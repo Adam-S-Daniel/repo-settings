@@ -1,0 +1,71 @@
+defaults:
+  actions:
+    sha_pinning_required: true
+    fork_pr_approval: all_external_contributors
+  ruleset:
+    enabled: true
+    name: "default branch protection"
+    enforcement: active
+    require_pull_request:
+      required_approving_review_count: 0
+      dismiss_stale_reviews: false
+    block_force_pushes: true
+    block_deletions: true
+    required_status_checks: []
+    admin_bypass: true
+
+repos:
+  # --- public, ruleset-safe (adversarially verified: no workflow pushes to main) ---
+  - name: Adam-S-Daniel/agentskills
+  - name: Adam-S-Daniel/tools
+  - name: Adam-S-Daniel/skills-evals
+  - name: Adam-S-Daniel/claude-memory-map
+  - name: Adam-S-Daniel/civic-azure-infra
+  - name: Adam-S-Daniel/civic-iac-policy
+  - name: Adam-S-Daniel/civic-platform-agents
+  - name: jodidaniel/squarespacetemp
+
+  # --- GHA-bench: currently on CLASSIC branch protection (compliant). Migration
+  #     to a ruleset is landed via a dedicated PR against this repo. ---
+  - name: Adam-S-Daniel/GHA-bench
+    overrides:
+      ruleset: { enabled: false }
+
+  # --- ruleset HELD until Adam-S-Daniel/_agent-guidance PR #20 (drift-report ->
+  #     PR instead of push-to-main) merges. Until then its nightly workflow
+  #     pushes to main and a PR-required ruleset would break it. Flip to managed
+  #     (remove this override) once #20 is merged. ---
+  - name: Adam-S-Daniel/_agent-guidance
+    overrides:
+      ruleset: { enabled: false }
+
+  # --- private: only SHA pinning applies. fork-PR approval (422) and rulesets
+  #     (403, needs Pro) are auto-skipped by the engine with an explicit reason. ---
+  - name: Adam-S-Daniel/rss-inator
+  - name: Adam-S-Daniel/jc
+  - name: Adam-S-Daniel/agentskills-private
+  - name: Adam-S-Daniel/4A
+
+  # --- scratch/experimental: Actions hardening only, no ruleset ---
+  - name: Adam-S-Daniel/scratch-jules-001
+    overrides: { ruleset: { enabled: false } }
+  - name: Adam-S-Daniel/scratch-claude-001
+    overrides: { ruleset: { enabled: false } }
+  - name: jodidaniel/scratch-claude-002
+    overrides: { ruleset: { enabled: false } }
+
+  # --- forks: excluded (upstream workflows should not be hardened downstream) ---
+  - name: Adam-S-Daniel/OctopusDeploy-Api
+    manage: false
+  - name: Adam-S-Daniel/SonosAmpJuicePi
+    manage: false
+
+  # --- cms-platform + consumers: owned by the platform's OWN settings-as-code
+  #     (repo-settings.yml manifest + rulesets). Excluded to avoid a competing
+  #     source of truth (GitHub enforces the union of rulesets). ---
+  - name: Adam-S-Daniel/cms-platform
+    manage: false
+  - name: Adam-S-Daniel/adamdaniel.ai
+    manage: false
+  - name: jodidaniel/jodidaniel.com
+    manage: false
