@@ -29,13 +29,11 @@ repos:
   #     fleet standard). Now managed like the other public repos. ---
   - name: Adam-S-Daniel/GHA-bench
 
-  # --- ruleset HELD until Adam-S-Daniel/_agent-guidance PR #20 (drift-report ->
-  #     PR instead of push-to-main) merges. Until then its nightly workflow
-  #     pushes to main and a PR-required ruleset would break it. Flip to managed
-  #     (remove this override) once #20 is merged. ---
+  # --- _agent-guidance: ruleset enabled. Previously held because drift-report.yml
+  #     pushed to main as the Actions bot; fixed in _agent-guidance PR #20
+  #     (drift report now lands via create-pull-request), so a PR-required
+  #     ruleset no longer breaks it. ---
   - name: Adam-S-Daniel/_agent-guidance
-    overrides:
-      ruleset: { enabled: false }
 
   # --- private: only SHA pinning applies. fork-PR approval (422) and rulesets
   #     (403, needs Pro) are auto-skipped by the engine with an explicit reason. ---
