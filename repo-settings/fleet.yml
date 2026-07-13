@@ -25,11 +25,9 @@ repos:
   - name: Adam-S-Daniel/civic-platform-agents
   - name: jodidaniel/squarespacetemp
 
-  # --- GHA-bench: currently on CLASSIC branch protection (compliant). Migration
-  #     to a ruleset is landed via a dedicated PR against this repo. ---
+  # --- GHA-bench: migrated from classic branch protection to a ruleset (the
+  #     fleet standard). Now managed like the other public repos. ---
   - name: Adam-S-Daniel/GHA-bench
-    overrides:
-      ruleset: { enabled: false }
 
   # --- ruleset HELD until Adam-S-Daniel/_agent-guidance PR #20 (drift-report ->
   #     PR instead of push-to-main) merges. Until then its nightly workflow
