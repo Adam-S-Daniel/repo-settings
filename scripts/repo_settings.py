@@ -461,6 +461,24 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
     return records
 
 
+def plan_repo_records(repo: str, settings: dict) -> list[dict]:
+    """plan_repo with per-repo fault isolation: a repo-level API failure
+    (deleted or renamed repo, no access) becomes one error record instead of
+    aborting the whole fleet run."""
+    try:
+        return plan_repo(repo, settings)
+    except GhError as e:
+        return [
+            {
+                "setting": "repo",
+                "status": "error",
+                "current": None,
+                "desired": None,
+                "note": e.message,
+            }
+        ]
+
+
 def _err(setting: str, desired: Any, e: GhError) -> dict:
     return {"setting": setting, "status": "error", "current": None,
             "desired": desired, "note": e.message}
@@ -577,7 +595,7 @@ def cmd_diff(args) -> int:
         if not t["manage"]:
             print(f"\n{t['repo']}\n  {DIM}excluded (manage: false){RESET}")
             continue
-        records = plan_repo(t["repo"], t["settings"])
+        records = plan_repo_records(t["repo"], t["settings"])
         render_records(t["repo"], records)
         any_drift |= any(r["status"] == "drift" for r in records)
         any_error |= any(r["status"] == "error" for r in records)
@@ -594,7 +612,7 @@ def cmd_apply(args) -> int:
         if not t["manage"]:
             print(f"\n{t['repo']}\n  {DIM}excluded (manage: false){RESET}")
             continue
-        records = plan_repo(t["repo"], t["settings"])
+        records = plan_repo_records(t["repo"], t["settings"])
         for r in records:
             if r["status"] == "drift":
                 if args.dry_run:

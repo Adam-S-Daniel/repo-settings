@@ -1,7 +1,13 @@
 # Offline tests of the pure config -> ruleset-body logic (no gh/network).
+import argparse
+import contextlib
+import io
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
@@ -128,6 +134,31 @@ class RulesetDocTests(unittest.TestCase):
         self.assertEqual(
             rs.normalize_ruleset(round_tripped), rs.normalize_ruleset(body)
         )
+
+
+class FaultIsolationTests(unittest.TestCase):
+    def test_plan_repo_records_isolates_gh_error(self):
+        with patch.object(rs, "plan_repo", side_effect=rs.GhError(404, "Not Found")):
+            records = rs.plan_repo_records("o/r", {})
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "error")
+        self.assertIn("Not Found", records[0]["note"])
+
+    def test_cmd_diff_continues_past_failing_repo(self):
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yml", delete=False
+        ) as fh:
+            fh.write("repos:\n  - name: o/repo1\n  - name: o/repo2\n")
+            config_path = fh.name
+        self.addCleanup(os.remove, config_path)
+        ns = argparse.Namespace(config=config_path, repo=None, owner=None)
+        with patch.object(
+            rs, "plan_repo", side_effect=[rs.GhError(404, "Not Found"), []]
+        ) as mock_plan:
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = rs.cmd_diff(ns)
+        self.assertEqual(result, 2)
+        self.assertEqual(mock_plan.call_count, 2)
 
 
 if __name__ == "__main__":

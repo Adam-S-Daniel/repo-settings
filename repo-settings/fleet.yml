@@ -40,7 +40,6 @@ defaults:
 repos:
   # --- public, ruleset-safe (adversarially verified: no workflow pushes to main) ---
   - name: Adam-S-Daniel/agentskills
-  - name: Adam-S-Daniel/tools
   - name: Adam-S-Daniel/skills-evals
   - name: Adam-S-Daniel/claude-memory-map
   - name: Adam-S-Daniel/civic-azure-infra
