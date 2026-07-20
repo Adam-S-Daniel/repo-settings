@@ -62,6 +62,13 @@ except ImportError:  # pragma: no cover
 
 DEFAULT_RULESET_NAME = "default branch protection"
 ADMIN_ROLE_ID = 5  # RepositoryRole id for "Admin" (used for bypass actors)
+BYPASS_ACTOR_TYPES = {
+    "Integration",
+    "OrganizationAdmin",
+    "RepositoryRole",
+    "Team",
+    "DeployKey",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -229,6 +236,26 @@ def build_ruleset_body(cfg: dict) -> dict:
                 "bypass_mode": "always",
             }
         )
+    for actor in cfg.get("bypass_actors") or []:
+        if not isinstance(actor, dict) or "actor_id" not in actor:
+            raise SystemExit(
+                f"error: bypass_actors entries must be mappings with an "
+                f"actor_id (got {actor!r})"
+            )
+        actor_type = actor.get("actor_type")
+        if actor_type not in BYPASS_ACTOR_TYPES:
+            raise SystemExit(
+                f"error: bypass_actors entry has invalid actor_type "
+                f"{actor_type!r} (expected one of "
+                f"{', '.join(sorted(BYPASS_ACTOR_TYPES))})"
+            )
+        entry = {
+            "actor_id": int(actor["actor_id"]),
+            "actor_type": actor_type,
+            "bypass_mode": actor.get("bypass_mode", "always"),
+        }
+        if entry not in bypass:
+            bypass.append(entry)
     return {
         "name": name,
         "target": "branch",
@@ -270,6 +297,37 @@ def normalize_ruleset(rs: dict | None) -> dict | None:
         "checks": checks,
         "bypass": bypass,
     }
+
+
+def ruleset_doc(branch_rs: dict) -> dict:
+    """Reduce a live branch ruleset to the config-schema `ruleset:` block
+    (the inverse of build_ruleset_body, for `generate`)."""
+    norm = normalize_ruleset(branch_rs)
+    doc = {
+        "enabled": True,
+        "name": branch_rs.get("name"),
+        "enforcement": branch_rs.get("enforcement"),
+        "require_pull_request": {
+            "required_approving_review_count": norm["pr_approvals"] or 0
+        }
+        if "pull_request" in norm["rule_types"]
+        else None,
+        "block_force_pushes": "non_fast_forward" in norm["rule_types"],
+        "block_deletions": "deletion" in norm["rule_types"],
+        "required_status_checks": norm["checks"],
+        "admin_bypass": any(
+            t == "RepositoryRole" and i == ADMIN_ROLE_ID
+            for (t, i, _m) in norm["bypass"]
+        ),
+    }
+    extra = [
+        {"actor_type": t, "actor_id": i, "bypass_mode": m}
+        for (t, i, m) in norm["bypass"]
+        if not (t == "RepositoryRole" and i == ADMIN_ROLE_ID)
+    ]
+    if extra:
+        doc["bypass_actors"] = extra
+    return doc
 
 
 def write_ruleset(repo: str, body: dict, existing_id: int | None) -> None:
@@ -484,24 +542,7 @@ def cmd_generate(args) -> int:
                 branch_rs = get_ruleset(repo, summary["id"])
                 break
         if branch_rs:
-            norm = normalize_ruleset(branch_rs)
-            doc["ruleset"] = {
-                "enabled": True,
-                "name": branch_rs.get("name"),
-                "enforcement": branch_rs.get("enforcement"),
-                "require_pull_request": {
-                    "required_approving_review_count": norm["pr_approvals"] or 0
-                }
-                if "pull_request" in norm["rule_types"]
-                else None,
-                "block_force_pushes": "non_fast_forward" in norm["rule_types"],
-                "block_deletions": "deletion" in norm["rule_types"],
-                "required_status_checks": norm["checks"],
-                "admin_bypass": any(
-                    b[0] == "RepositoryRole" and b[1] == ADMIN_ROLE_ID
-                    for b in norm["bypass"]
-                ),
-            }
+            doc["ruleset"] = ruleset_doc(branch_rs)
         elif not private:
             doc["ruleset"] = {"enabled": False, "name": DEFAULT_RULESET_NAME}
     except GhError:

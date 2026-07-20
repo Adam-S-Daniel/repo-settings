@@ -14,6 +14,14 @@ defaults:
     required_status_checks: []
     admin_bypass: true
 
+# Bot-write policy (issue #5; docs/decisions/0001): generated data (badges, run
+# summaries, dashboards) goes to a dedicated UNPROTECTED results branch -- the
+# model is skills-evals' `eval-results` -- never to the protected default
+# branch. The rare bot that truly must write to a default branch gets a
+# per-repo `bypass_actors` override HERE (auditable, drift-checked), never a
+# hand-granted UI bypass and never in `defaults:`. PR + auto-merge is not a
+# sanctioned bot-write path in this fleet.
+
 repos:
   # --- public, ruleset-safe (adversarially verified: no workflow pushes to main) ---
   - name: Adam-S-Daniel/agentskills

@@ -23,6 +23,21 @@ rulesets (403, needs GitHub Pro); the engine logs an explicit skip.
 their settings via the platform's own manifest, and two ruleset controllers on
 one repo would fight (GitHub enforces the union).
 
+## Policy: bot writes vs the PR-only ruleset
+
+The ruleset requires PRs into every managed default branch — bots included.
+The sanctioned patterns
+([ADR 0001](docs/decisions/0001-bot-writes-results-branch-or-declared-bypass.md)):
+
+- **Generated data** (badges, run summaries, dashboards): publish to a
+  dedicated unprotected results branch (model: skills-evals' `eval-results`);
+  consumers read from that branch. No ruleset changes.
+- **The rare bot that must write to the default branch**: declare its service
+  identity as a ruleset bypass actor in `fleet.yml` (`bypass_actors:` per-repo
+  override) so the grant is auditable and drift-checked. Never hand-grant
+  bypass in the UI — the drift report flags it.
+- **PR + auto-merge is not a sanctioned bot-write path** in this fleet.
+
 ## Local use
 
 ```bash
