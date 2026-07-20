@@ -33,9 +33,10 @@ The sanctioned patterns
   dedicated unprotected results branch (model: skills-evals' `eval-results`);
   consumers read from that branch. No ruleset changes.
 - **The rare bot that must write to the default branch**: declare its service
-  identity as a ruleset bypass actor in `fleet.yml` (`bypass_actors:` per-repo
-  override) so the grant is auditable and drift-checked. Never hand-grant
-  bypass in the UI — the drift report flags it.
+  identity as a ruleset bypass actor in `fleet.yml` (per-repo `bypass_actors:`
+  override; `defaults:`-level only for a fleet-standard bot like
+  agents-md-sync) so the grant is auditable and drift-checked. Never
+  hand-grant bypass in the UI — the drift report flags it.
 - **PR + auto-merge is not a sanctioned bot-write path** in this fleet.
 
 ## Local use

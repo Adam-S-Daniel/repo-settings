@@ -22,11 +22,19 @@ Generated data (badges, run summaries, reports, dashboard feeds) is published
 to a dedicated **unprotected results branch** — skills-evals' `eval-results` is
 the model — and consumers (badges, dashboards) read from that branch. The rare
 bot that genuinely must write to a protected default branch gets a ruleset
-**bypass actor declared in this repo's `fleet.yml`** (a per-repo
-`bypass_actors:` override), so the grant is auditable, fleet-consistent, and
-drift-checked; hand-granting bypass in the GitHub UI is not allowed — the
-engine treats bypass actors as managed state, so an undeclared grant shows up
-as drift. PR + auto-merge is **not** a sanctioned bot-write path in this fleet.
+**bypass actor declared in this repo's `fleet.yml`** — a per-repo
+`bypass_actors:` override for repo-specific bots, or a `defaults:`-level entry
+only for a fleet-standard bot that writes to every managed repo — so the grant
+is auditable, fleet-consistent, and drift-checked; hand-granting bypass in the
+GitHub UI is not allowed — the engine treats bypass actors as managed state,
+so an undeclared grant shows up as drift. PR + auto-merge is **not** a
+sanctioned bot-write path in this fleet.
+
+The first declared grant is the `agents-md-sync` GitHub App (App id 4268639),
+which pushes the managed `AGENTS.md` (and `CLAUDE.md` bridge) directly to
+every fleet repo's default branch. The PR-per-repo alternative it replaces
+produced unmergeable bot-PR spam — 18 open sync PRs across the fleet at the
+time of this decision.
 
 ## Consequences
 
@@ -42,6 +50,10 @@ as drift. PR + auto-merge is **not** a sanctioned bot-write path in this fleet.
   ruleset for that identity. Scope it to the narrowest identity possible — a
   dedicated GitHub App, never a human admin's PAT — and prefer redesigning the
   bot onto a results branch first.
+- A `defaults:`-level grant is fleet-wide by construction: whoever holds the
+  bot's private key can push to the default branch of every managed repo. Keep
+  such keys in a single controller repo's secrets (agents-md-sync's lives only
+  in `_agent-guidance`) and audit the list whenever a repo is onboarded.
 
 ## Alternatives considered
 

@@ -74,6 +74,7 @@ ruleset:
   #   bypass_mode: always | pull_request   (default: always)
   # Omit or leave empty for no extra actors -- the default AND the policy
   # default: generated data belongs on an unprotected results branch instead.
+  # In fleet configs, a defaults-level entry is reserved for fleet-standard bots.
   bypass_actors: []
 ```
 
