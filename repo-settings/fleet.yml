@@ -46,6 +46,12 @@ repos:
   - name: Adam-S-Daniel/civic-iac-policy
   - name: Adam-S-Daniel/civic-platform-agents
   - name: jodidaniel/squarespacetemp
+  # --- onboarded 2026-07-21 after the same audit: all workflows contents:read,
+  #     no pushes to the default branch, every action SHA-pinned. wsl-automation
+  #     already carried a hand-applied "default branch protection" ruleset
+  #     (managed in place by name from here on). ---
+  - name: Adam-S-Daniel/wsl-automation
+  - name: Adam-S-Daniel/fastmail-actions
 
   # --- GHA-bench: migrated from classic branch protection to a ruleset (the
   #     fleet standard). Now managed like the other public repos. ---
