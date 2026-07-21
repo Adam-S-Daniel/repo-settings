@@ -119,3 +119,10 @@ email addresses and their correspondents' into a public Actions log.)
 ## Repo-specific additions
 
 <!-- Add your repo-specific agent guidance below this line -->
+
+### Architecture Decision Records
+
+Non-obvious policy decisions are recorded in
+[docs/decisions/](docs/decisions/README.md). Read the relevant ADR before
+proposing to revert a policy — start with ADR 0001 (how bots write to
+protected branches).
