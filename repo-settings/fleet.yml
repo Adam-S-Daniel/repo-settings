@@ -1,4 +1,11 @@
 defaults:
+  # Prerequisite for the Dependabot unattended-merge path being rolled out
+  # fleet-wide: GitHub's native auto-merge cannot be armed at all unless the
+  # repo's "Allow auto-merge" setting is on. A plain repo setting (not
+  # Actions-specific, not the ruleset), so it applies to every managed repo
+  # here regardless of visibility -- no downgrade/skip handling needed.
+  repo:
+    allow_auto_merge: true
   actions:
     sha_pinning_required: true
     fork_pr_approval: all_external_contributors

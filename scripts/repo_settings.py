@@ -20,6 +20,10 @@ Managed settings:
   * actions.sha_pinning_required           -> repos/{repo}/actions/permissions
   * actions.fork_pr_approval               -> .../actions/permissions/fork-pr-contributor-approval
   * ruleset (default-branch protection)    -> repos/{repo}/rulesets  (idempotent BY NAME)
+  * repo.allow_auto_merge                  -> repos/{repo}  (PATCH; a plain repo
+                                               setting, so unlike the two above it
+                                               is NOT downgraded/skipped on private
+                                               repos)
 
 We use repository RULESETS rather than classic branch protection so the fleet
 speaks the same primitive as the cms-platform-managed repos. A managed ruleset
@@ -34,16 +38,23 @@ GitHub App token). The default Actions `GITHUB_TOKEN` cannot change repo setting
 
 Config schema: see ../assets/repo-settings.schema.md. Two shapes are accepted:
 
-  * Single-repo -- top-level `actions:` / `ruleset:` blocks, optional top-level
-    `repo: owner/name` (or pass --repo).
+  * Single-repo -- top-level `actions:` / `ruleset:` blocks, plus an optional
+    top-level `repo:` key that is EITHER the identifier string `owner/name`
+    (the existing convention; pass --repo to override it) OR a settings mapping
+    like `{allow_auto_merge: true}` -- the same top-level key can't be both at
+    once, so when `repo:` is a mapping the identifier must come from --repo.
 
   * Fleet / fan-out -- a top-level `repos:` list, with an optional `defaults:`
     block that every repo inherits and per-repo `overrides:`. A repo entry with
-    `manage: false` is skipped (recorded as excluded).
+    `manage: false` is skipped (recorded as excluded). Here `repo:` is always a
+    settings mapping (the identifier comes from each entry's `name:`), so there
+    is no collision.
 
 The engine auto-detects repo visibility and downgrades gracefully: fork-PR
 approval (API 422) and rulesets (API 403 "upgrade to Pro") are skipped on private
 repos with a logged reason, so one baseline can target public and private repos.
+`repo.allow_auto_merge` is a plain repo setting and applies to private repos too
+-- it needs no such downgrade.
 """
 from __future__ import annotations
 
@@ -122,6 +133,10 @@ def get_repo(repo: str) -> dict:
 
 def default_branch(repo: str) -> str:
     return get_repo(repo)["default_branch"]
+
+
+def write_allow_auto_merge(repo: str, desired: bool) -> None:
+    gh_api(f"repos/{repo}", method="PATCH", body={"allow_auto_merge": desired})
 
 
 # --------------------------------------------------------------------------- #
@@ -370,13 +385,21 @@ def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
                 }
             )
         return targets
-    repo = repo_arg or cfg.get("repo")
+    repo_field = cfg.get("repo")
+    # `repo:` is overloaded in this shape: the pre-existing convention is the
+    # identifier string `owner/name`; the new settings mapping (e.g.
+    # {allow_auto_merge: true}) is a different, mutually-exclusive use of the
+    # same key. Only fall back to it as the identifier when it's a string, so
+    # an existing config's `repo: owner/name` keeps working unchanged.
+    repo = repo_arg or (repo_field if isinstance(repo_field, str) else None)
     if not repo:
         raise SystemExit(
             "error: single-repo config needs a top-level `repo: owner/name` "
             "or a --repo argument."
         )
     settings = {k: v for k, v in cfg.items() if k in ("actions", "ruleset")}
+    if isinstance(repo_field, dict):
+        settings["repo"] = repo_field
     return [{"repo": repo, "settings": settings, "manage": True}]
 
 
@@ -388,6 +411,7 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
     meta: dict = {}  # cache for private lookup
     actions_cfg = settings.get("actions") or {}
     ruleset_cfg = settings.get("ruleset") or {}
+    repo_cfg = settings.get("repo") or {}
 
     def is_private() -> bool:
         if "private" not in meta:
@@ -458,6 +482,42 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
             else:
                 records.append(_err(f"ruleset[{name}]", "enabled", e))
 
+    # -- allow auto-merge ---------------------------------------------------- #
+    auto_merge = repo_cfg.get("allow_auto_merge", "unset")
+    if auto_merge != "unset" and auto_merge is not None:
+        desired = bool(auto_merge)
+        try:
+            repo_obj = get_repo(repo)
+        except GhError as e:
+            records.append(_err("repo.allow_auto_merge", desired, e))
+        else:
+            # Read defensively rather than subscripting: a KeyError here would
+            # escape the `except GhError` above AND plan_repo_records' own
+            # GhError-only guard, aborting the entire fleet run over one repo's
+            # unexpected payload. GitHub returns `allow_auto_merge` on the full
+            # repository object, but a token without the scope to see it (or a
+            # future payload change) would otherwise be a fleet-wide outage.
+            if "allow_auto_merge" not in repo_obj:
+                records.append(
+                    _skip(
+                        "repo.allow_auto_merge",
+                        desired,
+                        "GitHub did not return allow_auto_merge for this repo "
+                        "(token scope or payload shape) -- leaving it unmanaged",
+                    )
+                )
+            else:
+                current = bool(repo_obj["allow_auto_merge"])
+                records.append(
+                    {
+                        "setting": "repo.allow_auto_merge",
+                        "status": "match" if current == desired else "drift",
+                        "current": current,
+                        "desired": desired,
+                        "_writer": ("auto_merge", None, desired),
+                    }
+                )
+
     return records
 
 
@@ -497,6 +557,8 @@ def apply_record(repo: str, rec: dict) -> None:
         write_fork_approval(repo, b)
     elif kind == "ruleset":
         write_ruleset(repo, a, b)
+    elif kind == "auto_merge":
+        write_allow_auto_merge(repo, b)
 
 
 # --------------------------------------------------------------------------- #
