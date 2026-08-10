@@ -136,6 +136,95 @@ class RulesetDocTests(unittest.TestCase):
         )
 
 
+class AllowAutoMergeTests(unittest.TestCase):
+    def test_drift_when_desired_true_and_live_false(self):
+        with patch.object(rs, "get_repo", return_value={"allow_auto_merge": False}):
+            records = rs.plan_repo("o/r", {"repo": {"allow_auto_merge": True}})
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["setting"], "repo.allow_auto_merge")
+        self.assertEqual(rec["status"], "drift")
+        self.assertEqual(rec["current"], False)
+        self.assertEqual(rec["desired"], True)
+
+    def test_match_when_desired_true_and_live_true(self):
+        with patch.object(rs, "get_repo", return_value={"allow_auto_merge": True}):
+            records = rs.plan_repo("o/r", {"repo": {"allow_auto_merge": True}})
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "match")
+
+    def test_omitted_key_is_unmanaged(self):
+        with patch.object(rs, "get_repo") as mock_get_repo:
+            records = rs.plan_repo("o/r", {"repo": {}})
+            records_no_block = rs.plan_repo("o/r", {})
+        self.assertEqual(records, [])
+        self.assertEqual(records_no_block, [])
+        mock_get_repo.assert_not_called()
+
+    def test_explicit_null_is_unmanaged(self):
+        with patch.object(rs, "get_repo") as mock_get_repo:
+            records = rs.plan_repo("o/r", {"repo": {"allow_auto_merge": None}})
+        self.assertEqual(records, [])
+        mock_get_repo.assert_not_called()
+
+    def test_absent_field_is_skipped_not_a_crash(self):
+        # A KeyError here would escape both this block's `except GhError` and
+        # plan_repo_records' GhError-only guard, turning one repo's odd payload
+        # into a fleet-wide abort.
+        with patch.object(rs, "get_repo", return_value={"name": "r"}):
+            records = rs.plan_repo("o/r", {"repo": {"allow_auto_merge": True}})
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["setting"], "repo.allow_auto_merge")
+        self.assertEqual(rec["status"], "skipped")
+        self.assertIn("allow_auto_merge", rec["note"])
+
+    def test_absent_field_does_not_abort_fleet_run(self):
+        with patch.object(rs, "get_repo", return_value={"name": "r"}):
+            records = rs.plan_repo_records("o/r", {"repo": {"allow_auto_merge": True}})
+        self.assertEqual([r["status"] for r in records], ["skipped"])
+
+    def test_read_failure_isolated_into_error_record(self):
+        with patch.object(rs, "get_repo", side_effect=rs.GhError(500, "boom")):
+            records = rs.plan_repo("o/r", {"repo": {"allow_auto_merge": True}})
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["setting"], "repo.allow_auto_merge")
+        self.assertEqual(rec["status"], "error")
+        self.assertIn("boom", rec["note"])
+
+    def test_apply_record_writes_via_gh_api_patch(self):
+        with patch.object(rs, "get_repo", return_value={"allow_auto_merge": False}):
+            records = rs.plan_repo("o/r", {"repo": {"allow_auto_merge": True}})
+        self.assertEqual(records[0]["status"], "drift")
+        with patch.object(rs, "gh_api") as mock_gh_api:
+            rs.apply_record("o/r", records[0])
+        mock_gh_api.assert_called_once_with(
+            "repos/o/r", method="PATCH", body={"allow_auto_merge": True}
+        )
+
+
+class SingleRepoRepoBlockTests(unittest.TestCase):
+    def test_string_identifier_still_works_unmanaged(self):
+        cfg = {"repo": "o/r", "actions": {"sha_pinning_required": True}}
+        targets = rs.resolve_targets(cfg, None)
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0]["repo"], "o/r")
+        self.assertNotIn("repo", targets[0]["settings"])
+
+    def test_repo_mapping_requires_repo_arg_for_identifier(self):
+        cfg = {"repo": {"allow_auto_merge": True}}
+        targets = rs.resolve_targets(cfg, "o/r")
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0]["repo"], "o/r")
+        self.assertEqual(targets[0]["settings"]["repo"], {"allow_auto_merge": True})
+
+    def test_repo_mapping_without_repo_arg_raises(self):
+        cfg = {"repo": {"allow_auto_merge": True}}
+        with self.assertRaises(SystemExit):
+            rs.resolve_targets(cfg, None)
+
+
 class FaultIsolationTests(unittest.TestCase):
     def test_plan_repo_records_isolates_gh_error(self):
         with patch.object(rs, "plan_repo", side_effect=rs.GhError(404, "Not Found")):

@@ -78,6 +78,35 @@ ruleset:
   bypass_actors: []
 ```
 
+### `repo:` -- plain repo settings
+
+A separate, optional top-level `repo:` block manages ordinary repository
+settings that are neither Actions-specific nor the ruleset -- read/written via
+`GET`/`PATCH repos/{owner}/{repo}` directly. Unlike `actions.fork_pr_approval`
+and `ruleset` above, these are NOT downgraded/skipped on private repos (there
+is no 422/403 to handle): a plain repo setting applies the same way regardless
+of visibility.
+
+```yaml
+repo:
+  # "Allow auto-merge" (repo Settings -> General -> Pull Requests). This is a
+  # PREREQUISITE for GitHub's native auto-merge to be armable at all -- if
+  # it's off, `gh pr merge --auto` (or a workflow/Dependabot calling the same
+  # API) fails outright, independent of branch-protection/ruleset state.
+  # Omit the key, or set it to null, to leave it unmanaged.
+  allow_auto_merge: true
+```
+
+**Collision with the single-repo shape's identifier field:** the single-repo
+shape already uses the top-level key `repo:` for the identifier string shown
+above (`repo: Adam-S-Daniel/agentskills`) -- the same key can't be both a
+string and a mapping in one document. If you want to manage
+`repo.allow_auto_merge` from a single-repo config file, pass the identifier as
+`--repo owner/name` on the command line instead of embedding it in the file,
+and put the mapping form (above) in the file's `repo:` key. This collision
+does not exist in the fleet/fan-out shape below, where the identifier always
+comes from each entry's `name:` and `repo:` is free to be a settings mapping.
+
 ## Fleet / fan-out shape
 
 One document describing many repos. `defaults:` is the baseline every repo
@@ -86,6 +115,9 @@ inherits; each entry may add `overrides:` (deep-merged over the defaults) or set
 
 ```yaml
 defaults:
+  repo:
+    # Plain repo setting (applies to private repos too -- see "repo:" above).
+    allow_auto_merge: true
   actions:
     sha_pinning_required: true
     fork_pr_approval: all_external_contributors
@@ -100,11 +132,12 @@ defaults:
     admin_bypass: true
 
 repos:
-  # Inherits everything from defaults.
+  # Inherits everything from defaults, incl. repo.allow_auto_merge.
   - name: Adam-S-Daniel/agentskills
 
-  # Private repo: the engine auto-skips fork_pr_approval and the ruleset.
-  # Setting ruleset.enabled: false is optional but self-documenting.
+  # Private repo: the engine auto-skips fork_pr_approval and the ruleset, but
+  # repo.allow_auto_merge still applies (it's not visibility-gated) unless
+  # overridden here.
   - name: Adam-S-Daniel/rss-inator
     overrides:
       ruleset: { enabled: false }
@@ -129,6 +162,15 @@ logging a `skip` with the reason:
 |-----------|-----------------|------------|
 | Private repo | `actions.fork_pr_approval` | 422 "not allowed for private repositories" |
 | Private repo without GitHub Pro | `ruleset` | 403 "Upgrade to GitHub Pro" |
+
+`repo.allow_auto_merge` is **not** in this table -- it's a plain repo setting
+(`GET`/`PATCH repos/{owner}/{repo}`), not an Actions-specific or Pro-gated one
+like the two rows above, so the engine applies it uniformly with no
+`is_private()` downgrade/skip path at all -- private and public repos are
+planned and applied identically. (This mirrors GitHub's documented behavior
+for "Allow auto-merge," which is not visibility- or plan-gated the way fork-PR
+approval and rulesets are, but that external claim was not re-verified against
+a live API call while writing this.)
 
 ## Fork-PR approval values (verified against the live API)
 

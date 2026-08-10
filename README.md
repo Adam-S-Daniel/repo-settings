@@ -16,12 +16,18 @@ Per repo, according to `fleet.yml`:
 - **SHA pinning** required for Actions (`sha_pinning_required`).
 - **Fork-PR approval** = `all_external_contributors` (public repos only).
 - **Default-branch protection** as a repository **ruleset** (public repos only).
+- **Allow auto-merge** (`repo.allow_auto_merge`) — a plain repo setting, so it
+  applies to private repos too. It's the prerequisite for GitHub's native
+  auto-merge to be armable at all (e.g. for Dependabot's unattended-merge
+  path); with it off, arming auto-merge fails outright regardless of
+  branch-protection/ruleset state.
 
-Private repos get SHA pinning only — the API rejects fork-PR approval (422) and
-rulesets (403, needs GitHub Pro); the engine logs an explicit skip.
-`cms-platform` + its consumer sites are excluded (`manage: false`) — they own
-their settings via the platform's own manifest, and two ruleset controllers on
-one repo would fight (GitHub enforces the union).
+Private repos get SHA pinning + `repo.allow_auto_merge` — the API rejects
+fork-PR approval (422) and rulesets (403, needs GitHub Pro); the engine logs an
+explicit skip for those two only. `cms-platform` + its consumer sites are
+excluded (`manage: false`) — they own their settings via the platform's own
+manifest, and two ruleset controllers on one repo would fight (GitHub enforces
+the union).
 
 ## Policy: bot writes vs the PR-only ruleset
 
