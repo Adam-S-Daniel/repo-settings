@@ -6,13 +6,25 @@ on:
     paths:
       - "scripts/**"
       - "tests/**"
-      - ".github/workflows/tests.yml"
+      # Any workflow change runs the suite. Narrower than this ("just
+      # tests.yml") left a Dependabot action-SHA bump to a DIFFERENT workflow
+      # file producing zero check-runs on its PR, which the unattended-merge
+      # sweep in dependabot-auto-merge.yml refuses to merge on (it requires at
+      # least one concluded green check, never zero signal) — so the PR would
+      # sit open forever.
+      - ".github/workflows/**"
   push:
     branches: [main]
     paths:
       - "scripts/**"
       - "tests/**"
-      - ".github/workflows/tests.yml"
+      # Any workflow change runs the suite. Narrower than this ("just
+      # tests.yml") left a Dependabot action-SHA bump to a DIFFERENT workflow
+      # file producing zero check-runs on its PR, which the unattended-merge
+      # sweep in dependabot-auto-merge.yml refuses to merge on (it requires at
+      # least one concluded green check, never zero signal) — so the PR would
+      # sit open forever.
+      - ".github/workflows/**"
 
 permissions:
   contents: read
