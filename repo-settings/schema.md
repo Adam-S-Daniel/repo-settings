@@ -167,10 +167,14 @@ logging a `skip` with the reason:
 (`GET`/`PATCH repos/{owner}/{repo}`), not an Actions-specific or Pro-gated one
 like the two rows above, so the engine applies it uniformly with no
 `is_private()` downgrade/skip path at all -- private and public repos are
-planned and applied identically. (This mirrors GitHub's documented behavior
-for "Allow auto-merge," which is not visibility- or plan-gated the way fork-PR
-approval and rulesets are, but that external claim was not re-verified against
-a live API call while writing this.)
+planned and applied identically.
+
+**Verified against the live API** (apply run 2026-08-11, previously recorded
+here as an unverified external claim): on the four private repos in `fleet.yml`
+the same run logged both `[skip] ruleset[...] (private repo without GitHub Pro
+-- rulesets not available (API 403))` and `[CHANGED] repo.allow_auto_merge ->
+True`. Same repo, same run, same plan tier -- so "Allow auto-merge" is
+demonstrably neither visibility- nor Pro-gated, while the ruleset beside it is.
 
 ## Fork-PR approval values (verified against the live API)
 
