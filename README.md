@@ -61,7 +61,8 @@ Local runs use your `gh auth` (which must have admin on the targets).
 The workflow (`.github/workflows/repo-settings.yml`) authenticates with a
 **GitHub App** so it can reach both accounts with short-lived, least-privilege
 tokens (a fine-grained PAT can only ever cover one owner). Until the App is
-configured, the workflow **skips itself** (guarded on `vars.REPO_SETTINGS_APP_ID`).
+configured, the workflow **skips itself** (guarded on
+`vars.REPO_SETTINGS_APP_CLIENT_ID` / `vars.REPO_SETTINGS_APP_ID`).
 
 1. **Create a GitHub App** (github.com → Settings → Developer settings → GitHub
    Apps → New). Repository permissions: **Administration: Read & write**,
@@ -70,7 +71,11 @@ configured, the workflow **skips itself** (guarded on `vars.REPO_SETTINGS_APP_ID
 3. **Install the App** on both `Adam-S-Daniel` and the `jodidaniel` org, granting
    access to the repos in `fleet.yml` (or "All repositories").
 4. In **this repo** → Settings → Secrets and variables → Actions:
-   - Variable `REPO_SETTINGS_APP_ID` = the App's numeric ID.
+   - Variable `REPO_SETTINGS_APP_CLIENT_ID` = the App's **Client ID** (on the
+     App's settings page, format `Iv23li...`). The older
+     `REPO_SETTINGS_APP_ID` (numeric App ID) still works as a fallback, but
+     the action deprecated `app-id` -- prefer the Client ID, and delete the
+     old variable once it is set.
    - Secret `REPO_SETTINGS_APP_PRIVATE_KEY` = the full contents of the `.pem`.
 
 After that the workflow runs on push to `main` (config/script changes), a weekly
