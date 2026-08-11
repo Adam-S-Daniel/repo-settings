@@ -20,10 +20,9 @@ Managed settings:
   * actions.sha_pinning_required           -> repos/{repo}/actions/permissions
   * actions.fork_pr_approval               -> .../actions/permissions/fork-pr-contributor-approval
   * ruleset (default-branch protection)    -> repos/{repo}/rulesets  (idempotent BY NAME)
-  * repo.allow_auto_merge                  -> repos/{repo}  (PATCH; a plain repo
-                                               setting, so unlike the two above it
-                                               is NOT downgraded/skipped on private
-                                               repos)
+  * repo.allow_auto_merge                  -> repos/{repo}  (PATCH; skipped on
+                                               private repos -- see the downgrade
+                                               note below, it is plan-gated there)
 
 We use repository RULESETS rather than classic branch protection so the fleet
 speaks the same primitive as the cms-platform-managed repos. A managed ruleset
@@ -51,10 +50,16 @@ Config schema: see ../assets/repo-settings.schema.md. Two shapes are accepted:
     is no collision.
 
 The engine auto-detects repo visibility and downgrades gracefully: fork-PR
-approval (API 422) and rulesets (API 403 "upgrade to Pro") are skipped on private
-repos with a logged reason, so one baseline can target public and private repos.
-`repo.allow_auto_merge` is a plain repo setting and applies to private repos too
--- it needs no such downgrade.
+approval (API 422), rulesets (API 403 "upgrade to Pro") and allow_auto_merge are
+skipped on private repos with a logged reason, so one baseline can target public
+and private repos.
+
+allow_auto_merge is the awkward one: GitHub offers auto-merge on private repos
+only on Pro/Team/Enterprise, and on a plan without it the PATCH returns 200 and
+is then silently ignored -- there is no error to catch. Measured 2026-08-11:
+a public repo went CHANGED -> True and read back [ok], while four private repos
+in the same run went CHANGED -> True and read back False. Left unskipped it
+produces a false CHANGED on every apply and permanent DRIFT on every PR.
 """
 from __future__ import annotations
 
@@ -486,37 +491,63 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
     auto_merge = repo_cfg.get("allow_auto_merge", "unset")
     if auto_merge != "unset" and auto_merge is not None:
         desired = bool(auto_merge)
-        try:
-            repo_obj = get_repo(repo)
-        except GhError as e:
-            records.append(_err("repo.allow_auto_merge", desired, e))
+        if is_private():
+            # GitHub offers auto-merge on PRIVATE repos only on Pro/Team/
+            # Enterprise. On a plan without it the PATCH is ACCEPTED and
+            # returns 200 -- it is simply never honoured, so there is no error
+            # to catch, unlike the 422/403 the two settings above give us.
+            #
+            # Measured 2026-08-11, one apply run and the diff seven minutes
+            # later, same token, same code:
+            #   scratch-jules-001 (public):  CHANGED -> True, then [ok]
+            #   4A / rss-inator / jc / agentskills-private (private):
+            #                                CHANGED -> True, then still False
+            # Without this skip every private repo reports a false CHANGED on
+            # every apply and permanent DRIFT on every PR -- a red drift check
+            # that no merge can ever clear.
+            #
+            # If this account moves to Pro/Team/Enterprise, drop this branch:
+            # the write path already works, it is the plan that refuses it.
+            records.append(
+                _skip(
+                    "repo.allow_auto_merge",
+                    desired,
+                    "private repo without GitHub Pro -- auto-merge not available "
+                    "(PATCH returns 200 but is silently ignored)",
+                )
+            )
         else:
-            # Read defensively rather than subscripting: a KeyError here would
-            # escape the `except GhError` above AND plan_repo_records' own
-            # GhError-only guard, aborting the entire fleet run over one repo's
-            # unexpected payload. GitHub returns `allow_auto_merge` on the full
-            # repository object, but a token without the scope to see it (or a
-            # future payload change) would otherwise be a fleet-wide outage.
-            if "allow_auto_merge" not in repo_obj:
-                records.append(
-                    _skip(
-                        "repo.allow_auto_merge",
-                        desired,
-                        "GitHub did not return allow_auto_merge for this repo "
-                        "(token scope or payload shape) -- leaving it unmanaged",
-                    )
-                )
+            try:
+                repo_obj = get_repo(repo)
+            except GhError as e:
+                records.append(_err("repo.allow_auto_merge", desired, e))
             else:
-                current = bool(repo_obj["allow_auto_merge"])
-                records.append(
-                    {
-                        "setting": "repo.allow_auto_merge",
-                        "status": "match" if current == desired else "drift",
-                        "current": current,
-                        "desired": desired,
-                        "_writer": ("auto_merge", None, desired),
-                    }
-                )
+                # Read defensively rather than subscripting: a KeyError here would
+                # escape the `except GhError` above AND plan_repo_records' own
+                # GhError-only guard, aborting the entire fleet run over one repo's
+                # unexpected payload. GitHub returns `allow_auto_merge` on the full
+                # repository object, but a token without the scope to see it (or a
+                # future payload change) would otherwise be a fleet-wide outage.
+                if "allow_auto_merge" not in repo_obj:
+                    records.append(
+                        _skip(
+                            "repo.allow_auto_merge",
+                            desired,
+                            "GitHub did not return allow_auto_merge for this repo "
+                            "(token scope or payload shape) -- leaving it unmanaged",
+                        )
+                    )
+                else:
+                    current = bool(repo_obj["allow_auto_merge"])
+                    records.append(
+                        {
+                            "setting": "repo.allow_auto_merge",
+                            "status": "match" if current == desired else "drift",
+                            "current": current,
+                            "desired": desired,
+                            "_writer": ("auto_merge", None, desired),
+                        }
+                    )
 
     return records
 

@@ -162,15 +162,31 @@ logging a `skip` with the reason:
 |-----------|-----------------|------------|
 | Private repo | `actions.fork_pr_approval` | 422 "not allowed for private repositories" |
 | Private repo without GitHub Pro | `ruleset` | 403 "Upgrade to GitHub Pro" |
+| Private repo without GitHub Pro | `repo.allow_auto_merge` | **none -- 200, then silently ignored** |
 
-`repo.allow_auto_merge` is **not** in this table -- it's a plain repo setting
-(`GET`/`PATCH repos/{owner}/{repo}`), not an Actions-specific or Pro-gated one
-like the two rows above, so the engine applies it uniformly with no
-`is_private()` downgrade/skip path at all -- private and public repos are
-planned and applied identically. (This mirrors GitHub's documented behavior
-for "Allow auto-merge," which is not visibility- or plan-gated the way fork-PR
-approval and rulesets are, but that external claim was not re-verified against
-a live API call while writing this.)
+That third row is the dangerous one, because it is the only downgrade with **no
+error to catch**. GitHub offers auto-merge on private repos only on
+Pro/Team/Enterprise; below that the `PATCH repos/{owner}/{repo}` succeeds and
+the value simply never changes.
+
+This was originally documented here the other way round -- as "a plain repo
+setting, not Pro-gated, applied uniformly" -- on the strength of GitHub's docs
+for the *public* case. The 2026-08-11 runs disproved it, and the shape of that
+mistake is worth keeping: an apply reporting `CHANGED` is **not** evidence the
+setting took. Only a later read is.
+
+| Repo | apply 03:16 | diff 03:23 |
+|---|---|---|
+| `scratch-jules-001` (public) | `CHANGED -> True` | `[ok]` |
+| `4A`, `rss-inator`, `jc`, `agentskills-private` (private) | `CHANGED -> True` | `[DRIFT] from: False` |
+
+Same run, same token, same code -- only visibility differs. Left unskipped this
+yields a false `CHANGED` on every apply and permanent `DRIFT` on every PR: a red
+drift check that merging can never clear, because the write never lands.
+
+If this account moves to Pro/Team/Enterprise, remove the `is_private()` branch
+in the `allow_auto_merge` block -- the write path already works; it is the plan
+that refuses it.
 
 ## Fork-PR approval values (verified against the live API)
 
