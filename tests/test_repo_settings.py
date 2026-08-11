@@ -138,7 +138,7 @@ class RulesetDocTests(unittest.TestCase):
 
 class AllowAutoMergeTests(unittest.TestCase):
     def test_drift_when_desired_true_and_live_false(self):
-        with patch.object(rs, "get_repo", return_value={"allow_auto_merge": False}):
+        with patch.object(rs, "get_repo", return_value={"private": False, "allow_auto_merge": False}):
             records = rs.plan_repo("o/r", {"repo": {"allow_auto_merge": True}})
         self.assertEqual(len(records), 1)
         rec = records[0]
@@ -148,7 +148,7 @@ class AllowAutoMergeTests(unittest.TestCase):
         self.assertEqual(rec["desired"], True)
 
     def test_match_when_desired_true_and_live_true(self):
-        with patch.object(rs, "get_repo", return_value={"allow_auto_merge": True}):
+        with patch.object(rs, "get_repo", return_value={"private": False, "allow_auto_merge": True}):
             records = rs.plan_repo("o/r", {"repo": {"allow_auto_merge": True}})
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["status"], "match")
@@ -171,7 +171,7 @@ class AllowAutoMergeTests(unittest.TestCase):
         # A KeyError here would escape both this block's `except GhError` and
         # plan_repo_records' GhError-only guard, turning one repo's odd payload
         # into a fleet-wide abort.
-        with patch.object(rs, "get_repo", return_value={"name": "r"}):
+        with patch.object(rs, "get_repo", return_value={"private": False, "name": "r"}):
             records = rs.plan_repo("o/r", {"repo": {"allow_auto_merge": True}})
         self.assertEqual(len(records), 1)
         rec = records[0]
@@ -180,21 +180,52 @@ class AllowAutoMergeTests(unittest.TestCase):
         self.assertIn("allow_auto_merge", rec["note"])
 
     def test_absent_field_does_not_abort_fleet_run(self):
-        with patch.object(rs, "get_repo", return_value={"name": "r"}):
+        with patch.object(rs, "get_repo", return_value={"private": False, "name": "r"}):
             records = rs.plan_repo_records("o/r", {"repo": {"allow_auto_merge": True}})
         self.assertEqual([r["status"] for r in records], ["skipped"])
 
     def test_read_failure_isolated_into_error_record(self):
+        # is_private() reads the repo before the allow_auto_merge block's own
+        # try/except, so a read failure propagates out of plan_repo -- exactly
+        # as it already did for fork_pr_approval. plan_repo_records is the
+        # isolation boundary, and that is what must not let one repo's failure
+        # abort the fleet run.
         with patch.object(rs, "get_repo", side_effect=rs.GhError(500, "boom")):
+            records = rs.plan_repo_records("o/r", {"repo": {"allow_auto_merge": True}})
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["status"], "error")
+        self.assertIn("boom", rec["note"])
+
+    def test_private_repo_is_skipped_not_applied(self):
+        # Auto-merge is Pro/Team/Enterprise-only on private repos; below that
+        # the PATCH returns 200 and is silently ignored. Measured 2026-08-11:
+        # four private repos reported CHANGED -> True and read back False,
+        # while a public repo in the same run stuck. Without this skip they
+        # drift forever and the PR drift check can never go green.
+        with patch.object(rs, "get_repo", return_value={"private": True,
+                                                        "allow_auto_merge": False}):
             records = rs.plan_repo("o/r", {"repo": {"allow_auto_merge": True}})
         self.assertEqual(len(records), 1)
         rec = records[0]
         self.assertEqual(rec["setting"], "repo.allow_auto_merge")
-        self.assertEqual(rec["status"], "error")
-        self.assertIn("boom", rec["note"])
+        self.assertEqual(rec["status"], "skipped")
+        self.assertIn("Pro", rec["note"])
+        # and crucially it must carry no writer, so apply can never issue the
+        # PATCH that would report a false CHANGED
+        self.assertNotIn("_writer", rec)
+
+    def test_private_repo_skip_survives_a_true_live_value(self):
+        # Belt and braces: even if a private repo somehow already reads True,
+        # the setting stays unmanaged rather than flipping to "match" -- we
+        # cannot manage what the plan will not honour.
+        with patch.object(rs, "get_repo", return_value={"private": True,
+                                                        "allow_auto_merge": True}):
+            records = rs.plan_repo("o/r", {"repo": {"allow_auto_merge": True}})
+        self.assertEqual([r["status"] for r in records], ["skipped"])
 
     def test_apply_record_writes_via_gh_api_patch(self):
-        with patch.object(rs, "get_repo", return_value={"allow_auto_merge": False}):
+        with patch.object(rs, "get_repo", return_value={"private": False, "allow_auto_merge": False}):
             records = rs.plan_repo("o/r", {"repo": {"allow_auto_merge": True}})
         self.assertEqual(records[0]["status"], "drift")
         with patch.object(rs, "gh_api") as mock_gh_api:

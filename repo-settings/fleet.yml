@@ -70,10 +70,16 @@ repos:
   #     ruleset no longer breaks it. ---
   - name: Adam-S-Daniel/_agent-guidance
 
-  # --- private: SHA pinning and allow_auto_merge apply; fork-PR approval (422)
-  #     and rulesets (403, needs Pro) are auto-skipped by the engine with an
-  #     explicit reason. Confirmed by the 2026-08-11 apply run: these repos log
-  #     two skips and `[CHANGED] repo.allow_auto_merge -> True`. ---
+  # --- private: only SHA pinning applies. fork-PR approval (422), rulesets
+  #     (403, needs Pro) and allow_auto_merge are all auto-skipped by the engine
+  #     with an explicit reason.
+  #
+  #     allow_auto_merge is the non-obvious one: auto-merge is Pro/Team/
+  #     Enterprise-only on private repos, and below that the PATCH returns 200
+  #     and is silently ignored -- so it looked like it applied. Measured
+  #     2026-08-11: these four went `CHANGED -> True` on the apply and read back
+  #     False seven minutes later, while a public repo in the same run stuck.
+  #     See schema.md, "Downgrade behavior". ---
   - name: Adam-S-Daniel/rss-inator
   - name: Adam-S-Daniel/jc
   - name: Adam-S-Daniel/agentskills-private
@@ -84,12 +90,15 @@ repos:
   #     Administration-write App credentials was the one repo the engine never
   #     touched, and no drift on it was reportable.
   #
-  #     It is PRIVATE, so it gets SHA pinning + allow_auto_merge, and the
-  #     ruleset is skipped (403, needs Pro). Listing it therefore does NOT
-  #     protect its default branch -- that needs Pro or making the repo public,
-  #     and is worth revisiting given what this repo can administer. What
-  #     listing it does buy: SHA pinning is enforced rather than assumed, and
-  #     the repo shows up in the audit instead of being invisible to it.
+  #     It is PRIVATE, so of the four managed settings only SHA pinning
+  #     actually lands; fork-PR approval, the ruleset and allow_auto_merge are
+  #     all skipped (see the private group above). Listing it therefore does
+  #     NOT protect its default branch -- that needs Pro or making the repo
+  #     public, and is worth revisiting given what this repo can administer.
+  #     What listing it does buy is real though: SHA pinning was OFF here
+  #     (the 2026-08-11 drift report caught `actions.sha_pinning_required
+  #     False -> True`), so the repo enforcing SHA pinning fleet-wide was not
+  #     enforcing it on itself. And it now appears in the audit at all.
   #
   #     Ruleset-safe either way (checked 2026-08-11): all three workflows here
   #     have `contents: read` except dependabot-auto-merge.yml, and none runs
