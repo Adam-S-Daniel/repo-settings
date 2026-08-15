@@ -23,6 +23,9 @@ Managed settings:
   * repo.allow_auto_merge                  -> repos/{repo}  (PATCH; skipped on
                                                private repos -- see the downgrade
                                                note below, it is plan-gated there)
+  * repo.allow_merge_commit                -> repos/{repo}  (PATCH, one call for
+    repo.allow_squash_merge                   the whole group -- see
+    repo.allow_rebase_merge                   write_merge_methods)
 
 We use repository RULESETS rather than classic branch protection so the fleet
 speaks the same primitive as the cms-platform-managed repos. A managed ruleset
@@ -144,6 +147,25 @@ def write_allow_auto_merge(repo: str, desired: bool) -> None:
     gh_api(f"repos/{repo}", method="PATCH", body={"allow_auto_merge": desired})
 
 
+# The merge-method toggles, in the order GitHub's own UI lists them.
+MERGE_METHOD_KEYS = ("allow_merge_commit", "allow_squash_merge", "allow_rebase_merge")
+
+
+def write_merge_methods(repo: str, desired: dict) -> None:
+    """PATCH every managed merge-method toggle in ONE call.
+
+    Not one call per toggle, because GitHub rejects a repository with zero
+    merge methods enabled (422) and a per-toggle apply passes through exactly
+    that state whenever the run both enables one method and disables another:
+    disable-first leaves the repo momentarily with none, and which order the
+    records happen to be in is not something the caller controls. Sending the
+    whole desired group at once means the repo never occupies the invalid
+    state, and re-sending it is idempotent — so it does not matter which of the
+    group's records triggered the write.
+    """
+    gh_api(f"repos/{repo}", method="PATCH", body=dict(desired))
+
+
 # --------------------------------------------------------------------------- #
 # Actions settings readers/writers
 # --------------------------------------------------------------------------- #
@@ -230,7 +252,17 @@ def build_ruleset_body(cfg: dict) -> dict:
                     "require_code_owner_review": False,
                     "require_last_push_approval": False,
                     "required_review_thread_resolution": False,
-                    "allowed_merge_methods": ["merge", "squash", "rebase"],
+                    # Configurable, defaulting to all three so an existing
+                    # config's rendered ruleset is unchanged. The fleet sets it
+                    # explicitly: without that this rule RE-ASSERTS squash and
+                    # rebase on every apply, contradicting the repo-level
+                    # toggles it sits beside. Repo-level wins where they
+                    # disagree, so this is defence in depth rather than the
+                    # enforcement -- but a ruleset that says the opposite of
+                    # the policy is one a reader has to reconcile.
+                    "allowed_merge_methods": pr.get(
+                        "allowed_merge_methods", ["merge", "squash", "rebase"]
+                    ),
                 },
             }
         )
@@ -314,6 +346,11 @@ def normalize_ruleset(rs: dict | None) -> dict | None:
         "rule_types": sorted(rules_by_type.keys()),
         "pr_approvals": pr.get("required_approving_review_count"),
         "pr_dismiss_stale": bool(pr.get("dismiss_stale_reviews_on_push", False)),
+        # Compared, not merely written: this was absent, so a hand-edit in the
+        # UI adding squash back to the ruleset produced no drift and nothing
+        # ever said so. Sorted because GitHub does not promise an order and an
+        # unordered compare would report drift on a reshuffle.
+        "merge_methods": sorted(pr.get("allowed_merge_methods") or []),
         "checks": checks,
         "bypass": bypass,
     }
@@ -328,7 +365,11 @@ def ruleset_doc(branch_rs: dict) -> dict:
         "name": branch_rs.get("name"),
         "enforcement": branch_rs.get("enforcement"),
         "require_pull_request": {
-            "required_approving_review_count": norm["pr_approvals"] or 0
+            "required_approving_review_count": norm["pr_approvals"] or 0,
+            # Carried through, or `generate` would emit a config that rebuilds
+            # into a DIFFERENT ruleset than the one it read -- silently widening
+            # a merge-only repo back to all three methods.
+            "allowed_merge_methods": norm["merge_methods"],
         }
         if "pull_request" in norm["rule_types"]
         else None,
@@ -549,6 +590,57 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
                         }
                     )
 
+    # -- merge methods ------------------------------------------------------- #
+    # No plan gate, unlike allow_auto_merge above: these are ordinary
+    # repository fields honoured on every plan, public and private alike, so
+    # they are read and written the same way everywhere.
+    wanted = {
+        key: bool(repo_cfg[key])
+        for key in MERGE_METHOD_KEYS
+        if repo_cfg.get(key, "unset") not in ("unset", None)
+    }
+    if wanted:
+        if not any(wanted.values()) and len(wanted) == len(MERGE_METHOD_KEYS):
+            # GitHub 422s a repo with no merge method at all, so a config
+            # saying that is refused HERE, where a human is reading, rather
+            # than as a failed apply against every repo in the fleet.
+            for key in wanted:
+                records.append(
+                    _skip(f"repo.{key}", wanted[key],
+                          "config disables every merge method; GitHub requires at "
+                          "least one — leaving all three unmanaged")
+                )
+        else:
+            try:
+                repo_obj = get_repo(repo)
+            except GhError as e:
+                for key, desired in wanted.items():
+                    records.append(_err(f"repo.{key}", desired, e))
+            else:
+                for key, desired in wanted.items():
+                    if key not in repo_obj:
+                        # Same defensive read as allow_auto_merge above: a
+                        # KeyError here would abort the whole fleet run.
+                        records.append(
+                            _skip(f"repo.{key}", desired,
+                                  f"GitHub did not return {key} for this repo "
+                                  "(token scope or payload shape) — leaving it "
+                                  "unmanaged")
+                        )
+                        continue
+                    current = bool(repo_obj[key])
+                    records.append(
+                        {
+                            "setting": f"repo.{key}",
+                            "status": "match" if current == desired else "drift",
+                            "current": current,
+                            "desired": desired,
+                            # Every record in the group carries the WHOLE group:
+                            # see write_merge_methods for why it is one call.
+                            "_writer": ("merge_methods", None, wanted),
+                        }
+                    )
+
     return records
 
 
@@ -590,6 +682,8 @@ def apply_record(repo: str, rec: dict) -> None:
         write_ruleset(repo, a, b)
     elif kind == "auto_merge":
         write_allow_auto_merge(repo, b)
+    elif kind == "merge_methods":
+        write_merge_methods(repo, b)
 
 
 # --------------------------------------------------------------------------- #
