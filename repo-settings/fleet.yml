@@ -6,6 +6,32 @@ defaults:
   # here regardless of visibility -- no downgrade/skip handling needed.
   repo:
     allow_auto_merge: true
+    # Merge commits only, fleet-wide. Two reasons, one measured and one
+    # ergonomic.
+    #
+    # Measured: a squash merge collapses a branch into a NEW commit and leaves
+    # the originals on no branch. A repo whose lockfile pins a commit by sha —
+    # agentskills' skills.lock names the content commit its re-pin describes —
+    # is then pinning something a fresh clone of the default branch does not
+    # contain, and `generate_skills_lock.py --check` fails with "cannot resolve
+    # ref" (reproduced on throwaway clones, 2026-08-15). agentskills had
+    # already been set merge-only by hand for this; the fleet default is that
+    # decision written down.
+    #
+    # Ergonomic: with one method enabled there is nothing for an agent to
+    # choose, retry, or spend a round-trip discovering. `gh pr merge --merge`
+    # is the only form that works anywhere in the fleet.
+    #
+    # NOT fleet-wide in practice: the three cms-platform-managed repos
+    # (cms-platform, adamdaniel.ai, jodidaniel.com) carry `manage: false`
+    # below, so this never reaches them. That is deliberate and load-bearing,
+    # not an oversight — their Decap publish chain arms SQUASH auto-merge on
+    # every editorial PR, and squash is what collapses an editor's many
+    # per-save commits into one `publish: <title>` commit. They keep squash on,
+    # governed by cms-platform's own repo-settings.yml.
+    allow_merge_commit: true
+    allow_squash_merge: false
+    allow_rebase_merge: false
   actions:
     sha_pinning_required: true
     fork_pr_approval: all_external_contributors
@@ -16,6 +42,11 @@ defaults:
     require_pull_request:
       required_approving_review_count: 0
       dismiss_stale_reviews: false
+      # The ruleset half of the merge-only policy above. The repo-level toggles
+      # are what actually make `gh pr merge --squash` fail; this is the second
+      # layer, and stating it stops the rule RE-ASSERTING squash and rebase on
+      # every apply while the toggles beside it deny them.
+      allowed_merge_methods: [merge]
     block_force_pushes: true
     block_deletions: true
     required_status_checks: []

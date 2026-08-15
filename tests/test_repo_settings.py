@@ -235,6 +235,181 @@ class AllowAutoMergeTests(unittest.TestCase):
         )
 
 
+class RulesetMergeMethodTests(unittest.TestCase):
+    MERGE_ONLY_CFG = {
+        "enabled": True,
+        "name": "default branch protection",
+        "require_pull_request": {
+            "required_approving_review_count": 0,
+            "allowed_merge_methods": ["merge"],
+        },
+    }
+
+    def _pr_params(self, body):
+        return next(r["parameters"] for r in body["rules"] if r["type"] == "pull_request")
+
+    def test_default_is_still_all_three(self):
+        # An existing config that never mentioned merge methods must render
+        # exactly the ruleset it rendered before.
+        body = rs.build_ruleset_body(
+            {"enabled": True, "name": "n", "require_pull_request": {}}
+        )
+        self.assertEqual(
+            self._pr_params(body)["allowed_merge_methods"],
+            ["merge", "squash", "rebase"],
+        )
+
+    def test_config_narrows_the_ruleset(self):
+        body = rs.build_ruleset_body(dict(self.MERGE_ONLY_CFG))
+        self.assertEqual(self._pr_params(body)["allowed_merge_methods"], ["merge"])
+
+    def test_merge_methods_are_drift_compared(self):
+        # Absent from normalize_ruleset, a UI edit adding squash back produced
+        # no drift and nothing ever said so.
+        merge_only = rs.build_ruleset_body(dict(self.MERGE_ONLY_CFG))
+        widened = rs.build_ruleset_body(
+            {**self.MERGE_ONLY_CFG,
+             "require_pull_request": {"required_approving_review_count": 0,
+                                      "allowed_merge_methods": ["merge", "squash"]}}
+        )
+        self.assertNotEqual(
+            rs.normalize_ruleset(merge_only), rs.normalize_ruleset(widened)
+        )
+
+    def test_order_alone_is_not_drift(self):
+        a = rs.build_ruleset_body(
+            {**self.MERGE_ONLY_CFG,
+             "require_pull_request": {"required_approving_review_count": 0,
+                                      "allowed_merge_methods": ["merge", "squash"]}}
+        )
+        b = rs.build_ruleset_body(
+            {**self.MERGE_ONLY_CFG,
+             "require_pull_request": {"required_approving_review_count": 0,
+                                      "allowed_merge_methods": ["squash", "merge"]}}
+        )
+        self.assertEqual(rs.normalize_ruleset(a), rs.normalize_ruleset(b))
+
+    def test_a_narrowed_ruleset_round_trips_through_generate(self):
+        # Without ruleset_doc carrying the list, `generate` on a merge-only repo
+        # emitted a config that rebuilt into an all-three ruleset -- silently
+        # widening it back on the next apply.
+        body = rs.build_ruleset_body(dict(self.MERGE_ONLY_CFG))
+        round_tripped = rs.build_ruleset_body(rs.ruleset_doc(body))
+        self.assertEqual(
+            rs.normalize_ruleset(round_tripped), rs.normalize_ruleset(body)
+        )
+        self.assertEqual(
+            self._pr_params(round_tripped)["allowed_merge_methods"], ["merge"]
+        )
+
+
+class MergeMethodTests(unittest.TestCase):
+    LIVE_ALL_ON = {
+        "private": False,
+        "allow_merge_commit": True,
+        "allow_squash_merge": True,
+        "allow_rebase_merge": True,
+    }
+    MERGE_ONLY = {
+        "allow_merge_commit": True,
+        "allow_squash_merge": False,
+        "allow_rebase_merge": False,
+    }
+
+    def test_drift_is_reported_per_toggle(self):
+        with patch.object(rs, "get_repo", return_value=dict(self.LIVE_ALL_ON)):
+            records = rs.plan_repo("o/r", {"repo": dict(self.MERGE_ONLY)})
+        by_setting = {r["setting"]: r for r in records}
+        self.assertEqual(by_setting["repo.allow_merge_commit"]["status"], "match")
+        self.assertEqual(by_setting["repo.allow_squash_merge"]["status"], "drift")
+        self.assertEqual(by_setting["repo.allow_rebase_merge"]["status"], "drift")
+
+    def test_match_when_already_merge_only(self):
+        live = {"private": False, **self.MERGE_ONLY}
+        with patch.object(rs, "get_repo", return_value=live):
+            records = rs.plan_repo("o/r", {"repo": dict(self.MERGE_ONLY)})
+        self.assertEqual({r["status"] for r in records}, {"match"})
+
+    def test_omitted_keys_are_unmanaged(self):
+        with patch.object(rs, "get_repo") as mock_get_repo:
+            records = rs.plan_repo("o/r", {"repo": {}})
+        self.assertEqual(records, [])
+        mock_get_repo.assert_not_called()
+
+    def test_explicit_null_is_unmanaged(self):
+        with patch.object(rs, "get_repo") as mock_get_repo:
+            records = rs.plan_repo("o/r", {"repo": {"allow_squash_merge": None}})
+        self.assertEqual(records, [])
+        mock_get_repo.assert_not_called()
+
+    def test_private_repos_are_managed_too(self):
+        # Unlike allow_auto_merge, these are not plan-gated -- a private repo
+        # honours them, so skipping it would leave the fleet's private repos
+        # silently unmanaged.
+        live = {"private": True, "allow_merge_commit": True,
+                "allow_squash_merge": True, "allow_rebase_merge": True}
+        with patch.object(rs, "get_repo", return_value=live):
+            records = rs.plan_repo("o/r", {"repo": dict(self.MERGE_ONLY)})
+        self.assertIn("drift", {r["status"] for r in records})
+
+    def test_absent_field_is_skipped_not_a_crash(self):
+        with patch.object(rs, "get_repo", return_value={"private": False, "name": "r"}):
+            records = rs.plan_repo("o/r", {"repo": dict(self.MERGE_ONLY)})
+        self.assertEqual({r["status"] for r in records}, {"skipped"})
+        self.assertIn("allow_squash_merge",
+                      [r["note"] for r in records if "squash" in r["setting"]][0])
+
+    def test_read_failure_isolated_into_error_records(self):
+        with patch.object(rs, "get_repo", side_effect=rs.GhError(500, "boom")):
+            records = rs.plan_repo_records("o/r", {"repo": dict(self.MERGE_ONLY)})
+        self.assertEqual({r["status"] for r in records}, {"error"})
+
+    def test_disabling_every_method_is_refused_rather_than_applied(self):
+        # GitHub 422s a repo with no merge method at all. Refusing here means a
+        # human reading the config finds out, rather than every repo in the
+        # fleet failing its apply.
+        allnone = {key: False for key in rs.MERGE_METHOD_KEYS}
+        with patch.object(rs, "get_repo") as mock_get_repo:
+            records = rs.plan_repo("o/r", {"repo": allnone})
+        self.assertEqual({r["status"] for r in records}, {"skipped"})
+        self.assertTrue(all("at least one" in r["note"] for r in records))
+        for rec in records:
+            self.assertNotIn("_writer", rec)
+        mock_get_repo.assert_not_called()
+
+    def test_apply_patches_the_whole_group_in_one_call(self):
+        # One call, not one per toggle: a per-toggle apply passes through the
+        # zero-methods state GitHub rejects whenever a run both enables one and
+        # disables another.
+        with patch.object(rs, "get_repo", return_value=dict(self.LIVE_ALL_ON)):
+            records = rs.plan_repo("o/r", {"repo": dict(self.MERGE_ONLY)})
+        drifted = [r for r in records if r["status"] == "drift"]
+        with patch.object(rs, "gh_api") as mock_gh_api:
+            rs.apply_record("o/r", drifted[0])
+        mock_gh_api.assert_called_once_with(
+            "repos/o/r", method="PATCH", body=dict(self.MERGE_ONLY)
+        )
+
+    def test_every_record_in_the_group_carries_the_whole_group(self):
+        # Whichever record apply happens to reach first must produce the same
+        # complete PATCH, or the repo lands in a partial state.
+        with patch.object(rs, "get_repo", return_value=dict(self.LIVE_ALL_ON)):
+            records = rs.plan_repo("o/r", {"repo": dict(self.MERGE_ONLY)})
+        writers = [r["_writer"][2] for r in records]
+        self.assertEqual(writers, [dict(self.MERGE_ONLY)] * len(records))
+
+    def test_a_partial_group_only_patches_what_the_config_names(self):
+        # Managing one toggle must not silently assert a value for the others.
+        with patch.object(rs, "get_repo", return_value=dict(self.LIVE_ALL_ON)):
+            records = rs.plan_repo("o/r", {"repo": {"allow_squash_merge": False}})
+        self.assertEqual(len(records), 1)
+        with patch.object(rs, "gh_api") as mock_gh_api:
+            rs.apply_record("o/r", records[0])
+        mock_gh_api.assert_called_once_with(
+            "repos/o/r", method="PATCH", body={"allow_squash_merge": False}
+        )
+
+
 class SingleRepoRepoBlockTests(unittest.TestCase):
     def test_string_identifier_still_works_unmanaged(self):
         cfg = {"repo": "o/r", "actions": {"sha_pinning_required": True}}
