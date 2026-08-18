@@ -265,3 +265,56 @@ Non-obvious policy decisions are recorded in
 [docs/decisions/](docs/decisions/README.md). Read the relevant ADR before
 proposing to revert a policy — start with ADR 0001 (how bots write to
 protected branches).
+
+### Merge-setting fields go missing on a low-scope token
+
+- `GET /repos/{owner}/{repo}` returns the **merge-setting** fields —
+  `allow_merge_commit`, `allow_squash_merge`, `allow_rebase_merge`,
+  `allow_auto_merge`, `delete_branch_on_merge` — only to a token with
+  write-level access to the repo's contents. Below that the keys are **absent**,
+  not `false`. Non-merge fields (`has_wiki`, `default_branch`), rulesets and
+  `actions/permissions` stay visible, so the token looks perfectly alive.
+- The engine therefore treats an absent key as an informational **skip**, never
+  as drift and never as a `KeyError`. Keep it that way: a `KeyError` there
+  escapes both `plan_repo`'s `GhError` guard and `plan_repo_records`, taking the
+  whole fleet run down over one repo's payload. Never "fix" it by promoting an
+  absent key to drift.
+- Consequence for CI: while the fan-out App is scoped Administration + Actions +
+  Metadata (README, "CI fan-out" step 1), the scheduled run cannot audit or
+  reconcile the merge-method policy — those records come back as skips, and
+  merge-method drift is caught only by an operator `apply` under ambient
+  `gh auth`. Accept that gap knowingly, or widen the App and **verify** the keys
+  actually appear before trusting the audit again.
+- Never probe a read-scoped token by asking for `.delete_branch_on_merge` — an
+  absent key reads exactly like a dead token. Probe with
+  `gh api repos/<owner>/<repo>/actions/permissions --jq .enabled`.
+
+### Pull before you apply
+
+- `repo_settings.py apply` is a **converging** writer: it makes the fleet match
+  the checkout it runs from. `write_ruleset` PUTs the whole desired body, so a
+  stale checkout silently reverts everything merged since — a `bypass_actors`
+  grant added on `main` is stripped the moment someone applies from a branch
+  that predates it, with no error and no drift to show for it.
+- So: `git pull` immediately before any local `apply`, and after a failed or
+  partial run re-run from current `main` rather than assuming the legs that
+  already passed are still good.
+- Same hazard from the workflow: `workflow_dispatch` executes the engine and
+  `fleet.yml` **of the ref you dispatch**, not of `main`. Dispatch from `main`
+  unless you are deliberately testing a branch — a dispatch on a stale branch
+  produces a convincing, wrong audit.
+
+### A stray ruleset defeats a declared bypass
+
+- GitHub enforces the **union** of every ruleset on a repo, and a bypass actor
+  exempts only the ruleset that grants it. A leftover hand-made ruleset with an
+  empty `bypass_actors` therefore blocks the declared bypass App **and** admins,
+  even while `fleet.yml`'s managed ruleset grants both.
+- The engine is idempotent **by name** and never touches rulesets it does not
+  own (`schema.md`), so a stray never surfaces as drift. The symptom is a bot
+  still taking GH013 after its grant applied cleanly and `diff` reports
+  converged — that is the signature of a second ruleset, not a bug in the grant.
+- Before declaring a repo onboarded — especially one that already carried
+  protection by hand — enumerate its rulesets and delete the strays:
+  `gh api repos/<owner>/<repo>/rulesets --jq '.[] | "\(.id) \(.name)"'`.
+  Deletion stays manual and deliberate; the engine will not do it for you.
