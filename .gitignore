@@ -1,0 +1,14 @@
+# Python build artifacts. repo-settings had no .gitignore at all, so running
+# `python3 -m pytest tests/` left a dirty tree and four .pyc files were
+# committed by accident (removed from the index in the same commit as this
+# file). Mirrors agentskills' list -- same language, same toolchain, and no
+# reason for the two to disagree.
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+pytest-cache*
