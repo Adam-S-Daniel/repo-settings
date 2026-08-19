@@ -77,7 +77,29 @@ defaults:
 
 repos:
   # --- public, ruleset-safe (adversarially verified: no workflow pushes to main) ---
+  # agentskills carries the fleet's only required status check.
+  # `pytest-windows` is its Windows CI lane, added in agentskills #100 after 72
+  # tests were found failing on Windows -- three of the causes in SHIPPED code,
+  # on the platform most of those skills exist to run on. Left advisory, that
+  # lane catches a regression only when somebody happens to look at it.
+  #
+  # Two preconditions were checked before listing it, because both of the ways
+  # a required check hard-blocks every open PR live in the WORKFLOW, not here
+  # (AGENTS.md, "A required status check gets no `concurrency` group"):
+  #   * the context name is stable -- `pytest-windows` is a plain job id with
+  #     no `name:` and no `matrix`, so GitHub publishes the check under the job
+  #     id verbatim. Adding either renames the context, and a required context
+  #     that stops being reported blocks every open PR until this line is
+  #     updated to match.
+  #   * agentskills' ci.yml has no `concurrency:` block at all, at either
+  #     level, so no cancelled run can win the same head sha and wedge the
+  #     merge API with `405 Required status check ... is cancelled`.
+  # agentskills' scripts/test_ci_workflow.py parses that workflow and fails if
+  # either stops holding, so this list cannot be quietly outlived.
   - name: Adam-S-Daniel/agentskills
+    overrides:
+      ruleset:
+        required_status_checks: [pytest-windows]
   - name: Adam-S-Daniel/skills-evals
   - name: Adam-S-Daniel/claude-memory-map
   - name: Adam-S-Daniel/civic-azure-infra
