@@ -252,6 +252,31 @@ def build_ruleset_body(cfg: dict) -> dict:
                     "require_code_owner_review": False,
                     "require_last_push_approval": False,
                     "required_review_thread_resolution": False,
+                    # "Require an approval for changes not attributed to a
+                    # user." Dependabot's commits are exactly that, so a
+                    # Dependabot PR needs an extra approving review even where
+                    # `required_approving_review_count` is 0 -- the two
+                    # parameters are INDEPENDENT. A human-authored PR is
+                    # attributed and merges normally, which is why a fleet with
+                    # this on looks entirely healthy right up until the
+                    # unattended dependency path is the thing being watched.
+                    #
+                    # The discriminator is attributed-vs-unattributed
+                    # AUTHORSHIP, not the presence of a required status check:
+                    # agentskills carries a required check (`pytest-windows`)
+                    # and was measured with this parameter true along with
+                    # every other visible fleet ruleset (2026-08-20).
+                    #
+                    # Defaulted True because that is GitHub's own default and
+                    # what every fleet ruleset has silently carried since the
+                    # engine created it -- so a config that never mentions the
+                    # key renders exactly the ruleset it rendered before.
+                    # Always emitted, never conditional: `write_ruleset` PUTs
+                    # this whole body, so a key omitted here is a key GitHub
+                    # re-defaults to true on the next apply.
+                    "require_extra_approval_for_unattributed_changes": pr.get(
+                        "require_extra_approval_for_unattributed_changes", True
+                    ),
                     # Configurable, defaulting to all three so an existing
                     # config's rendered ruleset is unchanged. The fleet sets it
                     # explicitly: without that this rule RE-ASSERTS squash and
@@ -346,6 +371,18 @@ def normalize_ruleset(rs: dict | None) -> dict | None:
         "rule_types": sorted(rules_by_type.keys()),
         "pr_approvals": pr.get("required_approving_review_count"),
         "pr_dismiss_stale": bool(pr.get("dismiss_stale_reviews_on_push", False)),
+        # Compared, not merely written -- the same lesson as merge_methods
+        # below. Until this line existed the engine had no concept of the
+        # parameter at all: `apply` could never set it and `diff` could never
+        # report it, so the repo whose whole job is settings-as-code carried a
+        # live, load-bearing ruleset parameter that was neither declared nor
+        # audited. Absent from a payload (an API version predating the
+        # parameter) we read GitHub's own default, True, rather than False --
+        # guessing False there would report a CLEAN audit for a rule that is in
+        # fact being enforced.
+        "pr_extra_approval_unattributed": bool(
+            pr.get("require_extra_approval_for_unattributed_changes", True)
+        ),
         # Compared, not merely written: this was absent, so a hand-edit in the
         # UI adding squash back to the ruleset produced no drift and nothing
         # ever said so. Sorted because GitHub does not promise an order and an
@@ -370,6 +407,13 @@ def ruleset_doc(branch_rs: dict) -> dict:
             # into a DIFFERENT ruleset than the one it read -- silently widening
             # a merge-only repo back to all three methods.
             "allowed_merge_methods": norm["merge_methods"],
+            # Carried through for the same reason as allowed_merge_methods
+            # above: without it, `generate` against a repo that has this
+            # switched off emits a config that rebuilds with the True default
+            # -- silently re-arming the rule on the next apply.
+            "require_extra_approval_for_unattributed_changes": norm[
+                "pr_extra_approval_unattributed"
+            ],
         }
         if "pull_request" in norm["rule_types"]
         else None,

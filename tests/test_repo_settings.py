@@ -303,6 +303,177 @@ class RulesetMergeMethodTests(unittest.TestCase):
         )
 
 
+class RulesetUnattributedApprovalTests(unittest.TestCase):
+    """`require_extra_approval_for_unattributed_changes`.
+
+    The parameter that blocked the nightly Dependabot sweep fleet-wide
+    (skills-evals run 32342667620, 2026-08-20: three PRs mergeable with green
+    checks, `merged=0 updated=0 skipped=0 failed=3`). It is INDEPENDENT of
+    `required_approving_review_count` -- 0 approvals required and still an
+    approval demanded, because Dependabot's commits are unattributed.
+
+    The discriminator is attributed-vs-unattributed AUTHORSHIP, not the
+    presence of a required status check: agentskills has one
+    (`pytest-windows`) and measured this parameter true anyway.
+    """
+
+    KEY = "require_extra_approval_for_unattributed_changes"
+
+    # Verbatim shape of the live `pull_request` rule parameters, as returned by
+    # GET repos/Adam-S-Daniel/skills-evals/rules/branches/main on 2026-08-20.
+    LIVE_PR_PARAMS = {
+        "required_approving_review_count": 0,
+        "dismiss_stale_reviews_on_push": False,
+        "required_reviewers": [],
+        "require_code_owner_review": False,
+        "require_last_push_approval": False,
+        "required_review_thread_resolution": False,
+        "require_extra_approval_for_unattributed_changes": True,
+        "allowed_merge_methods": ["merge"],
+    }
+
+    OFF_CFG = {
+        "enabled": True,
+        "name": "default branch protection",
+        "require_pull_request": {
+            "required_approving_review_count": 0,
+            "allowed_merge_methods": ["merge"],
+            "require_extra_approval_for_unattributed_changes": False,
+        },
+    }
+
+    def _pr_params(self, body):
+        return next(
+            r["parameters"] for r in body["rules"] if r["type"] == "pull_request"
+        )
+
+    def _live(self, params):
+        return {
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [
+                {"type": "deletion"},
+                {"type": "non_fast_forward"},
+                {"type": "pull_request", "parameters": params},
+            ],
+            "bypass_actors": [
+                {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
+            ],
+        }
+
+    def test_body_always_states_the_key(self):
+        # write_ruleset PUTs the whole body, so a key that is only sometimes
+        # emitted is a key GitHub re-defaults to true on the next apply.
+        body = rs.build_ruleset_body(
+            {"enabled": True, "name": "n", "require_pull_request": {}}
+        )
+        self.assertIn(self.KEY, self._pr_params(body))
+
+    def test_default_is_githubs_default_true(self):
+        # A config that never mentioned the key must render exactly the ruleset
+        # it rendered before the engine learned the field.
+        body = rs.build_ruleset_body(
+            {"enabled": True, "name": "n", "require_pull_request": {}}
+        )
+        self.assertIs(self._pr_params(body)[self.KEY], True)
+
+    def test_config_switches_it_off(self):
+        body = rs.build_ruleset_body(dict(self.OFF_CFG))
+        self.assertIs(self._pr_params(body)[self.KEY], False)
+
+    def test_it_is_drift_compared(self):
+        # Absent from normalize_ruleset the field was invisible to `diff`, so
+        # the daily drift report could never report it.
+        on = rs.build_ruleset_body(
+            {"enabled": True, "name": "n", "require_pull_request": {}}
+        )
+        off = rs.build_ruleset_body(dict(self.OFF_CFG))
+        self.assertNotEqual(rs.normalize_ruleset(on), rs.normalize_ruleset(off))
+
+    def test_live_fleet_state_is_drift_against_the_declared_config(self):
+        live = self._live(dict(self.LIVE_PR_PARAMS))
+        desired = rs.build_ruleset_body(dict(self.OFF_CFG))
+        n_live = rs.normalize_ruleset(live)
+        n_want = rs.normalize_ruleset(desired)
+        self.assertIs(n_live["pr_extra_approval_unattributed"], True)
+        self.assertIs(n_want["pr_extra_approval_unattributed"], False)
+        self.assertNotEqual(n_live, n_want)
+
+    def test_a_payload_without_the_key_reads_as_true_not_false(self):
+        # Guessing False for an absent key would report a CLEAN audit for a
+        # rule GitHub is in fact enforcing.
+        params = dict(self.LIVE_PR_PARAMS)
+        del params[self.KEY]
+        norm = rs.normalize_ruleset(self._live(params))
+        self.assertIs(norm["pr_extra_approval_unattributed"], True)
+
+    def test_it_round_trips_through_generate(self):
+        # Without ruleset_doc carrying it, `generate` against a repo where it
+        # is off emits a config that rebuilds with the True default -- silently
+        # re-arming the rule on the next apply.
+        body = rs.build_ruleset_body(dict(self.OFF_CFG))
+        round_tripped = rs.build_ruleset_body(rs.ruleset_doc(body))
+        self.assertEqual(
+            rs.normalize_ruleset(round_tripped), rs.normalize_ruleset(body)
+        )
+        self.assertIs(self._pr_params(round_tripped)[self.KEY], False)
+
+    def test_a_ruleset_without_a_pull_request_rule_is_unaffected(self):
+        body = rs.build_ruleset_body(
+            {"enabled": True, "name": "n", "require_pull_request": None}
+        )
+        self.assertNotIn(
+            "pull_request", [r["type"] for r in body["rules"]]
+        )
+        # Still normalizes without raising, and reports GitHub's default.
+        self.assertIs(
+            rs.normalize_ruleset(body)["pr_extra_approval_unattributed"], True
+        )
+
+
+class FleetConfigTests(unittest.TestCase):
+    """The declaration itself, parsed -- never regex-scanned."""
+
+    FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
+
+    def setUp(self):
+        import yaml
+
+        with open(self.FLEET, encoding="utf-8") as fh:
+            self.cfg = yaml.safe_load(fh)
+
+    def test_defaults_declare_unattributed_approval_off(self):
+        pr = self.cfg["defaults"]["ruleset"]["require_pull_request"]
+        self.assertIs(
+            pr["require_extra_approval_for_unattributed_changes"], False
+        )
+
+    def test_defaults_render_into_a_ruleset_body_that_states_it(self):
+        body = rs.build_ruleset_body(self.cfg["defaults"]["ruleset"])
+        params = next(
+            r["parameters"] for r in body["rules"] if r["type"] == "pull_request"
+        )
+        self.assertIs(
+            params["require_extra_approval_for_unattributed_changes"], False
+        )
+
+    def test_no_repo_override_silently_re_arms_it(self):
+        # A per-repo override deep-merges over defaults; one that re-enabled
+        # the rule would re-break that repo's unattended path without saying so.
+        for entry in self.cfg["repos"]:
+            if isinstance(entry, str) or not entry.get("overrides"):
+                continue
+            merged = rs.deep_merge(self.cfg["defaults"], entry["overrides"])
+            pr = (merged.get("ruleset") or {}).get("require_pull_request")
+            if not pr:
+                continue
+            self.assertIs(
+                pr["require_extra_approval_for_unattributed_changes"],
+                False,
+                msg=f"{entry['name']} re-enables the unattributed-changes rule",
+            )
+
+
 class MergeMethodTests(unittest.TestCase):
     LIVE_ALL_ON = {
         "private": False,
