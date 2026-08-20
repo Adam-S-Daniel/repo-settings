@@ -51,6 +51,17 @@ ruleset:
     required_approving_review_count: 0   # 0 = PR required, self-merge allowed
     dismiss_stale_reviews: false
 
+    # "Require an approval for changes not attributed to a user."
+    # INDEPENDENT of required_approving_review_count above: with this true a
+    # PR whose commits are unattributed (Dependabot's are, by definition)
+    # needs an approving review even when the count is 0, and the merge API
+    # answers `mergeStateStatus=BLOCKED` / "the base branch policy prohibits
+    # the merge". Omit the key to get GitHub's own default, which is TRUE --
+    # so a ruleset this engine created has always carried it, silently, until
+    # the field became managed here. See "The unattributed-changes parameter"
+    # below.
+    require_extra_approval_for_unattributed_changes: false
+
   block_force_pushes: true               # adds the non_fast_forward rule
   block_deletions: true                  # adds the deletion rule
 
@@ -127,6 +138,7 @@ defaults:
     enforcement: active
     require_pull_request:
       required_approving_review_count: 0
+      require_extra_approval_for_unattributed_changes: false
     block_force_pushes: true
     block_deletions: true
     admin_bypass: true
@@ -187,6 +199,57 @@ drift check that merging can never clear, because the write never lands.
 If this account moves to Pro/Team/Enterprise, remove the `is_private()` branch
 in the `allow_auto_merge` block -- the write path already works; it is the plan
 that refuses it.
+
+## The unattributed-changes parameter (why it is declared, not defaulted)
+
+`require_extra_approval_for_unattributed_changes` sits inside the ruleset's
+`pull_request` rule and means "require an approving review for changes not
+attributed to a user". It is **independent of
+`required_approving_review_count`**: the count can be `0` and this can still
+demand an approval. Dependabot's commits are unattributed, so the two together
+produce a PR that is mergeable, has green checks, and that GitHub refuses:
+
+    mergeStateStatus=BLOCKED
+    Pull request ...#40 is not mergeable: the base branch policy prohibits the merge.
+
+Human-authored PRs are attributed and merge normally, so a fleet in this state
+looks entirely healthy — only the unattended dependency-merge path dies.
+Measured on the nightly sweep: skills-evals run
+[32342667620](https://github.com/Adam-S-Daniel/skills-evals/actions/runs/32342667620)
+(2026-08-20, scheduled, conclusion `failure`) ended `merged=0 updated=0
+skipped=0 failed=3`.
+
+**The discriminator is attributed-vs-unattributed authorship, not the presence
+of a required status check.** An early reading of the same failure blamed
+`required_status_checks: []`; it is wrong. `agentskills` carries a required
+check (`pytest-windows`) and measured this parameter `true` alongside every
+other visible fleet ruleset (agentskills, skills-evals, claude-memory-map,
+wsl-automation, fastmail-actions, GHA-bench, `_agent-guidance`; 2026-08-20).
+`repo-settings`' own ruleset could not be read for that measurement — it is
+private and rulesets need GitHub Pro (`GET .../rulesets` → 403 "Upgrade to
+GitHub Pro"), which is the same reason the engine skips its ruleset entirely.
+
+Three notes on how the engine treats it:
+
+- **Always written.** `build_ruleset_body` emits the key unconditionally, so
+  the converging `PUT` in `write_ruleset` always states it. A key omitted from
+  that body is a key GitHub re-defaults to `true` on the next apply.
+- **Compared, not merely written.** `normalize_ruleset` carries it, so an
+  undeclared value is drift the daily report shows — the same lesson
+  `allowed_merge_methods` taught. A payload that omits the key (an API version
+  predating the parameter) normalizes to GitHub's default `true`, not `false`:
+  guessing `false` would report a clean audit for a rule that is being
+  enforced.
+- **Round-tripped.** `ruleset_doc` emits it, so `generate` against a repo where
+  it is off cannot produce a config that silently re-arms it.
+
+Effective value on a live branch, in one read (works with plain repository read
+access, unlike `GET .../rulesets/{id}`):
+
+```bash
+gh api "repos/<owner>/<repo>/rules/branches/<branch>" \
+  --jq '.[] | select(.type=="pull_request") | .parameters'
+```
 
 ## Fork-PR approval values (verified against the live API)
 

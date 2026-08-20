@@ -47,6 +47,60 @@ defaults:
       # layer, and stating it stops the rule RE-ASSERTING squash and rebase on
       # every apply while the toggles beside it deny them.
       allowed_merge_methods: [merge]
+      # "Require an approval for changes not attributed to a user" -- a
+      # ruleset parameter INDEPENDENT of required_approving_review_count
+      # above. Dependabot's commits are unattributed by definition, so with
+      # this true a Dependabot PR needs an approving review even though the
+      # count beside it is 0, and GitHub answers the merge API with
+      # `mergeStateStatus=BLOCKED` / "the base branch policy prohibits the
+      # merge". That is what has been failing the nightly
+      # dependabot-auto-merge sweep fleet-wide -- skills-evals run
+      # 32342667620 (2026-08-20, scheduled): three PRs mergeable with green
+      # checks, `merged=0 updated=0 skipped=0 failed=3`.
+      #
+      # THE DISCRIMINATOR IS AUTHORSHIP, NOT REQUIRED CHECKS. An early read
+      # of the same failure blamed `required_status_checks: []` -- i.e. that
+      # repos without a required check were the failing ones. That is FALSE,
+      # and it is the reading someone will reach for again: agentskills HAS a
+      # required check (`pytest-windows`, declared in its overrides below) and
+      # still measured this parameter true. Human-authored PRs merge fine
+      # everywhere because they are attributed; only the unattended path
+      # dies, which is exactly why the fleet looked healthy.
+      #
+      # Measured true on 2026-08-20 on every fleet ruleset visible to the
+      # auditing credential -- agentskills, skills-evals, claude-memory-map,
+      # wsl-automation, fastmail-actions, GHA-bench, _agent-guidance. Nobody
+      # set it: GitHub defaults it to true, and until the engine learned the
+      # field it could be neither applied nor reported, so this repo carried
+      # a live load-bearing ruleset parameter that was undeclared and
+      # unaudited.
+      #
+      # why: false -- the fleet deliberately built an unattended
+      # dependency-merge path and this one parameter silently vetoes it. The
+      # path is not unguarded: Dependabot waits out a cooldown before a PR
+      # even opens (`default-days: 7`, `semver-major-days: 30` -- see
+      # .github/dependabot.yml), the sweep in
+      # .github/workflows/dependabot-auto-merge.yml re-checks a
+      # manifest-path allowlist against the PR's own diff and refuses
+      # anything outside it, it requires at least one concluded green check
+      # (never zero signal), and the merge-only policy above keeps the landed
+      # commit's parents intact.
+      #
+      # THE HONEST COST: with this false, a Dependabot PR that passes CI and
+      # the path allowlist merges into a protected default branch with NO
+      # human in the loop. That is the stated intent of the path rather than
+      # a side effect, and it is what the guards above exist for -- but it is
+      # a real transfer of trust to the guards, and the alternative is just
+      # as real: leave it true, accept that every Dependabot PR waits on a
+      # human approving review, and reframe the sweep as a reporter rather
+      # than a merger.
+      #
+      # Scope note: ADR 0001's "PR + auto-merge is not a sanctioned bot-write
+      # path" governs a bot PUBLISHING GENERATED DATA (badges, run summaries)
+      # onto a default branch -- that still goes to a results branch.
+      # Dependabot dependency PRs are the separate, already-declared
+      # unattended path (see repo.allow_auto_merge at the top of this block).
+      require_extra_approval_for_unattributed_changes: false
     block_force_pushes: true
     block_deletions: true
     required_status_checks: []
