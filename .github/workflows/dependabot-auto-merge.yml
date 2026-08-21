@@ -182,10 +182,19 @@ jobs:
           BLOCKED_PRS=0
           FAILED=0
 
-          # Why the base branch policy is refusing, probed at most once per
-          # run and reused for every BLOCKED PR (they all share one base).
+          # Why the base branch policy is refusing, re-probed whenever the
+          # base CHANGES (so a run alternating bases probes each time it
+          # switches -- correct always, minimal only in the common case where
+          # the PRs are grouped by base, which is the trade taken over
+          # carrying a per-base map). It used to be probed once per RUN, on the comment
+          # that Dependabot's PRs "all share one base" -- true today, and
+          # silently wrong the moment one targets a different branch: every
+          # later BLOCKED PR would carry the FIRST base's diagnosis with
+          # nothing saying so, which is worse than no diagnosis because it
+          # reads like one.
           BLOCKED_CAUSE=""
-          BLOCKED_PROBED=0
+          BLOCKED_PROBED_BASE=""
+          BLOCKED_BASES=""
 
           diagnose_blocked() {
             local base rules extra approvals
@@ -194,10 +203,19 @@ jobs:
             # false `cond` makes the AND-list itself non-zero, and whether
             # that is exempt is exactly the shell subtlety not worth relying
             # on inside a job that merges to a protected branch.
-            if [ "$BLOCKED_PROBED" = "1" ]; then
+            # Re-probe whenever the base changes. The emptiness guard is
+            # deliberate rather than defensive noise: an empty base would
+            # otherwise compare equal to the initial value on the very first
+            # call and suppress the probe entirely, leaving BLOCKED_CAUSE
+            # empty and the error line trailing off after "Cause: ".
+            if [ -n "$BLOCKED_PROBED_BASE" ] && [ "$base" = "$BLOCKED_PROBED_BASE" ]; then
               return 0
             fi
-            BLOCKED_PROBED=1
+            BLOCKED_PROBED_BASE="$base"
+            case " ${BLOCKED_BASES} " in
+              *" ${base} "*) ;;
+              *) BLOCKED_BASES="${BLOCKED_BASES}${BLOCKED_BASES:+ }${base}" ;;
+            esac
 
             # The EFFECTIVE rules for the branch, in one read. This endpoint
             # needs only repository read access, unlike GET .../rulesets/{id}
@@ -306,7 +324,7 @@ jobs:
             # the branch rather than retrying the merge.
             if [ "$merge_state" = "BLOCKED" ]; then
               diagnose_blocked "$base"
-              echo "::error::blocked #${num} — mergeable with green checks, but GitHub's base branch policy refuses the merge (mergeStateStatus=BLOCKED); not attempting it. Cause: ${BLOCKED_CAUSE}"
+              echo "::error::blocked #${num} — mergeable with green checks, but GitHub's base branch policy refuses the merge (mergeStateStatus=BLOCKED); not attempting it. Cause (base ${base}): ${BLOCKED_CAUSE}"
               BLOCKED_PRS=$((BLOCKED_PRS + 1))
               continue
             fi
@@ -371,7 +389,15 @@ jobs:
           # What was wrong before was never the red — it was that the red
           # said nothing.
           if [ "$BLOCKED_PRS" -gt 0 ]; then
-            echo "::error::${BLOCKED_PRS} Dependabot PR(s) blocked by the base branch policy — ${BLOCKED_CAUSE}"
+            # shellcheck disable=SC2086  # deliberate word-splitting: count bases
+            set -- ${BLOCKED_BASES}
+            if [ "$#" -gt 1 ]; then
+              # BLOCKED_CAUSE holds only the LAST base probed, so naming it
+              # here would attribute one branch's policy to every branch.
+              echo "::error::${BLOCKED_PRS} Dependabot PR(s) blocked by the base branch policy across $# base branches (${BLOCKED_BASES}) — see the per-PR causes above."
+            else
+              echo "::error::${BLOCKED_PRS} Dependabot PR(s) blocked by the base branch policy — ${BLOCKED_CAUSE}"
+            fi
           fi
           if [ "$FAILED" -gt 0 ]; then
             echo "::error::${FAILED} Dependabot PR(s) could be neither merged nor updated — see the errors above."

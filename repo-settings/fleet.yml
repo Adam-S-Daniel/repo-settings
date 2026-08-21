@@ -86,14 +86,21 @@ defaults:
       # (never zero signal), and the merge-only policy above keeps the landed
       # commit's parents intact.
       #
-      # THE HONEST COST: with this false, a Dependabot PR that passes CI and
-      # the path allowlist merges into a protected default branch with NO
-      # human in the loop. That is the stated intent of the path rather than
-      # a side effect, and it is what the guards above exist for -- but it is
-      # a real transfer of trust to the guards, and the alternative is just
-      # as real: leave it true, accept that every Dependabot PR waits on a
-      # human approving review, and reframe the sweep as a reporter rather
-      # than a merger.
+      # THE HONEST COST: this parameter governs EVERY unattributed change on
+      # these branches, not only Dependabot's -- any App- or bot-authored
+      # commit loses the same gate. With it false, an unattributed PR that
+      # passes CI and the path allowlist merges into a protected default
+      # branch with NO human in the loop. That is the stated intent of the
+      # path rather than a side effect, and it is what the guards above exist
+      # for -- but it is a real transfer of trust to the guards, and the
+      # alternative is just as real: leave it true, accept that every such PR
+      # waits on a human approving review, and reframe the sweep as a
+      # reporter rather than a merger.
+      #
+      # Practically narrow today -- only write-access actors plus Dependabot
+      # can open PRs here, and required_approving_review_count: 0 already lets
+      # a human self-merge -- but this paragraph is what someone reads to
+      # decide whether the flip was right, so it states the real scope.
       #
       # Scope note: ADR 0001's "PR + auto-merge is not a sanctioned bot-write
       # path" governs a bot PUBLISHING GENERATED DATA (badges, run summaries)

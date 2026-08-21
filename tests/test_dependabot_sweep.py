@@ -72,7 +72,17 @@ case "$1 ${2:-}" in
   "pr update-branch")
     ;;
   "api "*|"api")
-    if [ -f "$FIXTURES/rules.json" ]; then
+    # `repos/<owner>/<repo>/rules/branches/<base>` -- serve that base's rules
+    # when the fixture names one, so a multi-base run can be given genuinely
+    # different policies per branch. Strip the known PREFIX rather than
+    # taking the last path segment: a branch name may legally contain `/`
+    # (`release/2`), and the real endpoint takes it verbatim. `/` is not
+    # usable in a filename, so the fixture spells it `__`.
+    base="${2#*/rules/branches/}"
+    base="${base//\//__}"
+    if [ -f "$FIXTURES/rules-$base.json" ]; then
+      cat "$FIXTURES/rules-$base.json"
+    elif [ -f "$FIXTURES/rules.json" ]; then
       cat "$FIXTURES/rules.json"
     else
       # gh api on an HTTP error prints the error BODY to STDOUT and exits 1.
@@ -122,17 +132,17 @@ class SweepGateTests(unittest.TestCase):
                 )
         cls.script = sweep_script()
 
-    def _pr(self, number, merge_state, checks=("SUCCESS",)):
+    def _pr(self, number, merge_state, checks=("SUCCESS",), base="main"):
         return {
             "number": number,
-            "baseRefName": "main",
+            "baseRefName": base,
             "headRefOid": "0" * 40,
             "mergeable": "MERGEABLE",
             "mergeStateStatus": merge_state,
             "statusCheckRollup": [{"conclusion": c} for c in checks],
         }
 
-    def _run(self, prs, rules=None, merge_fails=()):
+    def _run(self, prs, rules=None, merge_fails=(), rules_by_base=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -150,6 +160,11 @@ class SweepGateTests(unittest.TestCase):
             )
         if rules is not None:
             (fixtures / "rules.json").write_text(json.dumps(rules), encoding="utf-8")
+        for base, base_rules in (rules_by_base or {}).items():
+            # Mirrors the stub: `/` is not usable in a filename.
+            (fixtures / f"rules-{base.replace('/', '__')}.json").write_text(
+                json.dumps(base_rules), encoding="utf-8"
+            )
         (fixtures / "calls.log").write_text("", encoding="utf-8")
 
         for name, body in (("gh", GH_STUB), ("git", GIT_STUB)):
@@ -216,6 +231,52 @@ class SweepGateTests(unittest.TestCase):
         self.assertIn(
             "merged=0 updated=0 skipped=0 blocked=3 failed=0", proc.stdout
         )
+
+    def test_cause_is_reprobed_when_the_base_changes(self):
+        # The cache used to be keyed on nothing at all -- probed once per RUN,
+        # on the comment that Dependabot's PRs "all share one base". True
+        # today; silently wrong the moment one targets a different branch,
+        # because every later BLOCKED PR then carried the FIRST base's
+        # diagnosis with nothing saying so. A confident wrong diagnosis is
+        # worse than none: it sends the reader to a policy that is fine.
+        generic = json.loads(json.dumps(LIVE_PR_RULE))
+        del generic["parameters"]["require_extra_approval_for_unattributed_changes"]
+        proc, calls = self._run(
+            [self._pr(40, "BLOCKED"), self._pr(41, "BLOCKED", base="release/2")],
+            rules_by_base={"main": [LIVE_PR_RULE], "release/2": [generic]},
+        )
+        self.assertEqual(
+            sum(1 for line in calls.splitlines() if line.startswith("api ")), 2
+        )
+        # Each PR gets ITS OWN base's cause, and says which base it is about.
+        self.assertIn(
+            "Cause (base main): the base branch ruleset sets "
+            "require_extra_approval_for_unattributed_changes=true",
+            proc.stdout,
+        )
+        self.assertIn("Cause (base release/2): the base branch policy refused", proc.stdout)
+
+    def test_summary_does_not_pin_one_cause_on_several_bases(self):
+        # BLOCKED_CAUSE holds only the LAST base probed, so the roll-up line
+        # must not name it when the run spanned more than one base.
+        generic = json.loads(json.dumps(LIVE_PR_RULE))
+        del generic["parameters"]["require_extra_approval_for_unattributed_changes"]
+        proc, _ = self._run(
+            [self._pr(40, "BLOCKED"), self._pr(41, "BLOCKED", base="release/2")],
+            rules_by_base={"main": [LIVE_PR_RULE], "release/2": [generic]},
+        )
+        self.assertIn("across 2 base branches (main release/2)", proc.stdout)
+        self.assertIn("see the per-PR causes above", proc.stdout)
+
+    def test_summary_still_names_the_cause_for_a_single_base(self):
+        prs = [self._pr(n, "BLOCKED") for n in (38, 39)]
+        proc, _ = self._run(prs, rules=[LIVE_PR_RULE])
+        self.assertIn(
+            "2 Dependabot PR(s) blocked by the base branch policy — "
+            "the base branch ruleset sets",
+            proc.stdout,
+        )
+        self.assertNotIn("base branches", proc.stdout)
 
     def test_unreadable_rules_still_skip_and_say_so(self):
         # No rules.json -> the stub reproduces gh's error-body-on-stdout

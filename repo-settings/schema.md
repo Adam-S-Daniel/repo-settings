@@ -251,6 +251,16 @@ gh api "repos/<owner>/<repo>/rules/branches/<branch>" \
   --jq '.[] | select(.type=="pull_request") | .parameters'
 ```
 
+Fine to type by hand; do **not** lift that shape into a script. On an HTTP
+error `gh api` prints the error JSON **body** to stdout, the `--jq` filter
+never runs, and it exits 1 — so `out=$(cmd) || true` captures the error body as
+though it were a result. Reproduced against this repo, which is private without
+GitHub Pro and so has no ruleset at all: the endpoint returns its 403 body and
+`jq` then fails with `Cannot index string with string "type"`. In a script,
+separate the fetch from the filter and discard the output explicitly on failure
+(`rules=$(gh api … 2>/dev/null) || rules=""`), which is what
+`dependabot-auto-merge.yml`'s `diagnose_blocked` does three files away.
+
 ## Fork-PR approval values (verified against the live API)
 
 The correct enum values are the short forms returned by
