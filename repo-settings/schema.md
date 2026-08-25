@@ -106,6 +106,18 @@ repo:
   # API) fails outright, independent of branch-protection/ruleset state.
   # Omit the key, or set it to null, to leave it unmanaged.
   allow_auto_merge: true
+
+  # "Automatically delete head branches" (repo Settings -> General -> Pull
+  # Requests). Unlike allow_auto_merge above this is NOT plan-gated -- it is
+  # honoured on private repos too, so it needs no downgrade handling.
+  #
+  # It matters more than tidiness. A bot that proposes from a fixed branch
+  # name cannot re-propose while a branch of that name still exists carrying
+  # content it did not write, and refusing to force-push over it is correct.
+  # So a merged PR whose branch outlives it silently disables that bot for the
+  # repo, with nothing going red. Omit the key, or set it to null, to leave it
+  # unmanaged.
+  delete_branch_on_merge: true
 ```
 
 **Collision with the single-repo shape's identifier field:** the single-repo

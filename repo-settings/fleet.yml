@@ -32,6 +32,33 @@ defaults:
     allow_merge_commit: true
     allow_squash_merge: false
     allow_rebase_merge: false
+    # "Automatically delete head branches". Not tidiness — it is what keeps
+    # the fleet's own bots working.
+    #
+    # A bot that proposes from a FIXED branch name (skills-lock-bump/update,
+    # agents-md-sync/update) refuses to force-push a branch of that name whose
+    # content it did not write. That refusal is correct — it is what stops the
+    # bot clobbering a reviewer's commit — but it does not distinguish "a
+    # reviewer pushed here" from "this branch is the residue of a PR that
+    # merged and was never deleted". In the second case the bot is disabled
+    # for that repo permanently, and nothing anywhere goes red: it exits 0,
+    # and the repo simply stops receiving updates.
+    #
+    # Measured 2026-08-25: five of the ten lock-carrying repos —
+    # agentskills-private, fastmail-actions, repo-settings, wsl-automation and
+    # jodidaniel/scratch-claude-002 — had been stuck exactly that way since
+    # 2026-08-21, each serving a four-day-old skills bundle while its own
+    # session-start verdict read OK.
+    #
+    # Two layers, deliberately: _agent-guidance's bumper now deletes its own
+    # branch after merging, and this is the backstop for every other
+    # automation that does not.
+    #
+    # NOT plan-gated, unlike allow_auto_merge above: GitHub honours this on
+    # private repos too, so no downgrade/skip handling is needed. It does NOT
+    # reach the three cms-platform-managed repos, which carry `manage: false`
+    # below and are governed by cms-platform's own repo-settings.yml.
+    delete_branch_on_merge: true
   actions:
     sha_pinning_required: true
     fork_pr_approval: all_external_contributors

@@ -136,6 +136,94 @@ class RulesetDocTests(unittest.TestCase):
         )
 
 
+class DeleteBranchOnMergeTests(unittest.TestCase):
+    """"Automatically delete head branches" — the fleet-wide backstop that keeps
+    fixed-branch-name bots working.
+
+    A bot proposing from a fixed branch refuses to force-push a branch of that
+    name whose content it did not write. Correct — but it cannot tell a
+    reviewer's commit from the residue of a PR that merged and was never
+    deleted, so the second case disables the bot for that repo permanently with
+    nothing going red. Measured 2026-08-25: five of ten lock-carrying repos,
+    stuck since 2026-08-21.
+    """
+
+    def test_drift_when_desired_true_and_live_false(self):
+        with patch.object(rs, "get_repo",
+                          return_value={"private": False, "delete_branch_on_merge": False}):
+            records = rs.plan_repo("o/r", {"repo": {"delete_branch_on_merge": True}})
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["setting"], "repo.delete_branch_on_merge")
+        self.assertEqual(rec["status"], "drift")
+        self.assertEqual(rec["current"], False)
+        self.assertEqual(rec["desired"], True)
+
+    def test_match_when_desired_true_and_live_true(self):
+        with patch.object(rs, "get_repo",
+                          return_value={"private": False, "delete_branch_on_merge": True}):
+            records = rs.plan_repo("o/r", {"repo": {"delete_branch_on_merge": True}})
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "match")
+
+    def test_private_repo_is_managed_not_skipped(self):
+        """The distinction from allow_auto_merge, and the reason this has no
+        private gate: GitHub honours this one on every plan. Skipping private
+        repos here would leave exactly the repos that went stale unmanaged —
+        four of the five measured were private."""
+        with patch.object(rs, "get_repo",
+                          return_value={"private": True, "delete_branch_on_merge": False}):
+            records = rs.plan_repo("o/r", {"repo": {"delete_branch_on_merge": True}})
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "drift")
+
+    def test_omitted_key_is_unmanaged(self):
+        with patch.object(rs, "get_repo") as mock_get_repo:
+            records = rs.plan_repo("o/r", {"repo": {}})
+        self.assertEqual(records, [])
+        mock_get_repo.assert_not_called()
+
+    def test_explicit_null_is_unmanaged(self):
+        with patch.object(rs, "get_repo") as mock_get_repo:
+            records = rs.plan_repo("o/r", {"repo": {"delete_branch_on_merge": None}})
+        self.assertEqual(records, [])
+        mock_get_repo.assert_not_called()
+
+    def test_absent_field_is_skipped_not_a_crash(self):
+        """This is one of the MERGE-SETTING fields GitHub withholds from a
+        low-scope token — absent, not false. A subscript would KeyError past
+        plan_repo_records' GhError-only guard and abort the fleet run."""
+        with patch.object(rs, "get_repo", return_value={"private": False, "name": "r"}):
+            records = rs.plan_repo("o/r", {"repo": {"delete_branch_on_merge": True}})
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["setting"], "repo.delete_branch_on_merge")
+        self.assertEqual(rec["status"], "skipped")
+        self.assertIn("delete_branch_on_merge", rec["note"])
+
+    def test_absent_field_does_not_abort_fleet_run(self):
+        with patch.object(rs, "get_repo", return_value={"private": False, "name": "r"}):
+            records = rs.plan_repo_records("o/r", {"repo": {"delete_branch_on_merge": True}})
+        self.assertEqual([r["status"] for r in records], ["skipped"])
+
+    def test_read_failure_isolated_into_error_record(self):
+        with patch.object(rs, "get_repo", side_effect=rs.GhError(500, "boom")):
+            records = rs.plan_repo_records("o/r", {"repo": {"delete_branch_on_merge": True}})
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "error")
+
+    def test_apply_patches_the_repo(self):
+        """The writer is reachable from the record the planner emits — a plan
+        whose _writer nothing dispatches is drift that never converges."""
+        with patch.object(rs, "get_repo",
+                          return_value={"private": False, "delete_branch_on_merge": False}):
+            rec = rs.plan_repo("o/r", {"repo": {"delete_branch_on_merge": True}})[0]
+        with patch.object(rs, "gh_api") as mock_api:
+            rs.apply_record("o/r", rec)
+        mock_api.assert_called_once_with(
+            "repos/o/r", method="PATCH", body={"delete_branch_on_merge": True})
+
+
 class AllowAutoMergeTests(unittest.TestCase):
     def test_drift_when_desired_true_and_live_false(self):
         with patch.object(rs, "get_repo", return_value={"private": False, "allow_auto_merge": False}):
