@@ -23,6 +23,9 @@ Managed settings:
   * repo.allow_auto_merge                  -> repos/{repo}  (PATCH; skipped on
                                                private repos -- see the downgrade
                                                note below, it is plan-gated there)
+  * repo.delete_branch_on_merge            -> repos/{repo}  (PATCH; absent key
+                                                            on a low-scope token
+                                                            is a skip)
   * repo.allow_merge_commit                -> repos/{repo}  (PATCH, one call for
     repo.allow_squash_merge                   the whole group -- see
     repo.allow_rebase_merge                   write_merge_methods)
@@ -145,6 +148,10 @@ def default_branch(repo: str) -> str:
 
 def write_allow_auto_merge(repo: str, desired: bool) -> None:
     gh_api(f"repos/{repo}", method="PATCH", body={"allow_auto_merge": desired})
+
+
+def write_delete_branch_on_merge(repo: str, desired: bool) -> None:
+    gh_api(f"repos/{repo}", method="PATCH", body={"delete_branch_on_merge": desired})
 
 
 # The merge-method toggles, in the order GitHub's own UI lists them.
@@ -634,6 +641,59 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
                         }
                     )
 
+    # -- delete branch on merge ---------------------------------------------- #
+    # "Automatically delete head branches". A plain repo field like the merge
+    # toggles below — honoured on every plan, public and private alike — so it
+    # gets no private gate of the kind allow_auto_merge needs above.
+    #
+    # WHY IT IS MANAGED AT ALL, since a leftover branch sounds cosmetic. A bot
+    # that opens a pull request from a fixed branch name cannot re-propose
+    # while a branch of that name still exists carrying content it did not
+    # write, and refusing to force-push over it is the correct behaviour —
+    # that rule is what stops it clobbering a reviewer's commit. So a merged
+    # PR whose branch outlives it silently disables the bot for that repo, and
+    # nothing goes red: the bot exits 0 and the repo just stops receiving
+    # updates. Measured 2026-08-25: five of ten lock-carrying repos had been
+    # stuck that way since 2026-08-21, serving a stale skills bundle while
+    # their own session-start verdict read OK.
+    #
+    # _agent-guidance's bumper now deletes its own branch after merging, which
+    # is the fix for the bot that has one. This setting is the fleet-wide
+    # backstop for every OTHER automation, present and future, that does not.
+    delete_on_merge = repo_cfg.get("delete_branch_on_merge", "unset")
+    if delete_on_merge != "unset" and delete_on_merge is not None:
+        desired = bool(delete_on_merge)
+        try:
+            repo_obj = get_repo(repo)
+        except GhError as e:
+            records.append(_err("repo.delete_branch_on_merge", desired, e))
+        else:
+            # The same defensive read as the two blocks around it, and for the
+            # same reason: this is one of the MERGE-SETTING fields GitHub
+            # returns only to a token with write-level contents access. Below
+            # that the key is ABSENT, not false — so a subscript here would
+            # KeyError past plan_repo_records' GhError-only guard and take the
+            # whole fleet run down over one repo's payload. See AGENTS.md,
+            # "Merge-setting fields go missing on a low-scope token".
+            if "delete_branch_on_merge" not in repo_obj:
+                records.append(
+                    _skip("repo.delete_branch_on_merge", desired,
+                          "GitHub did not return delete_branch_on_merge for this "
+                          "repo (token scope or payload shape) — leaving it "
+                          "unmanaged")
+                )
+            else:
+                current = bool(repo_obj["delete_branch_on_merge"])
+                records.append(
+                    {
+                        "setting": "repo.delete_branch_on_merge",
+                        "status": "match" if current == desired else "drift",
+                        "current": current,
+                        "desired": desired,
+                        "_writer": ("delete_branch_on_merge", None, desired),
+                    }
+                )
+
     # -- merge methods ------------------------------------------------------- #
     # No plan gate, unlike allow_auto_merge above: these are ordinary
     # repository fields honoured on every plan, public and private alike, so
@@ -728,6 +788,8 @@ def apply_record(repo: str, rec: dict) -> None:
         write_allow_auto_merge(repo, b)
     elif kind == "merge_methods":
         write_merge_methods(repo, b)
+    elif kind == "delete_branch_on_merge":
+        write_delete_branch_on_merge(repo, b)
 
 
 # --------------------------------------------------------------------------- #
