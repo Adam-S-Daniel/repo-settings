@@ -8,6 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import argparse
+import contextlib
+import io
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
@@ -717,3 +720,126 @@ class FaultIsolationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoverageTests(unittest.TestCase):
+    """`coverage` answers a question no other command asks: which repos this
+    credential can administer that the config never mentions.
+
+    Declared, not managed. A repo carrying `manage: false` is a decision
+    somebody wrote down; a repo absent from the file is a decision nobody has
+    made, and from the outside those looked identical.
+    """
+
+    CFG = {
+        "defaults": {},
+        "repos": [
+            {"name": "acme/declared-managed"},
+            {"name": "acme/declared-unmanaged", "manage": False},
+        ],
+    }
+
+    def _run(self, reachable, owner=None):
+        args = argparse.Namespace(config="ignored.yml", owner=owner)
+        with patch.object(rs, "load_config", return_value=self.CFG), \
+             patch.object(rs, "installation_repos", return_value=reachable):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = rs.cmd_coverage(args)
+        return rc, buf.getvalue()
+
+    def test_every_reachable_repo_declared_is_clean(self):
+        rc, out = self._run(["acme/declared-managed", "acme/declared-unmanaged"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("UNDECLARED", out)
+        self.assertIn("2 reachable, 2 declared, 0 undeclared", out)
+
+    def test_an_undeclared_repo_is_reported_and_exits_one(self):
+        rc, out = self._run(
+            ["acme/declared-managed", "acme/declared-unmanaged", "acme/brand-new"]
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("UNDECLARED  acme/brand-new", out)
+        self.assertIn("3 reachable, 2 declared, 1 undeclared", out)
+
+    def test_manage_false_is_declared_not_undeclared(self):
+        """The whole distinction. A repo deliberately left unmanaged has been
+        decided about, and reporting it would train the reader to ignore the
+        report -- which is how a nudge stops being a nudge."""
+        rc, out = self._run(["acme/declared-unmanaged"])
+        self.assertEqual(rc, 0)
+        self.assertIn("declared, manage: false", out)
+        self.assertNotIn("UNDECLARED", out)
+
+    def test_an_empty_enumeration_refuses_rather_than_certifying(self):
+        """Never pass vacuously: a clean line over zero repos reads exactly
+        like a clean line over all of them."""
+        rc, _ = self._run([])
+        self.assertEqual(rc, 2)
+
+    def test_a_single_repo_config_has_no_fleet_to_be_complete_about(self):
+        args = argparse.Namespace(config="ignored.yml", owner=None)
+        with patch.object(rs, "load_config", return_value={"repo": "acme/one"}), \
+             patch.object(rs, "installation_repos") as enumerate_mock:
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = rs.cmd_coverage(args)
+        self.assertEqual(rc, 2)
+        # And it did not spend an API call establishing that.
+        enumerate_mock.assert_not_called()
+
+    def test_comparison_is_case_insensitive(self):
+        """GitHub preserves the case an owner typed and matches irrespective of
+        it, so a config that spells a name differently from the API is the same
+        repo -- reporting it undeclared would send someone to add a duplicate."""
+        rc, out = self._run(["ACME/Declared-Managed", "acme/declared-unmanaged"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("UNDECLARED", out)
+
+
+class InstallationReposTests(unittest.TestCase):
+    """The enumeration itself: pagination, shape, and the owner filter."""
+
+    @staticmethod
+    def _page(names):
+        return {"repositories": [{"full_name": n} for n in names]}
+
+    def test_owner_filter_keeps_only_that_account(self):
+        with patch.object(rs, "gh_api", return_value=self._page(
+                ["acme/one", "other/two", "ACME/three"])):
+            self.assertEqual(
+                rs.installation_repos("acme"), ["ACME/three", "acme/one"]
+            )
+
+    def test_no_owner_keeps_everything(self):
+        with patch.object(rs, "gh_api", return_value=self._page(
+                ["acme/one", "other/two"])):
+            self.assertEqual(rs.installation_repos(None), ["acme/one", "other/two"])
+
+    def test_it_pages(self):
+        """A full page means there may be another. Stopping at the first would
+        silently truncate the denominator, which is the failure this whole
+        command exists to prevent -- one level down."""
+        first = self._page([f"acme/r{i:03d}" for i in range(100)])
+        second = self._page(["acme/last"])
+        with patch.object(rs, "gh_api", side_effect=[first, second]) as api:
+            got = rs.installation_repos(None)
+        self.assertEqual(len(got), 101)
+        self.assertIn("acme/last", got)
+        self.assertEqual(api.call_count, 2)
+        self.assertIn("page=2", api.call_args_list[1].args[0])
+
+    def test_a_short_page_ends_the_walk(self):
+        with patch.object(rs, "gh_api", return_value=self._page(["acme/one"])) as api:
+            rs.installation_repos(None)
+        self.assertEqual(api.call_count, 1)
+
+    def test_an_empty_response_is_not_an_infinite_loop(self):
+        with patch.object(rs, "gh_api", return_value={"repositories": []}) as api:
+            self.assertEqual(rs.installation_repos(None), [])
+        self.assertEqual(api.call_count, 1)
+
+    def test_a_null_payload_is_survivable(self):
+        """`gh api` returns None for an empty body. Reaching into that with
+        .get would be an AttributeError dressed up as an enumeration failure."""
+        with patch.object(rs, "gh_api", return_value=None):
+            self.assertEqual(rs.installation_repos(None), [])

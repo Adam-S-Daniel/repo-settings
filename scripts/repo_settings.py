@@ -880,6 +880,88 @@ def _filter_owner(targets: list[dict], owner: str | None) -> list[dict]:
     return [t for t in targets if t["repo"].split("/", 1)[0].lower() == o]
 
 
+def installation_repos(owner: str | None) -> list[str]:
+    """Every repository this credential can administer, as `owner/name`.
+
+    `/installation/repositories` rather than `/users/{o}/repos` or
+    `/orgs/{o}/repos`, for three reasons and the third is the one that matters:
+    it does not require knowing whether an account is a user or an org; it is
+    paginated identically either way; and it returns EXACTLY the set the App
+    can act on, which is the set this coverage question is actually about. A
+    user listing would happily return repos the App was never installed on,
+    and reporting those as "undeclared" would be reporting a gap nothing in
+    this repo could close.
+    """
+    repos: list[str] = []
+    page = 1
+    while True:
+        # `gh api` follows no pagination of its own here because the response
+        # is an OBJECT, not an array, so --paginate would concatenate objects.
+        payload = gh_api(f"/installation/repositories?per_page=100&page={page}")
+        chunk = (payload or {}).get("repositories") or []
+        if not chunk:
+            break
+        repos.extend(r["full_name"] for r in chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+    if owner:
+        o = owner.lower()
+        repos = [r for r in repos if r.split("/", 1)[0].lower() == o]
+    return sorted(repos)
+
+
+def cmd_coverage(args) -> int:
+    """Report repositories the credential can administer that `fleet.yml` does
+    not DECLARE.
+
+    Declared, not managed. A repo carrying `manage: false` is a decision
+    somebody wrote down and is not reported; a repo absent from the file
+    entirely is a decision nobody has made, and until this command existed the
+    two were indistinguishable from the outside. Same shape as the
+    `skills_bootstrap` partition in `_agent-guidance` (its ADR 0011), for the
+    same reason: an allowlist that says nothing about what it omits cannot be
+    audited for completeness.
+
+    Exit 0 when every reachable repo is declared, 1 when some are not, and 2
+    when the question could not be asked -- never 0 on an enumeration that
+    failed, because a clean line over zero repos reads exactly like a clean
+    line over all of them.
+    """
+    cfg = load_config(args.config)
+    if "repos" not in cfg:
+        sys.stderr.write(
+            "coverage: this config is single-repo shaped; there is no fleet to "
+            "be complete about.\n"
+        )
+        return 2
+
+    declared = {t["repo"].lower(): t for t in resolve_targets(cfg, None)}
+    reachable = installation_repos(getattr(args, "owner", None))
+    if not reachable:
+        sys.stderr.write(
+            "coverage: the installation reported no repositories -- refusing to "
+            "certify a fleet as complete against an empty enumeration.\n"
+        )
+        return 2
+
+    undeclared = [r for r in reachable if r.lower() not in declared]
+    for repo in reachable:
+        t = declared.get(repo.lower())
+        if t is None:
+            print(f"UNDECLARED  {repo}: reachable by this credential, absent from the config")
+        elif not t["manage"]:
+            print(f"OK          {repo}: declared, manage: false")
+        else:
+            print(f"OK          {repo}: declared and managed")
+
+    print(
+        f"\n{len(reachable)} reachable, {len(reachable) - len(undeclared)} declared, "
+        f"{len(undeclared)} undeclared"
+    )
+    return 1 if undeclared else 0
+
+
 def cmd_diff(args) -> int:
     cfg = load_config(args.config)
     targets = _filter_owner(resolve_targets(cfg, args.repo), getattr(args, "owner", None))
@@ -943,6 +1025,14 @@ def main() -> int:
     a.add_argument("--owner", help="only process repos under this owner (account)")
     a.add_argument("--dry-run", action="store_true", help="preview only")
     a.set_defaults(func=cmd_apply)
+
+    c = sub.add_parser(
+        "coverage",
+        help="report repos this credential can administer that the config does not declare",
+    )
+    c.add_argument("--config", required=True)
+    c.add_argument("--owner", help="only consider repos under this owner (account)")
+    c.set_defaults(func=cmd_coverage)
 
     args = p.parse_args()
     try:
