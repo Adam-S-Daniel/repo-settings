@@ -75,10 +75,23 @@ configured, the workflow **skips itself** (guarded on
    Administration + Actions **write** reach is every repo in both accounts.
    `fleet.yml` declares 21 repos (the engine manages 16 of them -- five carry
    `manage: false`), and declared-vs-in-account is equal today: 21 and 21, no
-   difference either way (verified 2026-08-29). So the exposure is prospective --
-   the next repo created in either account is the first that will sit inside the
-   App's reach while appearing in no registry. Nothing here audits that: the
-   engine reads `fleet.yml` and never enumerates an account to compare.
+   difference either way (verified 2026-08-29). So the exposure was prospective --
+   the next repo created in either account would be the first to sit inside the
+   App's reach while appearing in no registry.
+   **That is now audited.** `repo_settings.py coverage` asks
+   `/installation/repositories` what the credential can actually administer and
+   reports anything `fleet.yml` does not DECLARE; the weekly workflow runs it
+   per owner and files a `ci`-labelled issue naming the repos, closing it when
+   the file catches up. Declared is the test, not managed: a repo carrying
+   `manage: false` has been decided about and is not reported -- which is what
+   the two forks carry. Absence is the finding, because absence and a
+   deliberate omission looked identical from outside the file.
+   Three things it deliberately does NOT do: fail the weekly apply (a repo
+   nobody has declared is no reason to abandon the settings the declared ones
+   are owed), run on pull requests, or conclude anything from an enumeration
+   that failed -- an empty listing exits 2 and leaves any open issue alone,
+   because a clean line over zero repos reads exactly like a clean line over
+   all of them.
 4. In **this repo** → Settings → Secrets and variables → Actions:
    - Variable `REPO_SETTINGS_APP_CLIENT_ID` = the App's **Client ID** (on the
      App's settings page). Not the numeric App ID -- the action's `app-id`
