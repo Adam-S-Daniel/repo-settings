@@ -1,21 +1,55 @@
 # Unattended-merge gate for Dependabot PRs.
 #
-# THIS REPO'S CONSTRAINT (read before touching either job below): the
-# default-branch ruleset here sets `required_approving_review_count: 0` and
-# `required_status_checks: []`. With NO required checks configured, GitHub's
-# native auto-merge REFUSES to arm — `gh pr merge --auto` errors that the PR
-# is already in a clean/mergeable state, because there is nothing for
-# auto-merge to hold the merge FOR. So job `auto-merge` below's `--auto`
-# attempt is expected to no-op on every PR in this repo; it costs nothing and
-# starts working for free the day this repo's ruleset grows a required
-# check. The workflow that actually lands PRs unattended is job `sweep`,
-# which merges DIRECTLY on a schedule instead of depending on auto-merge
-# holding for a check that doesn't exist.
+# THIS REPO'S CONSTRAINT (read before touching either job below): this repo has
+# NO default-branch ruleset at all. It is private and the account is not on
+# Pro, so GET /repos/{owner}/{repo}/rulesets answers 403 "Upgrade to GitHub Pro
+# or make this repository public", and none can be created here. Measured
+# 2026-08-29, with the public control (agentskills) returning its ruleset in the
+# same run. This paragraph used to say the ruleset "sets
+# required_approving_review_count: 0 and required_status_checks: []" -- naming
+# the settings of a ruleset that does not exist.
 #
-# DO NOT generalise the paragraph above into "no required check is why
-# Dependabot PRs don't land." It is a claim about native auto-merge ARMING,
-# and nothing more. The thing that has actually been refusing these merges
-# fleet-wide is a different, independent ruleset parameter --
+# The CONCLUSION it drew survives, but not for the reason it gave, and the
+# nearer cause matters more: `allow_auto_merge` is FALSE on this repo (measured
+# 2026-08-29), and fleet.yml's own header says native auto-merge cannot be armed
+# at all unless that repo setting is on. So `--auto` could not arm here even
+# with a required check present. The absence of required checks is a second,
+# independent reason -- `gh pr merge --auto` errors that the PR is already in a
+# clean/mergeable state, because there is nothing for auto-merge to hold the
+# merge FOR -- but it is not the operative one. Either way, job `auto-merge`
+# below's `--auto` attempt is expected to no-op on every PR in this repo, and
+# job `sweep` is what actually lands them, merging DIRECTLY on a schedule.
+#
+# That `allow_auto_merge: false` is NOT drift, and the engine is not failing to
+# see it -- it refuses to PLAN it, deliberately. `scripts/repo_settings.py:586`
+# gates the setting behind `if is_private():` and records a skip reading
+# "private repo without GitHub Pro -- auto-merge not available (PATCH returns 200
+# but is silently ignored)". GitHub offers auto-merge on private repos only on
+# Pro/Team/Enterprise; below that the PATCH is ACCEPTED, returns 200, and is
+# never honoured, so there is no error to catch. Measured 2026-08-11, one apply
+# and a diff seven minutes later on the same token: a public repo went
+# CHANGED -> True and read back ok, while four private repos went CHANGED -> True
+# and read back False. Without that skip every private repo would report a false
+# CHANGED on every apply and permanent DRIFT on every PR -- a red check no merge
+# could ever clear (repo_settings.py:597-599).
+#
+# So an operator `apply` under ambient `gh auth` would NOT reconcile it: the
+# write path is not what is blocked. Moving the account to Pro/Team/Enterprise,
+# or making the repo public, is what would change it -- and repo_settings.py:601
+# says to drop that branch if the account ever moves, because the write path
+# already works and it is the plan that refuses.
+#
+# So this does NOT "start working for free the day this repo's ruleset grows a
+# required check", as this header used to say. No ruleset can grow here while
+# the repo is private off Pro -- running private repos without rulesets is a
+# deliberate accepted position (owner, 2026-08-29), not an oversight -- and even
+# if one could, `allow_auto_merge` would still have to be turned on.
+#
+# DO NOT generalise the arming discussion above -- the paragraph beginning "The
+# CONCLUSION it drew survives" -- into "no required check is why Dependabot PRs
+# don't land." It is a claim about native auto-merge ARMING, and nothing more.
+# The thing that has actually been refusing these merges fleet-wide is a
+# different, independent ruleset parameter --
 # `require_extra_approval_for_unattributed_changes` -- which demands an
 # approving review for commits not attributed to a user, which Dependabot's
 # are, even where `required_approving_review_count` is 0. The discriminator
@@ -126,12 +160,13 @@ jobs:
 
       - name: Attempt auto-merge
         if: steps.paths.outputs.safe == 'true'
-        # `|| true`: per the header, this repo's required_status_checks: []
-        # means GitHub's native auto-merge cannot arm here — it errors that
-        # the PR is already mergeable/clean, i.e. it silently does nothing.
-        # That's expected; job `sweep` below is what actually lands these
-        # PRs. Kept so this starts working for free if the ruleset ever
-        # grows a required check.
+        # `|| true`: per the header, native auto-merge cannot arm here --
+        # `allow_auto_merge` is false on this repo, and there are no required
+        # checks either -- so it errors that the PR is already mergeable/clean,
+        # i.e. it silently does nothing. That's expected; job `sweep` below is
+        # what actually lands these PRs. Kept because it costs nothing, NOT
+        # because a required check alone would switch it on -- `allow_auto_merge`
+        # would have to be enabled too.
         run: gh pr merge --auto --merge "$PR_URL" || true
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -144,9 +179,10 @@ jobs:
     # one run. As the first ones merge, every PR still open in the batch
     # goes OUT OF DATE with the new base — and a stale branch is genuinely
     # un-mergeable, which no amount of re-arming auto-merge can fix; only
-    # updating the branch can. On THIS repo (no required checks) native
-    # auto-merge cannot even arm in the first place (see the workflow
-    # header), so this job is the ONLY path that lands a Dependabot PR
+    # updating the branch can. On THIS repo native auto-merge cannot arm at
+    # all -- `allow_auto_merge` is false and cannot be enabled while the repo
+    # is private off Pro (see the workflow header) -- so this job is the ONLY
+    # path that lands a Dependabot PR
     # unattended: it merges DIRECTLY once the PR's own CI is green, and
     # refreshes (rather than force-merges) a PR that has fallen behind its
     # base so the next sweep can land it cleanly.

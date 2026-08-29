@@ -156,6 +156,15 @@ defaults:
 # this fleet (the cms-platform-managed repos, excluded here, use it by their
 # own design).
 
+# WHAT THIS LIST IS, AND THE TWO SETS IT IS NOT. It is what this file DECLARES:
+# 21 entries. The engine MANAGES 16 of them -- five carry `manage: false`, and
+# cmd_diff/cmd_apply skip those before planning anything. The App's REACH is
+# wider than either: both installations are on "All repositories" (owner,
+# 2026-08-29), so the credential this file drives can administer every repo in
+# both accounts, listed here or not. Declared and in-account are equal today
+# (21 = 21, verified 2026-08-29), so a repo created in either account tomorrow
+# is the first that is reachable and undeclared -- and nothing compares them:
+# the engine never enumerates an account, it only reads this list.
 repos:
   # --- public, ruleset-safe (adversarially verified: no workflow pushes to main) ---
   # agentskills carries the fleet's only required status check.
@@ -225,7 +234,9 @@ repos:
   #     actually lands; fork-PR approval, the ruleset and allow_auto_merge are
   #     all skipped (see the private group above). Listing it therefore does
   #     NOT protect its default branch -- that needs Pro or making the repo
-  #     public, and is worth revisiting given what this repo can administer.
+  #     public. Running private repos without rulesets is a decision the owner
+  #     affirmed on 2026-08-29 rather than an open question; revisit it only if
+  #     the account moves to Pro or these repos go public.
   #     What listing it does buy is real though: SHA pinning was OFF here
   #     (the 2026-08-11 drift report caught `actions.sha_pinning_required
   #     False -> True`), so the repo enforcing SHA pinning fleet-wide was not

@@ -68,8 +68,17 @@ configured, the workflow **skips itself** (guarded on
    Apps → New). Repository permissions: **Administration: Read & write**,
    **Actions: Read & write**, **Metadata: Read-only**. No webhook.
 2. **Generate a private key** (downloads a `.pem`).
-3. **Install the App** on both `Adam-S-Daniel` and the `jodidaniel` org, granting
-   access to the repos in `fleet.yml` (or "All repositories").
+3. **Install the App** on both `Adam-S-Daniel` and the `jodidaniel` org. You can
+   grant access to just the repos in `fleet.yml` or choose "All repositories" --
+   but know which, because the two differ in blast radius. **Both installations
+   are currently on "All repositories"** (owner, 2026-08-29), so the App's
+   Administration + Actions **write** reach is every repo in both accounts.
+   `fleet.yml` declares 21 repos (the engine manages 16 of them -- five carry
+   `manage: false`), and declared-vs-in-account is equal today: 21 and 21, no
+   difference either way (verified 2026-08-29). So the exposure is prospective --
+   the next repo created in either account is the first that will sit inside the
+   App's reach while appearing in no registry. Nothing here audits that: the
+   engine reads `fleet.yml` and never enumerates an account to compare.
 4. In **this repo** → Settings → Secrets and variables → Actions:
    - Variable `REPO_SETTINGS_APP_CLIENT_ID` = the App's **Client ID** (on the
      App's settings page). Not the numeric App ID -- the action's `app-id`
