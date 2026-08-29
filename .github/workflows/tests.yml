@@ -6,6 +6,7 @@ on:
     paths:
       - "scripts/**"
       - "tests/**"
+      - "repo-settings/**"
       # Any workflow change runs the suite. Narrower than this ("just
       # tests.yml") left a Dependabot action-SHA bump to a DIFFERENT workflow
       # file producing zero check-runs on its PR, which the unattended-merge
@@ -18,6 +19,7 @@ on:
     paths:
       - "scripts/**"
       - "tests/**"
+      - "repo-settings/**"
       # Any workflow change runs the suite. Narrower than this ("just
       # tests.yml") left a Dependabot action-SHA bump to a DIFFERENT workflow
       # file producing zero check-runs on its PR, which the unattended-merge

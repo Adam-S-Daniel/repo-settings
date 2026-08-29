@@ -183,9 +183,6 @@ repos:
         required_status_checks: [pytest-windows]
   - name: Adam-S-Daniel/skills-evals
   - name: Adam-S-Daniel/claude-memory-map
-  - name: Adam-S-Daniel/civic-azure-infra
-  - name: Adam-S-Daniel/civic-iac-policy
-  - name: Adam-S-Daniel/civic-platform-agents
   - name: jodidaniel/squarespacetemp
   # --- onboarded 2026-07-21 after the same audit: all workflows contents:read,
   #     no pushes to the default branch, every action SHA-pinned. wsl-automation
