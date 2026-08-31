@@ -27,6 +27,29 @@ actions:
   # detects private repos and skips this automatically.
   fork_pr_approval: all_external_contributors
 
+# Dependabot alerts + security-update automation. See "security:" below for
+# the endpoints, the read/write semantics, and why grouped_security_updates
+# can be declared but never applied.
+security:
+  # Prerequisite for automated_security_fixes below -- Dependabot cannot open
+  # a security-update PR without an alert to resolve. Omit the key, or set it
+  # to null, to leave it unmanaged.
+  vulnerability_alerts: true
+
+  # Whether Dependabot opens PRs for known vulnerabilities in dependencies.
+  # Requires vulnerability_alerts above; the engine applies these two in a
+  # dependency-aware order (see "security:" below) so a run never lands a
+  # repo with security updates on and alerts off, even partway through.
+  # Omit the key, or set it to null, to leave it unmanaged.
+  automated_security_fixes: true
+
+  # Declared for the record, not because the engine can act on it -- GitHub
+  # exposes grouped security updates through the UI only (no REST endpoint at
+  # repo or org level). Always reported `skipped`, never applied. Omit the
+  # key to leave it entirely undeclared (distinct from declaring it and never
+  # converging it -- see "security:" below for why this repo does the latter).
+  grouped_security_updates: true
+
 ruleset:
   # Omit the whole block, or set enabled: false, to leave protection unmanaged.
   # PUBLIC repos only -- private repos need GitHub Pro (API 403); the engine
@@ -130,6 +153,115 @@ and put the mapping form (above) in the file's `repo:` key. This collision
 does not exist in the fleet/fan-out shape below, where the identifier always
 comes from each entry's `name:` and `repo:` is free to be a settings mapping.
 
+### `security:` -- Dependabot alerts and security updates
+
+Three leaves, two of them applyable. Like `repo:` above these are ordinary
+per-repo toggles, not Actions-specific and not the ruleset -- but unlike
+`repo:`, two of the three DO need downgrade handling, because the read (not
+the write) can fail on a scope the fan-out App's grant does not cover on every
+installation.
+
+```yaml
+security:
+  # Dependabot ALERTS -- the prerequisite for everything below. Omit the key,
+  # or set it to null, to leave it unmanaged.
+  vulnerability_alerts: true
+
+  # Dependabot SECURITY UPDATES -- automated PRs that resolve an open alert.
+  # Requires vulnerability_alerts above (see "Apply order" below). Omit the
+  # key, or set it to null, to leave it unmanaged.
+  automated_security_fixes: true
+
+  # Dependabot GROUPED security updates. Declared for the record; the engine
+  # can never apply it (see "grouped_security_updates has no API" below).
+  # Omit the key to leave it undeclared instead of declared-and-skipped.
+  grouped_security_updates: true
+```
+
+**Endpoints, and the PUT/DELETE-carries-the-value shape.** Both applyable
+leaves are read and written through a pair of GitHub endpoints that take
+`PUT` to enable and `DELETE` to disable, with **no request body either way** --
+unlike every other writer in this file, which PATCHes or PUTs a JSON value,
+here the HTTP **method itself** is the value:
+
+| Leaf | Endpoint | Read shape |
+|---|---|---|
+| `vulnerability_alerts` | `repos/{repo}/vulnerability-alerts` | HTTP status only -- 204 = enabled, 404 = disabled, no JSON body ever |
+| `automated_security_fixes` | `repos/{repo}/automated-security-fixes` | `200 {"enabled": bool, "paused": bool}` on current GitHub; tolerate the legacy 204-empty/404 shape too, since which vintage a given installation answers with is not something to assume |
+
+`paused` (on `automated_security_fixes`) is deliberately **not managed** -- it
+is GitHub's own operational signal that Dependabot has paused security-update
+PRs for the repo (e.g. after a run of unmergeable ones), not a policy toggle a
+human flips, and there is no write surface for it at all.
+
+**Why a 404 here reads as "disabled", not "not authorized".** The
+account-wide guidance is right that a bare GitHub 404 is ambiguous by design
+and should not be read as absence -- but that rule exists because most 404s
+come from a credential that cannot see the resource at all, indistinguishable
+from a real absence. This endpoint is different: the fan-out App's
+**installation** is what grants visibility into a repo in the first place,
+not a narrower per-endpoint scope sitting on top of an otherwise-working
+credential. A token that cannot see the repo fails `get_repo` and the ruleset
+reads too, and `plan_repo_records`' fault isolation turns THAT failure into a
+repo-level `error` record -- so a lone 404 on this one endpoint, with every
+other record for the same repo reading cleanly, is the documented feature-off
+signal and nothing else. There is no scope tier that sits between "can
+administer this repo at all" and "can read this one flag".
+
+**Why a 403 maps to a skip, not a raised error.** This surface is bolted onto
+an already-working weekly fleet run whose App grant (Administration: Read &
+write) predates this setting existing at all -- proven to cover every other
+writer in this file, not yet proven to cover these two specific endpoints on
+every installation. A hard failure here would take the ENTIRE apply down over
+one repo's scope gap, turning a working enforcement lane into a broken one.
+So a 403 on either read produces a visible `skipped` record naming the 403 --
+the same contract `actions.fork_pr_approval`'s 403/404/422 handling already
+uses -- which keeps the gap honest (a reader sees "cannot read") rather than
+silent. **The false-green risk this accepts, explicitly:** a fleet-wide 403 on
+every repo would make the whole `security` group report clean `skipped`
+records forever, with no drift and no error to prompt a second look --
+identical in shape to a scoped search that returns a plausible, complete-shaped
+wrong answer. Watch the rendered report for a `skip` naming HTTP 403 on a
+repo where every other record reads normally; that is the signature.
+
+**Apply order is a real dependency, not cosmetics.** Dependabot security
+updates cannot open a PR without an alert to resolve, so
+`automated_security_fixes` being on with `vulnerability_alerts` off is a state
+that should never be produced, even transiently by a partial apply.
+`cmd_apply` walks `drift` records in list order, so `plan_repo` builds the
+order to match: when `automated_security_fixes` is desired `true`, the
+`vulnerability_alerts` record is emitted first (prerequisite before
+dependent); when it is desired `false`, `automated_security_fixes` is emitted
+first (dependent disabled before the prerequisite is pulled out from under
+it).
+
+**`grouped_security_updates` has no API, at any scope.** Verified against
+GitHub's REST reference for both surfaces, not inferred from a failed call:
+absent from a repo's `security_and_analysis` object (whose keys are
+`advanced_security`, `code_security`, `dependabot_security_updates`,
+`secret_scanning`, `secret_scanning_push_protection`,
+`secret_scanning_non_provider_patterns`, `secret_scanning_ai_detection`,
+`secret_scanning_delegated_alert_dismissal`,
+`secret_scanning_delegated_bypass`, `secret_scanning_delegated_bypass_options`),
+and absent from org/enterprise code-security configurations too -- which are
+**org-scoped**, so useless here regardless: 18 of the fleet's repos sit under
+a user account, not an org.
+[`integrations/terraform-provider-github` issue 3334](https://github.com/integrations/terraform-provider-github/issues/3334)
+is the open community request asking for exactly this endpoint. It is UI-only
+(repo Settings -> Code security & analysis) or expressible per-repo in a
+site's own `.github/dependabot.yml` via `groups:` with `applies-to:
+security-updates`.
+
+The engine reports this leaf as a permanent `skip` naming both the manual UI
+path and the `dependabot.yml` alternative, and it never carries a `_writer` --
+there is nothing `apply_record` could dispatch to. Declaring it (rather than
+omitting the key, which would leave it undeclared like any other unmanaged
+setting) is deliberate: an omitted third toggle beside two applied ones reads
+as "forgotten"; a declared one that always reports `skipped` reads as "known,
+blocked, and here is why" -- which is the true state. See
+[docs/decisions/0002](../docs/decisions/0002-declare-dependabot-security-settings-including-the-unenforceable-one.md)
+for the full reasoning.
+
 ## Fleet / fan-out shape
 
 One document describing many repos. `defaults:` is the baseline every repo
@@ -144,6 +276,13 @@ defaults:
   actions:
     sha_pinning_required: true
     fork_pr_approval: all_external_contributors
+  security:
+    # See "security:" above -- vulnerability_alerts must apply before
+    # automated_security_fixes; the engine orders the two records itself.
+    vulnerability_alerts: true
+    automated_security_fixes: true
+    # Declared but not applyable -- see "grouped_security_updates has no API".
+    grouped_security_updates: true
   ruleset:
     enabled: true
     name: "default branch protection"
