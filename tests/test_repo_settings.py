@@ -843,3 +843,371 @@ class InstallationReposTests(unittest.TestCase):
         .get would be an AttributeError dressed up as an enumeration failure."""
         with patch.object(rs, "gh_api", return_value=None):
             self.assertEqual(rs.installation_repos(None), [])
+
+
+class VulnerabilityAlertsReaderTests(unittest.TestCase):
+    """`read_vulnerability_alerts` -- the whole answer lives in the HTTP
+    status, never a JSON body, and success/404/403/other-error each has to
+    land in a different bucket."""
+
+    def test_204_empty_body_reads_as_enabled(self):
+        # gh_api returns None for an empty 204 body; success at all (no raise)
+        # is the enabled signal here, there is nothing else to inspect.
+        with patch.object(rs, "gh_api", return_value=None) as api:
+            self.assertIs(rs.read_vulnerability_alerts("o/r"), True)
+        api.assert_called_once_with("repos/o/r/vulnerability-alerts")
+
+    def test_404_reads_as_disabled(self):
+        with patch.object(rs, "gh_api", side_effect=rs.GhError(404, "Not Found")):
+            self.assertIs(rs.read_vulnerability_alerts("o/r"), False)
+
+    def test_403_reads_as_unreadable_none(self):
+        # Not "not there" -- the read itself could not be answered. plan_repo
+        # turns this into a `skipped` record, never a silent "disabled".
+        with patch.object(rs, "gh_api", side_effect=rs.GhError(403, "Forbidden")):
+            self.assertIsNone(rs.read_vulnerability_alerts("o/r"))
+
+    def test_other_ghz_error_propagates(self):
+        # A 500 (or anything not in the two documented shapes) must reach
+        # plan_repo_records as a real error record, not get silently folded
+        # into disabled or skipped.
+        with patch.object(rs, "gh_api", side_effect=rs.GhError(500, "boom")):
+            with self.assertRaises(rs.GhError):
+                rs.read_vulnerability_alerts("o/r")
+
+
+class AutomatedSecurityFixesReaderTests(unittest.TestCase):
+    """`read_automated_security_fixes` -- tolerates both the current
+    200-JSON-with-`enabled` shape and the legacy 204-empty-body shape, and
+    must never silently guess at an unrecognised payload."""
+
+    def test_dict_enabled_true(self):
+        with patch.object(rs, "gh_api", return_value={"enabled": True, "paused": False}):
+            self.assertIs(rs.read_automated_security_fixes("o/r"), True)
+
+    def test_dict_enabled_false(self):
+        with patch.object(rs, "gh_api", return_value={"enabled": False, "paused": False}):
+            self.assertIs(rs.read_automated_security_fixes("o/r"), False)
+
+    def test_paused_is_ignored_either_way(self):
+        # paused is deliberately not managed -- it must not change the
+        # enabled reading in either direction.
+        with patch.object(rs, "gh_api", return_value={"enabled": True, "paused": True}):
+            self.assertIs(rs.read_automated_security_fixes("o/r"), True)
+
+    def test_legacy_204_empty_body_reads_as_enabled(self):
+        with patch.object(rs, "gh_api", return_value=None):
+            self.assertIs(rs.read_automated_security_fixes("o/r"), True)
+
+    def test_404_reads_as_disabled(self):
+        with patch.object(rs, "gh_api", side_effect=rs.GhError(404, "Not Found")):
+            self.assertIs(rs.read_automated_security_fixes("o/r"), False)
+
+    def test_403_reads_as_unreadable_none(self):
+        with patch.object(rs, "gh_api", side_effect=rs.GhError(403, "Forbidden")):
+            self.assertIsNone(rs.read_automated_security_fixes("o/r"))
+
+    def test_other_ghz_error_propagates(self):
+        with patch.object(rs, "gh_api", side_effect=rs.GhError(500, "boom")):
+            with self.assertRaises(rs.GhError):
+                rs.read_automated_security_fixes("o/r")
+
+    def test_empty_dict_without_enabled_key_reads_as_enabled(self):
+        # Treated the same as the legacy 204-empty success, not as the
+        # unexpected-shape case below.
+        with patch.object(rs, "gh_api", return_value={}):
+            self.assertIs(rs.read_automated_security_fixes("o/r"), True)
+
+    def test_nonempty_dict_missing_enabled_key_raises_rather_than_guesses(self):
+        # A shape that matches neither documented vintage must never silently
+        # become a value the audit reports with confidence it does not have.
+        with patch.object(rs, "gh_api", return_value={"paused": False}):
+            with self.assertRaises(rs.GhError):
+                rs.read_automated_security_fixes("o/r")
+
+
+class SecurityWritersTests(unittest.TestCase):
+    """The METHOD carries the value here, unlike every other writer in this
+    file -- PUT to enable, DELETE to disable, and no body either way."""
+
+    def test_write_vulnerability_alerts_true_is_a_bare_put(self):
+        with patch.object(rs, "gh_api") as api:
+            rs.write_vulnerability_alerts("o/r", True)
+        api.assert_called_once_with("repos/o/r/vulnerability-alerts", method="PUT")
+        # No body kwarg at all -- assert_called_once_with above already
+        # enforces this (a body= kwarg would fail the equality check), stated
+        # explicitly since it is the whole point of the shape.
+        self.assertNotIn("body", api.call_args.kwargs)
+
+    def test_write_vulnerability_alerts_false_is_a_bare_delete(self):
+        with patch.object(rs, "gh_api") as api:
+            rs.write_vulnerability_alerts("o/r", False)
+        api.assert_called_once_with("repos/o/r/vulnerability-alerts", method="DELETE")
+        self.assertNotIn("body", api.call_args.kwargs)
+
+    def test_write_automated_security_fixes_true_is_a_bare_put(self):
+        with patch.object(rs, "gh_api") as api:
+            rs.write_automated_security_fixes("o/r", True)
+        api.assert_called_once_with("repos/o/r/automated-security-fixes", method="PUT")
+        self.assertNotIn("body", api.call_args.kwargs)
+
+    def test_write_automated_security_fixes_false_is_a_bare_delete(self):
+        with patch.object(rs, "gh_api") as api:
+            rs.write_automated_security_fixes("o/r", False)
+        api.assert_called_once_with("repos/o/r/automated-security-fixes", method="DELETE")
+        self.assertNotIn("body", api.call_args.kwargs)
+
+
+class SecurityPlanRecordsTests(unittest.TestCase):
+    """`plan_repo`'s `security` section: match/drift/skip/error for the two
+    applyable leaves, built from the readers directly rather than gh_api --
+    the readers' own contract is covered above."""
+
+    CFG_BOTH_ON = {"vulnerability_alerts": True, "automated_security_fixes": True}
+
+    def test_match_when_live_already_matches_desired(self):
+        with patch.object(rs, "read_vulnerability_alerts", return_value=True), \
+             patch.object(rs, "read_automated_security_fixes", return_value=True):
+            records = rs.plan_repo("o/r", {"security": dict(self.CFG_BOTH_ON)})
+        by_setting = {r["setting"]: r for r in records}
+        self.assertEqual(by_setting["security.vulnerability_alerts"]["status"], "match")
+        self.assertEqual(by_setting["security.automated_security_fixes"]["status"], "match")
+        for r in records:
+            self.assertNotIn("skipped", r["status"])
+            self.assertNotEqual(r["status"], "error")
+
+    def test_drift_when_both_off_and_desired_on(self):
+        with patch.object(rs, "read_vulnerability_alerts", return_value=False), \
+             patch.object(rs, "read_automated_security_fixes", return_value=False):
+            records = rs.plan_repo("o/r", {"security": dict(self.CFG_BOTH_ON)})
+        by_setting = {r["setting"]: r for r in records}
+        self.assertEqual(len(records), 2)
+        va = by_setting["security.vulnerability_alerts"]
+        af = by_setting["security.automated_security_fixes"]
+        self.assertEqual(va["status"], "drift")
+        self.assertEqual(va["current"], False)
+        self.assertEqual(va["desired"], True)
+        self.assertEqual(va["_writer"], ("vuln_alerts", None, True))
+        self.assertEqual(af["status"], "drift")
+        self.assertEqual(af["current"], False)
+        self.assertEqual(af["desired"], True)
+        self.assertEqual(af["_writer"], ("auto_sec_fixes", None, True))
+
+    def test_omitted_keys_are_unmanaged(self):
+        with patch.object(rs, "read_vulnerability_alerts") as va, \
+             patch.object(rs, "read_automated_security_fixes") as af:
+            records = rs.plan_repo("o/r", {"security": {}})
+            records_no_block = rs.plan_repo("o/r", {})
+        self.assertEqual(records, [])
+        self.assertEqual(records_no_block, [])
+        va.assert_not_called()
+        af.assert_not_called()
+
+    def test_403_on_vulnerability_alerts_is_a_skip_naming_403(self):
+        with patch.object(rs, "read_vulnerability_alerts", return_value=None), \
+             patch.object(rs, "read_automated_security_fixes", return_value=True):
+            records = rs.plan_repo(
+                "o/r", {"security": {"vulnerability_alerts": True}}
+            )
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["setting"], "security.vulnerability_alerts")
+        self.assertEqual(rec["status"], "skipped")
+        self.assertIn("403", rec["note"])
+        self.assertNotIn("_writer", rec)
+
+    def test_403_on_automated_security_fixes_is_a_skip_naming_403(self):
+        with patch.object(rs, "read_automated_security_fixes", return_value=None):
+            records = rs.plan_repo(
+                "o/r", {"security": {"automated_security_fixes": True}}
+            )
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["setting"], "security.automated_security_fixes")
+        self.assertEqual(rec["status"], "skipped")
+        self.assertIn("403", rec["note"])
+        self.assertNotIn("_writer", rec)
+
+    def test_read_failure_becomes_an_error_record_not_a_crash(self):
+        with patch.object(rs, "read_vulnerability_alerts",
+                          side_effect=rs.GhError(500, "boom")):
+            records = rs.plan_repo(
+                "o/r", {"security": {"vulnerability_alerts": True}}
+            )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "error")
+        self.assertIn("boom", records[0]["note"])
+
+    def test_read_failure_is_isolated_by_plan_repo_records(self):
+        with patch.object(rs, "read_vulnerability_alerts",
+                          side_effect=rs.GhError(500, "boom")):
+            records = rs.plan_repo_records(
+                "o/r", {"security": {"vulnerability_alerts": True}}
+            )
+        self.assertEqual([r["status"] for r in records], ["error"])
+
+
+class SecurityApplyOrderRegressionGuardTests(unittest.TestCase):
+    """Dependabot security updates require alerts to already be on, and
+    `cmd_apply` walks drift records in LIST ORDER -- so the order `plan_repo`
+    appends these two records in IS the write order. If this regresses, an
+    apply could enable automated_security_fixes before vulnerability_alerts
+    (or disable the prerequisite out from under the dependent), landing a
+    repo in a state Dependabot itself rejects."""
+
+    def _settings(self, desired):
+        return {
+            "security": {
+                "vulnerability_alerts": desired,
+                "automated_security_fixes": desired,
+            }
+        }
+
+    def test_enabling_orders_alerts_before_security_fixes(self):
+        with patch.object(rs, "read_vulnerability_alerts", return_value=False), \
+             patch.object(rs, "read_automated_security_fixes", return_value=False):
+            records = rs.plan_repo("o/r", self._settings(True))
+        self.assertEqual(
+            [r["setting"] for r in records],
+            ["security.vulnerability_alerts", "security.automated_security_fixes"],
+        )
+        self.assertTrue(all(r["status"] == "drift" for r in records))
+
+    def test_disabling_orders_security_fixes_before_alerts(self):
+        with patch.object(rs, "read_vulnerability_alerts", return_value=True), \
+             patch.object(rs, "read_automated_security_fixes", return_value=True):
+            records = rs.plan_repo("o/r", self._settings(False))
+        self.assertEqual(
+            [r["setting"] for r in records],
+            ["security.automated_security_fixes", "security.vulnerability_alerts"],
+        )
+        self.assertTrue(all(r["status"] == "drift" for r in records))
+
+
+class GroupedSecurityUpdatesTests(unittest.TestCase):
+    """No API exists for this leaf at any scope -- it must always report
+    `skipped` and must never carry a `_writer` (there is nothing
+    `apply_record` could dispatch to)."""
+
+    def test_declared_true_is_always_skipped_never_drift(self):
+        records = rs.plan_repo(
+            "o/r", {"security": {"grouped_security_updates": True}}
+        )
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["setting"], "security.grouped_security_updates")
+        self.assertEqual(rec["status"], "skipped")
+        self.assertNotIn("_writer", rec)
+
+    def test_declared_false_is_still_skipped_not_match(self):
+        # There is no live value to compare against -- any declared value
+        # produces the same unenforceable skip, never a match/drift verdict
+        # the engine has no way to have earned.
+        records = rs.plan_repo(
+            "o/r", {"security": {"grouped_security_updates": False}}
+        )
+        self.assertEqual([r["status"] for r in records], ["skipped"])
+
+    def test_note_names_the_absence_of_an_api(self):
+        records = rs.plan_repo(
+            "o/r", {"security": {"grouped_security_updates": True}}
+        )
+        note = records[0]["note"]
+        self.assertIn("no REST endpoint", note)
+        self.assertIn("dependabot.yml", note)
+
+    def test_omitted_key_is_unmanaged(self):
+        records = rs.plan_repo("o/r", {"security": {}})
+        self.assertEqual(records, [])
+
+    def test_apply_never_attempts_a_writer_for_it(self):
+        # apply_record dispatches purely on rec["_writer"][0] -- confirm the
+        # planned record genuinely carries none, so a future refactor of
+        # apply_record can't accidentally invent a call for this kind.
+        records = rs.plan_repo(
+            "o/r", {"security": {"grouped_security_updates": True}}
+        )
+        for r in records:
+            self.assertNotIn("_writer", r)
+
+
+class SecurityApplyRecordDispatchTests(unittest.TestCase):
+    """`apply_record`'s two new branches -- the writer reachable from the
+    record the planner emits, same shape as the existing dispatch tests for
+    every other kind in this file."""
+
+    def test_vuln_alerts_kind_calls_the_vuln_alerts_writer(self):
+        rec = {"setting": "security.vulnerability_alerts", "status": "drift",
+               "current": False, "desired": True,
+               "_writer": ("vuln_alerts", None, True)}
+        with patch.object(rs, "write_vulnerability_alerts") as writer:
+            rs.apply_record("o/r", rec)
+        writer.assert_called_once_with("o/r", True)
+
+    def test_auto_sec_fixes_kind_calls_the_auto_sec_fixes_writer(self):
+        rec = {"setting": "security.automated_security_fixes", "status": "drift",
+               "current": False, "desired": True,
+               "_writer": ("auto_sec_fixes", None, True)}
+        with patch.object(rs, "write_automated_security_fixes") as writer:
+            rs.apply_record("o/r", rec)
+        writer.assert_called_once_with("o/r", True)
+
+    def test_end_to_end_via_gh_api_for_vuln_alerts(self):
+        # Belt and braces: the same call chain MergeMethodTests and
+        # DeleteBranchOnMergeTests exercise for their own kinds, down to the
+        # actual gh_api call rather than stopping at the writer mock.
+        with patch.object(rs, "read_vulnerability_alerts", return_value=False):
+            rec = rs.plan_repo(
+                "o/r", {"security": {"vulnerability_alerts": True}}
+            )[0]
+        with patch.object(rs, "gh_api") as api:
+            rs.apply_record("o/r", rec)
+        api.assert_called_once_with("repos/o/r/vulnerability-alerts", method="PUT")
+
+    def test_end_to_end_via_gh_api_for_auto_sec_fixes(self):
+        with patch.object(rs, "read_automated_security_fixes", return_value=False):
+            rec = rs.plan_repo(
+                "o/r", {"security": {"automated_security_fixes": True}}
+            )[0]
+        with patch.object(rs, "gh_api") as api:
+            rs.apply_record("o/r", rec)
+        api.assert_called_once_with("repos/o/r/automated-security-fixes", method="PUT")
+
+
+class SecurityFleetConfigTests(unittest.TestCase):
+    """The `security` group in the shipped fleet.yml, parsed -- never
+    regex-scanned. Guards the exact gap the group exists to close: on
+    2026-08-31 the fleet's Dependabot-alerts posture was undeclared and
+    measurably split (403 "disabled" on four repos, apparently enabled on a
+    fifth) with nothing anywhere recording that as a decision."""
+
+    FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
+
+    def setUp(self):
+        import yaml
+
+        with open(self.FLEET, encoding="utf-8") as fh:
+            self.cfg = yaml.safe_load(fh)
+
+    def test_defaults_declare_all_three_security_settings_true(self):
+        security = self.cfg["defaults"]["security"]
+        self.assertIs(security["vulnerability_alerts"], True)
+        self.assertIs(security["automated_security_fixes"], True)
+        self.assertIs(security["grouped_security_updates"], True)
+
+    def test_every_managed_repo_resolves_the_security_defaults(self):
+        # A per-repo override COULD, in principle, silently drop a leaf the
+        # way an override could re-enable squash (see FleetConfigTests
+        # above) -- assert the settings resolve_targets actually hands each
+        # MANAGED repo carries all three, not just that defaults: declares
+        # them once at the top of the file.
+        for target in rs.resolve_targets(self.cfg, None):
+            if not target["manage"]:
+                continue
+            security = target["settings"].get("security") or {}
+            self.assertIn("vulnerability_alerts", security, msg=target["repo"])
+            self.assertIn("automated_security_fixes", security, msg=target["repo"])
+            self.assertIn("grouped_security_updates", security, msg=target["repo"])
+            self.assertIs(security["vulnerability_alerts"], True, msg=target["repo"])
+            self.assertIs(security["automated_security_fixes"], True, msg=target["repo"])
+            self.assertIs(security["grouped_security_updates"], True, msg=target["repo"])

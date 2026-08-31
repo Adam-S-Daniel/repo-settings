@@ -29,6 +29,18 @@ Managed settings:
   * repo.allow_merge_commit                -> repos/{repo}  (PATCH, one call for
     repo.allow_squash_merge                   the whole group -- see
     repo.allow_rebase_merge                   write_merge_methods)
+  * security.vulnerability_alerts          -> repos/{repo}/vulnerability-alerts
+                                               (PUT/DELETE, no body -- the
+                                               METHOD carries the value)
+  * security.automated_security_fixes      -> repos/{repo}/automated-security-fixes
+                                               (PUT/DELETE, no body; requires
+                                               vulnerability_alerts -- apply
+                                               order is dependency-aware, see
+                                               plan_repo)
+  * security.grouped_security_updates      -> NOT APPLYABLE. No REST endpoint
+                                               exists at any scope; declared
+                                               and always reported `skipped`
+                                               naming the manual UI path.
 
 We use repository RULESETS rather than classic branch protection so the fleet
 speaks the same primitive as the cms-platform-managed repos. A managed ruleset
@@ -190,6 +202,119 @@ def read_fork_approval(repo: str) -> str | None:
         raise
 
 
+def read_vulnerability_alerts(repo: str) -> bool | None:
+    """Read whether Dependabot ALERTS are on, or None when the read itself
+    could not be answered (a scope gap on the credential, not a live value).
+
+    `GET repos/{repo}/vulnerability-alerts` is one of the handful of GitHub
+    endpoints that carries its whole answer in the HTTP STATUS and never in a
+    body: 204 (No Content) means enabled, 404 means disabled, and there is no
+    JSON payload to inspect either way -- `gh_api` already returns None for an
+    empty 204, so success here just means "the call did not raise".
+
+    WHY A 404 HERE MEANS "DISABLED" RATHER THAN THE HOUSE RULE'S "NOT
+    AUTHORIZED". The account-wide guidance is emphatic that a GitHub 404 is
+    ambiguous by design and must not be read as "not there" -- and that rule
+    holds precisely because most 404s come from a credential that cannot see
+    the resource at all, with no way to tell that apart from a real absence.
+    This endpoint is different in one load-bearing way: the fan-out App's
+    INSTALLATION is what grants this token visibility into a repo in the
+    first place, not some narrower per-endpoint scope layered on top of a
+    working credential. A token that cannot see this repo fails `get_repo`
+    and the ruleset reads too -- and `plan_repo_records`' fault isolation
+    turns THAT failure into a repo-level `error` record, so a session looking
+    at the report sees the whole repo flagged, not a lone clean-looking
+    "disabled" hiding a blind credential. A 404 on THIS ONE endpoint, with
+    every other record for the same repo reading normally, is therefore the
+    documented feature-off signal and nothing else -- there is no scope that
+    sits between "can administer this repo" and "can read this one flag".
+
+    WHY A 403 MAPS TO None (a skip) RATHER THAN RAISING. This surface is
+    being bolted onto an already-working weekly fleet run whose App grant
+    predates it -- Administration: Read & write, the same scope every other
+    writer in this file relies on, but not proven to cover this specific
+    endpoint on every installation until it is actually exercised. A hard
+    failure here would take the ENTIRE apply down over one repo's scope gap,
+    turning a working enforcement lane into a broken one over a setting that
+    used to not exist at all. So `plan_repo` reports it as a visible
+    `skipped` record naming the 403 -- the same contract
+    `read_fork_approval`'s 403/404/422 handling already uses below -- which
+    keeps the gap honest (a reader sees "cannot read") instead of silent (a
+    reader sees nothing, or worse, a false "disabled").
+
+    Any OTHER GhError (500, a timeout gh surfaces as a bare non-2xx, etc.) is
+    re-raised rather than swallowed into either bucket: plan_repo's caller,
+    plan_repo_records, turns an uncaught GhError into a proper `error` record,
+    which is the right outcome for a failure that is not one of the two
+    documented, well-understood shapes above.
+    """
+    try:
+        gh_api(f"repos/{repo}/vulnerability-alerts")
+        return True
+    except GhError as e:
+        if e.status == 404:
+            return False
+        if e.status == 403:
+            return None
+        raise
+
+
+def read_automated_security_fixes(repo: str) -> bool | None:
+    """Read whether Dependabot SECURITY UPDATES are on. Same None-on-403 /
+    False-on-404 contract as read_vulnerability_alerts above, and the same
+    justification for both (see that function's docstring) -- this is the
+    dependent half of the same pair, so the read semantics have to match or a
+    plan_repo caller could not compare the two consistently.
+
+    Unlike vulnerability-alerts, this endpoint DOES carry a JSON body on
+    current GitHub: `GET repos/{repo}/automated-security-fixes` returns
+    `{"enabled": bool, "paused": bool}` with a 200. Older GitHub behaviour --
+    still worth tolerating, since we cannot pin which vintage a given
+    installation answers with -- was the same 204-empty/404 shape as
+    vulnerability-alerts, so a `None` payload (gh_api's return for an empty
+    body) is read as the legacy enabled-with-no-body case, exactly like the
+    other endpoint.
+
+    `paused` is DELIBERATELY NOT MANAGED. GitHub sets it when Dependabot has
+    paused security-update PRs for the repo (e.g. after a run of unmergeable
+    updates) as an operational signal, not a policy toggle a human is
+    expected to flip back and forth -- there is no PUT/DELETE surface for it
+    at all, only the read. Folding it into the desired/current comparison
+    here would invent drift the engine has no way to correct.
+
+    A dict WITHOUT an `enabled` key is an unexpected response shape, not a
+    value to guess at: an empty dict is treated the same as a legacy
+    204-empty success (True), but any other dict missing the key means the
+    payload does not match either documented vintage, and this raises rather
+    than silently defaulting -- an unexpected shape must never quietly become
+    a value the audit reports with confidence it does not have.
+    """
+    try:
+        payload = gh_api(f"repos/{repo}/automated-security-fixes")
+    except GhError as e:
+        if e.status == 404:
+            return False
+        if e.status == 403:
+            return None
+        raise
+    if payload is None:
+        return True
+    if isinstance(payload, dict):
+        if "enabled" in payload:
+            return bool(payload["enabled"])
+        if not payload:
+            return True
+        raise GhError(
+            None,
+            f"unexpected automated-security-fixes payload shape for {repo}: "
+            f"{payload!r} (missing 'enabled')",
+        )
+    raise GhError(
+        None,
+        f"unexpected automated-security-fixes payload type for {repo}: {payload!r}",
+    )
+
+
 def write_sha_pinning(repo: str, current: dict, desired: bool) -> None:
     gh_api(
         f"repos/{repo}/actions/permissions",
@@ -209,6 +334,22 @@ def write_fork_approval(repo: str, desired: str) -> None:
         method="PUT",
         body={"approval_policy": desired},
     )
+
+
+def write_vulnerability_alerts(repo: str, desired: bool) -> None:
+    """Enable/disable Dependabot alerts. Unlike every other writer in this
+    file, the VALUE lives in the HTTP METHOD, not in a request body: PUT
+    turns the feature on, DELETE turns it off, and both are called with no
+    body at all (`gh_api`'s `body` stays unset -- it already omits `--input`
+    for a None body, and this endpoint has nothing to accept anyway)."""
+    gh_api(f"repos/{repo}/vulnerability-alerts", method="PUT" if desired else "DELETE")
+
+
+def write_automated_security_fixes(repo: str, desired: bool) -> None:
+    """Enable/disable Dependabot security updates. Same method-carries-the-
+    value shape as write_vulnerability_alerts above, and for the same reason:
+    this endpoint too takes PUT-to-enable / DELETE-to-disable with no body."""
+    gh_api(f"repos/{repo}/automated-security-fixes", method="PUT" if desired else "DELETE")
 
 
 # --------------------------------------------------------------------------- #
@@ -554,6 +695,105 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
             except GhError as e:
                 records.append(_err("actions.fork_pr_approval", fork, e))
 
+    # -- security (Dependabot alerts + security updates) --------------------- #
+    # Three possible leaves, at most three records, in an order that is a real
+    # dependency and not cosmetics -- see below.
+    security_cfg = settings.get("security") or {}
+
+    vuln_rec: dict | None = None
+    if "vulnerability_alerts" in security_cfg:
+        vuln_desired = bool(security_cfg["vulnerability_alerts"])
+        try:
+            current = read_vulnerability_alerts(repo)
+        except GhError as e:
+            vuln_rec = _err("security.vulnerability_alerts", vuln_desired, e)
+        else:
+            if current is None:
+                # 403: the read itself could not be answered (a scope gap on
+                # a grant that predates this setting), not a live value -- see
+                # read_vulnerability_alerts' docstring for why this is a skip
+                # and not a raised error.
+                vuln_rec = _skip(
+                    "security.vulnerability_alerts", vuln_desired,
+                    "cannot read -- HTTP 403 (token lacks Administration on this repo)",
+                )
+            else:
+                vuln_rec = {
+                    "setting": "security.vulnerability_alerts",
+                    "status": "match" if current == vuln_desired else "drift",
+                    "current": current,
+                    "desired": vuln_desired,
+                    "_writer": ("vuln_alerts", None, vuln_desired),
+                }
+
+    autofix_rec: dict | None = None
+    autofix_desired = False
+    if "automated_security_fixes" in security_cfg:
+        autofix_desired = bool(security_cfg["automated_security_fixes"])
+        try:
+            current = read_automated_security_fixes(repo)
+        except GhError as e:
+            autofix_rec = _err("security.automated_security_fixes", autofix_desired, e)
+        else:
+            if current is None:
+                autofix_rec = _skip(
+                    "security.automated_security_fixes", autofix_desired,
+                    "cannot read -- HTTP 403 (token lacks Administration on this repo)",
+                )
+            else:
+                autofix_rec = {
+                    "setting": "security.automated_security_fixes",
+                    "status": "match" if current == autofix_desired else "drift",
+                    "current": current,
+                    "desired": autofix_desired,
+                    "_writer": ("auto_sec_fixes", None, autofix_desired),
+                }
+
+    # ORDERING IS A REAL DEPENDENCY, NOT COSMETICS. Dependabot security
+    # updates require Dependabot alerts to be on -- an alert is what a
+    # security-update PR resolves, so switching on the dependent before the
+    # prerequisite exists asks GitHub for a PR against nothing. `cmd_apply`
+    # walks `drift` records in LIST ORDER, so the order these two are
+    # appended in is the write order the apply actually performs:
+    #   desired True  -> alerts first, security updates second (enable the
+    #                     prerequisite, then the thing that depends on it)
+    #   desired False -> security updates first, alerts second (disable the
+    #                     dependent before pulling the floor out from under
+    #                     it, so a run that dies partway through never leaves
+    #                     the repo with updates on and alerts off)
+    # This mirrors write_merge_methods' reasoning a few sections up: the
+    # invalid intermediate state is real, GitHub's ordinary per-record apply
+    # would produce it depending on which record happens to come first, and
+    # the fix is to make the record order state the dependency explicitly
+    # rather than leave it to whichever order a dict happened to iterate in.
+    if autofix_desired:
+        records.extend(r for r in (vuln_rec, autofix_rec) if r is not None)
+    else:
+        records.extend(r for r in (autofix_rec, vuln_rec) if r is not None)
+
+    if "grouped_security_updates" in security_cfg:
+        # ALWAYS a skip, never a drift record and never a _writer -- GitHub
+        # exposes no REST endpoint for grouped security updates at repo OR
+        # org level (absent from `security_and_analysis`, absent from
+        # org/enterprise code-security configurations -- which are org-only
+        # anyway and so unreachable for the 18 fleet repos that sit under a
+        # user account). It is UI-only, or expressible per-repo in
+        # `.github/dependabot.yml` via `groups:` with `applies-to:
+        # security-updates`. Declaring the key at all (rather than omitting
+        # it) records the fleet's INTENT even though no automation here can
+        # ever converge it -- see fleet.yml's comment on this leaf for why
+        # that is deliberate rather than an oversight.
+        records.append(
+            _skip(
+                "security.grouped_security_updates",
+                bool(security_cfg["grouped_security_updates"]),
+                "no REST endpoint exists at repo or org level -- enable by hand in "
+                "Settings -> Code security & analysis, or express per-repo grouping "
+                "in .github/dependabot.yml via groups: with applies-to: "
+                "security-updates",
+            )
+        )
+
     # -- ruleset ------------------------------------------------------------ #
     if ruleset_cfg.get("enabled"):
         name = ruleset_cfg.get("name", DEFAULT_RULESET_NAME)
@@ -790,6 +1030,10 @@ def apply_record(repo: str, rec: dict) -> None:
         write_merge_methods(repo, b)
     elif kind == "delete_branch_on_merge":
         write_delete_branch_on_merge(repo, b)
+    elif kind == "vuln_alerts":
+        write_vulnerability_alerts(repo, b)
+    elif kind == "auto_sec_fixes":
+        write_automated_security_fixes(repo, b)
 
 
 # --------------------------------------------------------------------------- #

@@ -91,3 +91,4 @@ Optional sections for high-impact decisions:
 | ADR | Title | Status |
 |-----|-------|--------|
 | [0001](0001-bot-writes-results-branch-or-declared-bypass.md) | Route bot writes to results branches; declare rare ruleset bypasses in fleet.yml | Accepted |
+| [0002](0002-declare-dependabot-security-settings-including-the-unenforceable-one.md) | Manage Dependabot security settings as fleet code, including one the engine can never apply | Accepted |

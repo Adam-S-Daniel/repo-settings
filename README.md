@@ -21,6 +21,20 @@ Per repo, according to `fleet.yml`:
   auto-merge to be armable at all (e.g. for Dependabot's unattended-merge
   path); with it off, arming auto-merge fails outright regardless of
   branch-protection/ruleset state.
+- **Dependabot alerts** (`security.vulnerability_alerts`) and **Dependabot
+  security updates** (`security.automated_security_fixes`) — both read/written
+  via `PUT`/`DELETE repos/{repo}/vulnerability-alerts` and
+  `.../automated-security-fixes`, with **no request body**: the HTTP method
+  itself carries the value. These land through the fan-out App's existing
+  **Administration: Read & write** grant — no new credential, no workflow
+  change. Security updates require alerts to be on first, so the engine
+  applies the two in a dependency-aware order (see
+  [`repo-settings/schema.md`](repo-settings/schema.md), "`security:`"). A
+  third leaf, **grouped security updates**
+  (`security.grouped_security_updates`), is declared in `fleet.yml` for the
+  record but is **reported-only** — GitHub exposes no API for it at any scope,
+  so the engine always reports it `skipped` and names the manual UI path
+  instead of pretending it converged.
 
 Private repos get SHA pinning + `repo.allow_auto_merge` — the API rejects
 fork-PR approval (422) and rulesets (403, needs GitHub Pro); the engine logs an

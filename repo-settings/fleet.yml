@@ -62,6 +62,61 @@ defaults:
   actions:
     sha_pinning_required: true
     fork_pr_approval: all_external_contributors
+  # Dependabot alerts + security-update automation. Managed nowhere before
+  # this group existed, and measurably off on at least some of the fleet:
+  # 2026-08-31, `GET repos/{repo}/dependabot/alerts` against agentskills,
+  # repo-settings, skills-evals and agentskills-private all answered HTTP 403
+  # "Dependabot alerts are disabled for this repository" -- an explicit
+  # feature-off message, not the ambiguous 404 the account-wide guidance
+  # warns about elsewhere, so this was MEASURED rather than inferred.
+  # `_agent-guidance` alone answered with a permissions error instead of that
+  # feature-off message, i.e. it appeared to already have alerts ON -- which
+  # is exactly the kind of undeclared per-repo divergence this manifest
+  # exists to eliminate: nobody had decided the fleet should be split, it
+  # just was.
+  security:
+    # The PREREQUISITE for everything below it: Dependabot cannot open a
+    # security-update PR without an alert to resolve, so this has to be on
+    # before automated_security_fixes means anything. See schema.md's
+    # "security:" section for the read/write endpoints and why the engine
+    # applies this leaf before the dependent one whenever both are drifting
+    # and the desired state is "on".
+    vulnerability_alerts: true
+    # The leaf that actually matters, and the reason is a fast path this repo
+    # already assumes exists. `.github/dependabot.yml` sets a deliberate
+    # `cooldown` -- a minimum package age before a version-update PR opens --
+    # on the stated understanding that a SECURITY ADVISORY bypasses that
+    # cooldown and opens immediately regardless of age. That bypass is real on
+    # GitHub, but it is only reachable when Dependabot security updates are
+    # actually turned on for the repo. With this off, the cooldown is not a
+    # raised floor with an emergency exit for a live CVE -- it is the ONLY
+    # path, and the fleet would wait out the full cooling-off period on a
+    # vulnerable dependency exactly when it can least afford to. The same
+    # assumption -- security advisories bypass cooldown -- is written into the
+    # account-wide guidance (`AGENTS.md`, "Dependency updates"); turning this
+    # on is what makes that statement true rather than aspirational.
+    automated_security_fixes: true
+    # Declared even though NOTHING in this file, or the workflow that applies
+    # it, can ever converge it. GitHub exposes grouped security updates only
+    # through the web UI (repo Settings -> Code security & analysis) -- there
+    # is no field for it anywhere in `security_and_analysis` on the repos API,
+    # and no field for it in org/enterprise code-security configurations
+    # either (which are org-scoped anyway, so unreachable for the 18 fleet
+    # repos that sit under a user account, not an org). Verified against
+    # GitHub's own REST reference, not inferred from a failed call --
+    # `integrations/terraform-provider-github` issue 3334 is the open
+    # community request asking for exactly this endpoint to exist.
+    #
+    # The engine reports this leaf as a permanent `skip` naming the manual UI
+    # path, and per-repo grouping remains expressible in a site's own
+    # `.github/dependabot.yml` via `groups:` with `applies-to:
+    # security-updates` for whoever wants it. Recording the intent here,
+    # rather than omitting the key because nothing can act on it, is
+    # deliberate: an omitted third toggle reads as "forgotten", and a declared
+    # one that always reports `skipped` reads as "known, blocked, and why" --
+    # which is the truth. This is the one line in `defaults:` that a run can
+    # never make converge; see docs/decisions/0002 for the reasoning in full.
+    grouped_security_updates: true
   ruleset:
     enabled: true
     name: "default branch protection"
