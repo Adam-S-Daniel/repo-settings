@@ -564,6 +564,31 @@ class FleetConfigTests(unittest.TestCase):
                 msg=f"{entry['name']} re-enables the unattributed-changes rule",
             )
 
+    def test_defaults_declare_the_default_merge_commit_message(self):
+        repo_defaults = self.cfg["defaults"]["repo"]
+        self.assertEqual(repo_defaults["merge_commit_title"], "MERGE_MESSAGE")
+        self.assertEqual(repo_defaults["merge_commit_message"], "PR_TITLE")
+
+    def test_no_repo_override_changes_the_merge_commit_message(self):
+        # Same shape as test_no_repo_override_silently_re_arms_it: a per-repo
+        # override deep-merges over defaults, and one that switched this pair
+        # would change a repo's merge-commit message without saying so.
+        for entry in self.cfg["repos"]:
+            if isinstance(entry, str) or not entry.get("overrides"):
+                continue
+            merged = rs.deep_merge(self.cfg["defaults"], entry["overrides"])
+            repo = merged.get("repo") or {}
+            self.assertEqual(
+                repo.get("merge_commit_title"),
+                "MERGE_MESSAGE",
+                msg=f"{entry['name']} overrides merge_commit_title",
+            )
+            self.assertEqual(
+                repo.get("merge_commit_message"),
+                "PR_TITLE",
+                msg=f"{entry['name']} overrides merge_commit_message",
+            )
+
 
 class MergeMethodTests(unittest.TestCase):
     LIVE_ALL_ON = {
@@ -670,6 +695,146 @@ class MergeMethodTests(unittest.TestCase):
         mock_gh_api.assert_called_once_with(
             "repos/o/r", method="PATCH", body={"allow_squash_merge": False}
         )
+
+
+class MergeCommitMessageTests(unittest.TestCase):
+    """`merge_commit_title` / `merge_commit_message` -- the two repo fields
+    behind GitHub's "Allow merge commits" message choice. The fleet wants
+    GitHub's own "Default message" pair, MERGE_MESSAGE/PR_TITLE, everywhere:
+    a PR description carried into a merge commit becomes commit text, and a
+    closing keyword closes its issue from there even inside backticks --
+    commit text is not markdown. See fleet.yml's comment on this leaf.
+
+    Like write_merge_methods, both keys are written in ONE call so the repo
+    never holds a half-applied pair the config did not choose.
+    """
+
+    DEFAULT_PAIR = {
+        "merge_commit_title": "MERGE_MESSAGE",
+        "merge_commit_message": "PR_TITLE",
+    }
+
+    def test_drift_is_reported_per_key(self):
+        live = {
+            "private": False,
+            "merge_commit_title": "PR_TITLE",
+            "merge_commit_message": "PR_BODY",
+        }
+        with patch.object(rs, "get_repo", return_value=live):
+            records = rs.plan_repo("o/r", {"repo": dict(self.DEFAULT_PAIR)})
+        by_setting = {r["setting"]: r for r in records}
+        self.assertEqual(
+            set(by_setting), {"repo.merge_commit_title", "repo.merge_commit_message"}
+        )
+        title = by_setting["repo.merge_commit_title"]
+        self.assertEqual(title["status"], "drift")
+        self.assertEqual(title["current"], "PR_TITLE")
+        self.assertEqual(title["desired"], "MERGE_MESSAGE")
+        message = by_setting["repo.merge_commit_message"]
+        self.assertEqual(message["status"], "drift")
+        self.assertEqual(message["current"], "PR_BODY")
+        self.assertEqual(message["desired"], "PR_TITLE")
+
+    def test_match_when_already_default(self):
+        live = {"private": False, **self.DEFAULT_PAIR}
+        with patch.object(rs, "get_repo", return_value=live):
+            records = rs.plan_repo("o/r", {"repo": dict(self.DEFAULT_PAIR)})
+        self.assertEqual({r["status"] for r in records}, {"match"})
+
+    def test_omitted_keys_are_unmanaged(self):
+        with patch.object(rs, "get_repo") as mock_get_repo:
+            records = rs.plan_repo("o/r", {"repo": {}})
+        self.assertEqual(records, [])
+        mock_get_repo.assert_not_called()
+
+    def test_explicit_null_is_unmanaged(self):
+        with patch.object(rs, "get_repo") as mock_get_repo:
+            records = rs.plan_repo(
+                "o/r",
+                {"repo": {"merge_commit_title": None, "merge_commit_message": None}},
+            )
+        self.assertEqual(records, [])
+        mock_get_repo.assert_not_called()
+
+    def test_one_key_alone_is_refused_rather_than_applied(self):
+        with patch.object(rs, "get_repo") as mock_get_repo:
+            records = rs.plan_repo(
+                "o/r", {"repo": {"merge_commit_message": "PR_TITLE"}}
+            )
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["status"], "skipped")
+        self.assertIn("together", rec["note"])
+        self.assertNotIn("_writer", rec)
+        mock_get_repo.assert_not_called()
+
+    def test_a_pair_github_does_not_offer_is_refused(self):
+        with patch.object(rs, "get_repo") as mock_get_repo:
+            records = rs.plan_repo(
+                "o/r",
+                {
+                    "repo": {
+                        "merge_commit_title": "MERGE_MESSAGE",
+                        "merge_commit_message": "PR_BODY",
+                    }
+                },
+            )
+        self.assertEqual(len(records), 2)
+        self.assertEqual({r["status"] for r in records}, {"skipped"})
+        for rec in records:
+            self.assertNotIn("_writer", rec)
+        mock_get_repo.assert_not_called()
+
+    def test_private_repos_are_managed_too(self):
+        live = {
+            "private": True,
+            "merge_commit_title": "PR_TITLE",
+            "merge_commit_message": "PR_BODY",
+        }
+        with patch.object(rs, "get_repo", return_value=live):
+            records = rs.plan_repo("o/r", {"repo": dict(self.DEFAULT_PAIR)})
+        self.assertIn("drift", {r["status"] for r in records})
+
+    def test_absent_field_is_skipped_not_a_crash(self):
+        with patch.object(rs, "get_repo", return_value={"private": False, "name": "r"}):
+            records = rs.plan_repo("o/r", {"repo": dict(self.DEFAULT_PAIR)})
+        self.assertEqual({r["status"] for r in records}, {"skipped"})
+        title_note = [r["note"] for r in records if r["setting"] == "repo.merge_commit_title"][0]
+        self.assertIn("merge_commit_title", title_note)
+
+    def test_read_failure_isolated_into_error_records(self):
+        with patch.object(rs, "get_repo", side_effect=rs.GhError(500, "boom")):
+            records = rs.plan_repo_records("o/r", {"repo": dict(self.DEFAULT_PAIR)})
+        self.assertEqual({r["status"] for r in records}, {"error"})
+
+    def test_apply_patches_the_pair_in_one_call(self):
+        live = {
+            "private": False,
+            "merge_commit_title": "PR_TITLE",
+            "merge_commit_message": "PR_BODY",
+        }
+        with patch.object(rs, "get_repo", return_value=live):
+            records = rs.plan_repo("o/r", {"repo": dict(self.DEFAULT_PAIR)})
+        drifted = [r for r in records if r["status"] == "drift"]
+        with patch.object(rs, "gh_api") as mock_gh_api:
+            rs.apply_record("o/r", drifted[0])
+        mock_gh_api.assert_called_once_with(
+            "repos/o/r", method="PATCH", body=dict(self.DEFAULT_PAIR)
+        )
+
+    def test_every_record_carries_the_whole_pair(self):
+        live = {
+            "private": False,
+            "merge_commit_title": "PR_TITLE",
+            "merge_commit_message": "PR_BODY",
+        }
+        with patch.object(rs, "get_repo", return_value=live):
+            records = rs.plan_repo("o/r", {"repo": dict(self.DEFAULT_PAIR)})
+        self.assertEqual(len(records), 2)
+        for rec in records:
+            self.assertEqual(
+                rec["_writer"], ("merge_commit_message", None, dict(self.DEFAULT_PAIR))
+            )
 
 
 class SingleRepoRepoBlockTests(unittest.TestCase):

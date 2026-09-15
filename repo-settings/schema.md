@@ -141,6 +141,17 @@ repo:
   # repo, with nothing going red. Omit the key, or set it to null, to leave it
   # unmanaged.
   delete_branch_on_merge: true
+
+  # Merge-commit message (repo Settings -> General -> Pull Requests -> "Allow
+  # merge commits"). Declare both keys together. The engine accepts only the
+  # three pairs that page offers -- MERGE_MESSAGE/PR_TITLE ("Default
+  # message"), PR_TITLE/BLANK ("Default to pull request title") and
+  # PR_TITLE/PR_BODY ("Default to pull request title and description") -- and
+  # reports anything else, or one key alone, as a skip at plan time rather than
+  # applying it. Omit both, or set them to null, to leave them unmanaged. Why
+  # the fleet pins "Default message": see fleet.yml.
+  merge_commit_title: MERGE_MESSAGE
+  merge_commit_message: PR_TITLE
 ```
 
 **Collision with the single-repo shape's identifier field:** the single-repo
