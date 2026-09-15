@@ -590,6 +590,103 @@ class FleetConfigTests(unittest.TestCase):
             )
 
 
+class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
+    """cms-platform#437: five more fleet repos gain a required status check
+    (agentskills already carried the fleet's only one, `pytest-windows`).
+    Parsed from the shipped fleet.yml -- never regex-scanned -- and rendered
+    through the engine's OWN resolve_targets/build_ruleset_body so a
+    mismerge between an override and the shared defaults is a red here, not
+    something an operator discovers from a live drift report."""
+
+    FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
+
+    EXPECTED = {
+        "Adam-S-Daniel/claude-memory-map": ["test"],
+        "Adam-S-Daniel/skills-evals": ["test"],
+        "Adam-S-Daniel/fastmail-actions": ["pester"],
+        "Adam-S-Daniel/GHA-bench": ["test"],
+        "Adam-S-Daniel/_agent-guidance": ["test"],
+    }
+    PRE_EXISTING = {"Adam-S-Daniel/agentskills": ["pytest-windows"]}
+
+    def setUp(self):
+        import yaml
+
+        with open(self.FLEET, encoding="utf-8") as fh:
+            self.cfg = yaml.safe_load(fh)
+        self.targets = {t["repo"]: t for t in rs.resolve_targets(self.cfg, None)}
+
+    def test_the_five_declare_exactly_the_named_contexts(self):
+        for repo, checks in self.EXPECTED.items():
+            settings = self.targets[repo]["settings"]
+            self.assertEqual(
+                (settings.get("ruleset") or {}).get("required_status_checks"),
+                checks,
+                msg=repo,
+            )
+
+    def test_no_other_managed_repo_gained_a_required_check(self):
+        allowed = dict(self.EXPECTED)
+        allowed.update(self.PRE_EXISTING)
+        for repo, target in self.targets.items():
+            if not target["manage"]:
+                continue
+            checks = (target["settings"].get("ruleset") or {}).get(
+                "required_status_checks"
+            )
+            if repo in allowed:
+                self.assertEqual(checks, allowed[repo], msg=repo)
+            else:
+                self.assertFalse(
+                    checks,
+                    msg=f"{repo} unexpectedly declares required_status_checks: {checks!r}",
+                )
+
+    def test_each_renders_a_required_status_checks_rule_with_exactly_those_contexts(self):
+        for repo, checks in self.EXPECTED.items():
+            ruleset_cfg = self.targets[repo]["settings"]["ruleset"]
+            body = rs.build_ruleset_body(ruleset_cfg)
+            rsc = next(
+                r for r in body["rules"] if r["type"] == "required_status_checks"
+            )
+            self.assertEqual(
+                rsc["parameters"]["required_status_checks"],
+                [{"context": c} for c in checks],
+                msg=repo,
+            )
+            self.assertIs(
+                rsc["parameters"]["strict_required_status_checks_policy"],
+                False,
+                msg=repo,
+            )
+
+    def test_each_still_inherits_the_shared_ruleset_defaults(self):
+        # The override touches ONLY required_status_checks -- everything else
+        # in the rendered ruleset must still be the shared fleet default,
+        # not something a careless override silently dropped or reset.
+        for repo in self.EXPECTED:
+            ruleset_cfg = self.targets[repo]["settings"]["ruleset"]
+            body = rs.build_ruleset_body(ruleset_cfg)
+            pr_params = next(
+                r["parameters"] for r in body["rules"] if r["type"] == "pull_request"
+            )
+            self.assertIs(
+                pr_params["require_extra_approval_for_unattributed_changes"],
+                False,
+                msg=repo,
+            )
+            self.assertEqual(pr_params["allowed_merge_methods"], ["merge"], msg=repo)
+            self.assertIn(
+                {
+                    "actor_type": "Integration",
+                    "actor_id": 4268639,
+                    "bypass_mode": "always",
+                },
+                body["bypass_actors"],
+                msg=repo,
+            )
+
+
 class MergeMethodTests(unittest.TestCase):
     LIVE_ALL_ON = {
         "private": False,
