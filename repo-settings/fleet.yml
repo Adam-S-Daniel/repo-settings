@@ -32,6 +32,39 @@ defaults:
     allow_merge_commit: true
     allow_squash_merge: false
     allow_rebase_merge: false
+    # Merge-commit message: GitHub's "Default message" pair fleet-wide -- the
+    # classic `Merge pull request #N from <branch>` subject with the PR title
+    # as its body, never the PR description.
+    #
+    # Measured: a closing keyword next to an issue number closes that issue
+    # from ANY commit message, whatever surrounds it -- commit text is not
+    # markdown, so backticks do nothing. A code span shields the keyword only
+    # while it stays in a PR description. 2026-09-15 on scratch-claude-001: a
+    # description quoting the keyword in a code span left its issue open under
+    # MERGE_MESSAGE/PR_TITLE, and the same description closed its issue through
+    # the merge commit under PR_TITLE/PR_BODY
+    # (https://github.com/Adam-S-Daniel/_agent-guidance/issues/132#issuecomment-5687434470).
+    # Not hypothetical: cms-platform#283 was closed unfixed by merge commit
+    # 78617e1, whose message quoted the keyword in a sentence explaining why the
+    # issue had to stay open, and its gap then went unwatched for 26 days.
+    #
+    # agentskills was the only repo in either account on PR_TITLE/PR_BODY (read
+    # 2026-09-15). Its merge subjects switch from `Merge pull request` to PR
+    # titles between 2026-04-29 and 2026-05-11, before this file existed, and no
+    # reason is recorded in its docs, its history or here. Every other repo --
+    # the three `manage: false` cms-platform repos included, which this never
+    # reaches -- was already on MERGE_MESSAGE/PR_TITLE, so declaring it changes
+    # agentskills alone.
+    #
+    # What a setting cannot cover: a message typed at merge time (`gh pr merge
+    # --body`, an MCP merge call's commit_message) and branch commit messages
+    # still land verbatim -- 78617e1 was the former. That half belongs to the
+    # fleet guidance rule, not to this file.
+    #
+    # If a token does not see these fields, the engine reports a skip, never
+    # drift -- the same handling as the merge-method toggles above.
+    merge_commit_title: MERGE_MESSAGE
+    merge_commit_message: PR_TITLE
     # "Automatically delete head branches". Not tidiness — it is what keeps
     # the fleet's own bots working.
     #

@@ -29,6 +29,8 @@ Managed settings:
   * repo.allow_merge_commit                -> repos/{repo}  (PATCH, one call for
     repo.allow_squash_merge                   the whole group -- see
     repo.allow_rebase_merge                   write_merge_methods)
+  * repo.merge_commit_title                -> repos/{repo}  (PATCH, one call for
+    repo.merge_commit_message                  the pair -- see write_merge_commit_message)
   * security.vulnerability_alerts          -> repos/{repo}/vulnerability-alerts
                                                (PUT/DELETE, no body -- the
                                                METHOD carries the value)
@@ -181,6 +183,30 @@ def write_merge_methods(repo: str, desired: dict) -> None:
     whole desired group at once means the repo never occupies the invalid
     state, and re-sending it is idempotent — so it does not matter which of the
     group's records triggered the write.
+    """
+    gh_api(f"repos/{repo}", method="PATCH", body=dict(desired))
+
+
+# The two merge-commit-message fields, always written together.
+MERGE_COMMIT_MESSAGE_KEYS = ("merge_commit_title", "merge_commit_message")
+
+# The three (title, message) pairs GitHub's own "Allow merge commits" section
+# offers, in the order its UI lists them: "Default message", "Default to pull
+# request title", and "Default to pull request title and description".
+MERGE_COMMIT_MESSAGE_PAIRS = (
+    ("MERGE_MESSAGE", "PR_TITLE"),
+    ("PR_TITLE", "BLANK"),
+    ("PR_TITLE", "PR_BODY"),
+)
+
+
+def write_merge_commit_message(repo: str, desired: dict) -> None:
+    """PATCH both merge-commit-message fields in ONE call.
+
+    Same reasoning as write_merge_methods just above: sending the pair
+    together means the repo never holds a half-applied combination the config
+    did not choose -- whichever of the two records triggered the write, the
+    PATCH carries both keys.
     """
     gh_api(f"repos/{repo}", method="PATCH", body=dict(desired))
 
@@ -985,6 +1011,83 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
                         }
                     )
 
+    # -- merge commit message ------------------------------------------------ #
+    # merge_commit_title / merge_commit_message -- the pair behind GitHub's
+    # "Allow merge commits" message choice. Why this is managed at all, and
+    # why only the three pairs the UI offers are accepted:
+    #
+    # A PR description carried into the merge commit (PR_BODY) becomes commit
+    # text, and a closing keyword next to an issue number closes that issue
+    # from commit text even inside backticks -- commit text is not markdown,
+    # so quoting the keyword does nothing. Measured 2026-09-15 on
+    # scratch-claude-001: the same description with the keyword in a code span
+    # left its issue open under MERGE_MESSAGE/PR_TITLE, and closed it through
+    # the merge commit under PR_TITLE/PR_BODY
+    # (https://github.com/Adam-S-Daniel/_agent-guidance/issues/132#issuecomment-5687434470).
+    # Refusing any pair GitHub's own settings page does not offer means a
+    # human reading the config finds out at plan time, rather than an apply
+    # writing a combination nobody picked from that page.
+    wanted = {
+        key: repo_cfg[key]
+        for key in MERGE_COMMIT_MESSAGE_KEYS
+        if repo_cfg.get(key, "unset") not in ("unset", None)
+    }
+    if wanted:
+        if len(wanted) != len(MERGE_COMMIT_MESSAGE_KEYS):
+            for key in wanted:
+                records.append(
+                    _skip(f"repo.{key}", wanted[key],
+                          "declare merge_commit_title and merge_commit_message "
+                          "together — they are one setting on GitHub's side; "
+                          "leaving it unmanaged")
+                )
+        else:
+            title = wanted["merge_commit_title"]
+            message = wanted["merge_commit_message"]
+            if (str(title), str(message)) not in MERGE_COMMIT_MESSAGE_PAIRS:
+                for key in wanted:
+                    records.append(
+                        _skip(f"repo.{key}", wanted[key],
+                              "not one of the pairs GitHub's 'Allow merge "
+                              "commits' section offers -- MERGE_MESSAGE/"
+                              "PR_TITLE, PR_TITLE/BLANK or PR_TITLE/PR_BODY -- "
+                              "leaving it unmanaged")
+                    )
+            else:
+                try:
+                    repo_obj = get_repo(repo)
+                except GhError as e:
+                    for key, desired in wanted.items():
+                        records.append(_err(f"repo.{key}", desired, e))
+                else:
+                    for key, desired in wanted.items():
+                        if key not in repo_obj:
+                            # Same defensive read as allow_auto_merge and the
+                            # merge-method block above, and for the same
+                            # reason: a KeyError here would escape
+                            # plan_repo_records' GhError-only guard and abort
+                            # the whole fleet run over one repo's payload.
+                            records.append(
+                                _skip(f"repo.{key}", desired,
+                                      f"GitHub did not return {key} for this "
+                                      "repo (token scope or payload shape) — "
+                                      "leaving it unmanaged")
+                            )
+                            continue
+                        current = repo_obj[key]
+                        records.append(
+                            {
+                                "setting": f"repo.{key}",
+                                "status": "match" if current == desired else "drift",
+                                "current": current,
+                                "desired": desired,
+                                # Every record carries the WHOLE pair: see
+                                # write_merge_commit_message for why it is one
+                                # call.
+                                "_writer": ("merge_commit_message", None, wanted),
+                            }
+                        )
+
     return records
 
 
@@ -1028,6 +1131,8 @@ def apply_record(repo: str, rec: dict) -> None:
         write_allow_auto_merge(repo, b)
     elif kind == "merge_methods":
         write_merge_methods(repo, b)
+    elif kind == "merge_commit_message":
+        write_merge_commit_message(repo, b)
     elif kind == "delete_branch_on_merge":
         write_delete_branch_on_merge(repo, b)
     elif kind == "vuln_alerts":
