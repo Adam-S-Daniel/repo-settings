@@ -23,16 +23,36 @@ updates:
     # cms-platform/AGENTS.md, "SHA-pin every workflow `uses:`"), matching
     # cms-platform's own .github/dependabot.yml.
     #
-    # Majors wait longer (30 days) because a major is the class that has
-    # actually needed reverting elsewhere in this account (cms-platform's
-    # AGENTS.md records setup-node 6->7 needing a revert, and the Decap
-    # bundle bump kept deliberately revertible). 30 days gives upstream room
-    # to yank or patch a bad major while patches/minors keep flowing weekly.
-    #
-    # semver-minor-days / semver-patch-days are deliberately left undefined:
-    # GitHub's documented precedence falls an undefined `semver-*-days` back
-    # to `default-days`, so spelling them out would only invite the two
-    # numbers to drift apart from `default-days` over time.
+    # NO semver-major-days (and no semver-minor-days / semver-patch-days
+    # either): GitHub's Dependabot options reference supports only
+    # `default-days` for the github-actions ecosystem, not per-SemVer-tier
+    # cooldown. Every actions bump, majors included, waits the flat 7 days
+    # above. Adding any `semver-*-days` key here is a schema validation
+    # error, not a key Dependabot quietly ignores, and it disables the WHOLE
+    # FILE. This file shipped with `semver-major-days: 30` on 2026-08-10.
+    # GitHub's `dependabot` check on that commit failed with "The property
+    # '#/updates/0/cooldown/semver-major-days' is not supported for the
+    # package ecosystem 'github-actions'", and no update job ever ran until
+    # the key was removed (#35). That check only runs once the file is on
+    # main, so a PR never shows it: tests/test_dependabot_config.py is the
+    # pre-merge guard. dependabot/dependabot-core#14628 is the open upstream
+    # request to add the support.
     cooldown:
       default-days: 7
-      semver-major-days: 30
+    # cms-platform's version is NOT Dependabot's to move. The
+    # scheduled-run-health.yml thin caller carries that version TWICE: the
+    # reusable's `uses:@<tag>` and the `platform_ref:` input that pins the
+    # audit script the reusable sparse-checks-out. This ecosystem sees only
+    # the `uses:` half, so an unignored bump moves the workflow and strands
+    # the script pin. GHA-bench, which has no such ignore, is half-bumped
+    # that way today (https://github.com/Adam-S-Daniel/cms-platform/issues/424).
+    # Here it would also land unattended: this repo has no ruleset (see
+    # dependabot-auto-merge.yml's header), so its sweep merges any green
+    # Dependabot PR directly. The ignore is deliberately UNSCOPED (no
+    # `versions` or `update-types`), the same rule _agent-guidance,
+    # skills-evals, fastmail-actions and both CMS sites carry. Bump both
+    # halves by hand until cms-platform#424 settles a mechanism that keeps
+    # them in step; if it does, remove this ignore and the matching assertion
+    # in tests/test_dependabot_config.py together.
+    ignore:
+      - dependency-name: "Adam-S-Daniel/cms-platform/*"

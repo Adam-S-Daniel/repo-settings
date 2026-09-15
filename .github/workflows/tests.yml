@@ -14,6 +14,10 @@ on:
       # least one concluded green check, never zero signal) — so the PR would
       # sit open forever.
       - ".github/workflows/**"
+      # dependabot.yml is locked by tests/test_dependabot_config.py. GitHub
+      # validates that file only after it reaches main, so a config-only
+      # change must still run the suite on its PR.
+      - ".github/dependabot.yml"
   push:
     branches: [main]
     paths:
@@ -27,6 +31,10 @@ on:
       # least one concluded green check, never zero signal) — so the PR would
       # sit open forever.
       - ".github/workflows/**"
+      # dependabot.yml is locked by tests/test_dependabot_config.py. GitHub
+      # validates that file only after it reaches main, so a config-only
+      # change must still run the suite on its PR.
+      - ".github/dependabot.yml"
 
 permissions:
   contents: read
