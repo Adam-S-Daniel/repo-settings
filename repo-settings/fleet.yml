@@ -4,6 +4,12 @@ defaults:
   # repo's "Allow auto-merge" setting is on. A plain repo setting (not
   # Actions-specific, not the ruleset), so it applies to every managed repo
   # here regardless of visibility -- no downgrade/skip handling needed.
+  # Since cms-platform#437, the fleet's dependabot-auto-merge.yml no longer
+  # arms native auto-merge at all -- `gh` merges an immediately-mergeable PR
+  # on the spot instead of arming when nothing is required to wait for. The
+  # setting stays on regardless: the skills-lock bumper still asks for it
+  # (https://github.com/Adam-S-Daniel/_agent-guidance/issues/141), and a repo
+  # that does carry a required check can still put native auto-merge to use.
   repo:
     allow_auto_merge: true
     # Merge commits only, fleet-wide. Two reasons, one measured and one
@@ -197,9 +203,11 @@ defaults:
       # .github/dependabot.yml), the sweep in
       # .github/workflows/dependabot-auto-merge.yml re-checks a
       # manifest-path allowlist against the PR's own diff and refuses
-      # anything outside it, it requires at least one concluded green check
-      # (never zero signal), and the merge-only policy above keeps the landed
-      # commit's parents intact.
+      # anything outside it, it requires every check on the head to have
+      # concluded green -- at least one of them from outside its own
+      # workflow -- and pins the merge to that judged head (cms-platform#437),
+      # and the merge-only policy above keeps the landed commit's parents
+      # intact.
       #
       # THE HONEST COST: with this false, a Dependabot PR that passes CI and
       # the path allowlist merges into a protected default branch with NO
@@ -278,25 +286,92 @@ repos:
     overrides:
       ruleset:
         required_status_checks: [pytest-windows]
+  # Five more repos gain a required status check here (cms-platform#437 --
+  # https://github.com/Adam-S-Daniel/cms-platform/issues/437). WHY: the
+  # account rule is that PR CI is required, and a GitHub-enforced ruleset
+  # refusal is the one kind no workflow edit can reopen -- unlike the
+  # workflow-level `sweep` gate #437 hardened
+  # (dependabot-auto-merge.yml's job `sweep`, which stays the load-bearing
+  # UNATTENDED-merge gate everywhere in this fleet), a ruleset lives outside
+  # the workflow a bad edit or a compromised token could rewrite.
+  #
+  # The SAME preconditions agentskills' `pytest-windows` comment above
+  # checks, applied per repo and CHECKED 2026-09-15 for each of the five:
+  #   * the context name is stable -- a plain job id with no `name:` and no
+  #     `matrix`, so GitHub publishes the check under the job id verbatim
+  #     (AGENTS.md, "A required status check gets no `concurrency` group").
+  #   * no `concurrency:` block at workflow or job level, so no cancelled run
+  #     can win the same head sha and wedge the merge API with `405 Required
+  #     status check ... is cancelled`.
+  #   * no `timeout-minutes` on the publishing job -- GitHub reports a job it
+  #     kills at its wall as `cancelled`, the same unrecoverable shape as a
+  #     concurrency collision (cms-platform#1815/#285/#289).
+  #   * present on every pull request to `main`:
+  #       - claude-memory-map: `pull_request: branches: [main]`.
+  #       - _agent-guidance: unfiltered -- it runs TWICE per head, once via
+  #         `push` on `**` and once via `pull_request`, and both finish.
+  #       - GHA-bench: `pull_request: branches: [main]`.
+  #       - skills-evals and fastmail-actions: ONLY once their own
+  #         cms-platform#437 PRs convert the workflow-level `paths:` filter
+  #         to always-run + early-skip -- a REQUIRED check that a path filter
+  #         can skip blocks every PR the filter skips (AGENTS.md,
+  #         "Required-check + path-filter trap"). THAT is why this change has
+  #         to merge AFTER those two PRs land, not alongside them.
+  #
+  # Deliberately NOT required, and why: claude-memory-map's `mirror`/
+  # `teardown` (a cross-repo preview publisher carrying its own
+  # `cancel-in-progress` group); skills-evals' Propagation `gate`/`arms` (a
+  # `cancel-in-progress` group, timeout walls, matrix-named contexts, and a
+  # verdict that depends on another repo's live state, none of which this
+  # file can hold still); and every one of these repos' own `auto-merge`/
+  # `sweep` jobs -- that pair IS the gate being hardened, not a signal to
+  # gate behind.
+  #
+  # Merging this file to `main` runs the apply immediately
+  # (`.github/workflows/repo-settings.yml`), so any PR open on one of these five repos at
+  # that moment, whose head predates the check existing, needs "Update
+  # branch" before the new required context can report on it at all.
   - name: Adam-S-Daniel/skills-evals
+    overrides:
+      ruleset:
+        required_status_checks: [test]
   - name: Adam-S-Daniel/claude-memory-map
+    overrides:
+      ruleset:
+        required_status_checks: [test]
   - name: jodidaniel/squarespacetemp
   # --- onboarded 2026-07-21 after the same audit: all workflows contents:read,
   #     no pushes to the default branch, every action SHA-pinned. wsl-automation
   #     already carried a hand-applied "default branch protection" ruleset
   #     (managed in place by name from here on). ---
   - name: Adam-S-Daniel/wsl-automation
+  # required_status_checks: [pester] -- see the cms-platform#437 comment
+  # above Adam-S-Daniel/skills-evals for the preconditions and why this one
+  # waits for its own always-run/early-skip PR before it can be listed here.
   - name: Adam-S-Daniel/fastmail-actions
+    overrides:
+      ruleset:
+        required_status_checks: [pester]
 
   # --- GHA-bench: migrated from classic branch protection to a ruleset (the
   #     fleet standard). Now managed like the other public repos. ---
+  # required_status_checks: [test] -- see the cms-platform#437 comment above
+  # Adam-S-Daniel/skills-evals for the preconditions checked 2026-09-15.
   - name: Adam-S-Daniel/GHA-bench
+    overrides:
+      ruleset:
+        required_status_checks: [test]
 
   # --- _agent-guidance: ruleset enabled. Previously held because drift-report.yml
   #     pushed to main as the Actions bot; fixed in _agent-guidance PR #20
   #     (drift report now lands via create-pull-request), so a PR-required
   #     ruleset no longer breaks it. ---
+  # required_status_checks: [test] -- see the cms-platform#437 comment above
+  # Adam-S-Daniel/skills-evals for the preconditions checked 2026-09-15.
   - name: Adam-S-Daniel/_agent-guidance
+    overrides:
+      ruleset:
+        required_status_checks: [test]
 
   # --- private: only SHA pinning applies. fork-PR approval (422), rulesets
   #     (403, needs Pro) and allow_auto_merge are all auto-skipped by the engine

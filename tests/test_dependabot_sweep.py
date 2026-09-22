@@ -11,6 +11,18 @@ had already refused, so the run logged a self-contradicting pair --
 
 -- and failed daily naming no cause (skills-evals run 32342667620, 2026-08-20).
 
+cms-platform#437 hardened the sweep further, after #41 on THIS repo showed
+`gh pr merge --auto` merges an already-immediately-mergeable PR on the spot
+rather than arming, so a Dependabot PR could land before any real CI had
+reported at all. Job `auto-merge` no longer attempts a merge; this sweep is
+now the only unattended merge path, and it must not merge a PR whose only
+green checks are its OWN prior jobs on this same workflow. The additions
+here test that: a `SELF_WORKFLOW` identity that must be non-empty to run at
+all, a floor that requires at least one check from OUTSIDE this workflow, a
+40-hex-sha shape check on `headRefOid` before a merge is attempted, a merge
+pinned to that sha with `--match-head-commit`, and a re-check that the head
+has not moved out from under a refused, pinned merge attempt.
+
 These tests EXECUTE the step's real shell script, extracted from the workflow
 with a YAML parser (never a regex or line scan), against stubbed `gh`/`git`
 binaries. No network, no sleeps, no wall-clock dependence.
@@ -29,6 +41,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "dependabot-auto-merge.yml"
 STEP_NAME = "Sweep open Dependabot PRs"
+DEFAULT_SELF_WORKFLOW = "Dependabot auto-merge"
 
 # The verbatim `pull_request` rule parameters returned by
 # GET repos/Adam-S-Daniel/skills-evals/rules/branches/main on 2026-08-20.
@@ -58,7 +71,21 @@ case "$1 ${2:-}" in
     cat "$FIXTURES/pr-numbers.txt"
     ;;
   "pr view")
-    cat "$FIXTURES/pr-$3.json"
+    # First call for a given PR number answers with pr-N.json; every later
+    # call answers with pr-N.after.json if the test provided one (the
+    # sweep re-views a PR after a refused, pinned merge attempt to see
+    # whether its head moved), else falls back to pr-N.json again.
+    num="$3"
+    count_file="$FIXTURES/pr-${num}.calls"
+    count=0
+    [ -f "$count_file" ] && count=$(cat "$count_file")
+    count=$((count + 1))
+    echo "$count" > "$count_file"
+    if [ "$count" -gt 1 ] && [ -f "$FIXTURES/pr-${num}.after.json" ]; then
+      cat "$FIXTURES/pr-${num}.after.json"
+    else
+      cat "$FIXTURES/pr-${num}.json"
+    fi
     ;;
   "pr merge")
     num="${!#}"
@@ -122,17 +149,40 @@ class SweepGateTests(unittest.TestCase):
                 )
         cls.script = sweep_script()
 
-    def _pr(self, number, merge_state, checks=("SUCCESS",)):
+    def _pr(self, number, merge_state, checks=("SUCCESS",), head_sha=None):
+        def _entry(c):
+            # A plain string keeps every pre-existing caller working exactly
+            # as before -- a check with no `workflowName` at all, which the
+            # sweep's "outside this workflow" gate correctly treats as
+            # OUTSIDE (a legacy commit status carries no workflowName
+            # either). A dict lets a new test name a specific workflow, e.g.
+            # to simulate job `auto-merge`'s own SUCCESS check.
+            if isinstance(c, dict):
+                entry = {"conclusion": c.get("conclusion")}
+                if "workflowName" in c:
+                    entry["workflowName"] = c["workflowName"]
+                if "name" in c:
+                    entry["name"] = c["name"]
+                return entry
+            return {"conclusion": c}
+
         return {
             "number": number,
             "baseRefName": "main",
-            "headRefOid": "0" * 40,
+            "headRefOid": head_sha if head_sha is not None else "0" * 40,
             "mergeable": "MERGEABLE",
             "mergeStateStatus": merge_state,
-            "statusCheckRollup": [{"conclusion": c} for c in checks],
+            "statusCheckRollup": [_entry(c) for c in checks],
         }
 
-    def _run(self, prs, rules=None, merge_fails=()):
+    def _run(
+        self,
+        prs,
+        rules=None,
+        merge_fails=(),
+        after=None,
+        self_workflow=DEFAULT_SELF_WORKFLOW,
+    ):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -147,6 +197,10 @@ class SweepGateTests(unittest.TestCase):
         for pr in prs:
             (fixtures / f"pr-{pr['number']}.json").write_text(
                 json.dumps(pr), encoding="utf-8"
+            )
+        for num, payload in (after or {}).items():
+            (fixtures / f"pr-{num}.after.json").write_text(
+                json.dumps(payload), encoding="utf-8"
             )
         if rules is not None:
             (fixtures / "rules.json").write_text(json.dumps(rules), encoding="utf-8")
@@ -164,6 +218,7 @@ class SweepGateTests(unittest.TestCase):
                 "FIXTURES": str(fixtures),
                 "GITHUB_REPOSITORY": "Adam-S-Daniel/skills-evals",
                 "MERGE_FAILS": " ".join(str(n) for n in merge_fails),
+                "SELF_WORKFLOW": self_workflow,
             }
         )
         proc = subprocess.run(
@@ -245,6 +300,9 @@ class SweepGateTests(unittest.TestCase):
 
     def test_a_behind_pr_is_still_refreshed_not_blocked(self):
         # BEHIND is a state this sweep can fix; the gate must not catch it.
+        # No after.json for #42, so the post-refusal re-view falls back to
+        # the same pr-42.json -- the head has NOT moved, so this must still
+        # fall through to the BEHIND branch and refresh it.
         proc, calls = self._run([self._pr(42, "BEHIND")], merge_fails=(42,))
         self.assertIn("pr update-branch", calls)
         self.assertIn(
@@ -266,6 +324,104 @@ class SweepGateTests(unittest.TestCase):
         proc, _ = self._run([])
         self.assertIn("merged=0 updated=0 skipped=0 blocked=0 failed=0", proc.stdout)
         self.assertEqual(proc.returncode, 0)
+
+    # -- cms-platform#437 hardening: pin the merge, require an outside check #
+    def test_a_real_ci_check_plus_the_own_workflow_check_still_merges(self):
+        checks = [
+            {"conclusion": "SUCCESS", "workflowName": "tests"},
+            {"conclusion": "SUCCESS", "workflowName": DEFAULT_SELF_WORKFLOW},
+        ]
+        sha = "a" * 40
+        pr = self._pr(50, "CLEAN", checks=checks, head_sha=sha)
+        proc, calls = self._run([pr])
+        merge_calls = [
+            line for line in calls.splitlines() if line.startswith("pr merge")
+        ]
+        self.assertEqual(len(merge_calls), 1, msg=calls)
+        self.assertIn(f"--match-head-commit {sha}", merge_calls[0])
+        self.assertTrue(
+            merge_calls[0].rstrip().endswith("50"),
+            msg="the PR number must be the LAST argument -- the stub reads "
+            f"it with ${{!#}}: {merge_calls[0]!r}",
+        )
+        self.assertIn(
+            "merged=1 updated=0 skipped=0 blocked=0 failed=0", proc.stdout
+        )
+        self.assertEqual(proc.returncode, 0)
+
+    def test_only_the_own_workflow_reporting_does_not_merge(self):
+        checks = [{"conclusion": "SUCCESS", "workflowName": DEFAULT_SELF_WORKFLOW}]
+        proc, calls = self._run([self._pr(51, "CLEAN", checks=checks)])
+        self.assertNotIn("pr merge", calls)
+        self.assertIn(
+            "every check on its head comes from this workflow", proc.stdout
+        )
+        self.assertIn(
+            "merged=0 updated=0 skipped=1 blocked=0 failed=0", proc.stdout
+        )
+        self.assertEqual(proc.returncode, 0)
+
+    def test_a_still_running_outside_check_does_not_merge(self):
+        checks = [{"conclusion": None, "workflowName": "tests"}]
+        proc, calls = self._run([self._pr(52, "CLEAN", checks=checks)])
+        self.assertNotIn("pr merge", calls)
+        self.assertIn(
+            "merged=0 updated=0 skipped=1 blocked=0 failed=0", proc.stdout
+        )
+        self.assertEqual(proc.returncode, 0)
+
+    def test_head_moved_after_a_refused_pinned_merge_is_not_updated(self):
+        original = "1" * 40
+        moved = "2" * 40
+        pr = self._pr(53, "BEHIND", head_sha=original)
+        proc, calls = self._run(
+            [pr], merge_fails=(53,), after={53: {"headRefOid": moved}}
+        )
+        self.assertNotIn("pr update-branch", calls)
+        self.assertIn("its head moved", proc.stdout)
+        self.assertIn(
+            "merged=0 updated=0 skipped=1 blocked=0 failed=0", proc.stdout
+        )
+        self.assertEqual(proc.returncode, 0)
+
+    def test_empty_self_workflow_refuses_to_run_at_all(self):
+        proc, calls = self._run([self._pr(54, "CLEAN")], self_workflow="")
+        self.assertNotIn("pr merge", calls)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_non_sha_head_ref_oid_skips_rather_than_merging(self):
+        proc, calls = self._run([self._pr(55, "CLEAN", head_sha="abc")])
+        self.assertNotIn("pr merge", calls)
+        self.assertIn(
+            "merged=0 updated=0 skipped=1 blocked=0 failed=0", proc.stdout
+        )
+        self.assertEqual(proc.returncode, 0)
+
+
+class AutoMergeJobMergesNothingTests(unittest.TestCase):
+    """cms-platform#437: `gh pr merge --auto` merges an already-mergeable PR
+    on the spot instead of arming (measured on this repo's own #41), so job
+    `auto-merge` must never call `gh pr merge` at all -- only job `sweep`
+    merges, and only after judging every check on the head. Parsed with a
+    real YAML parser, never a regex or line scan, per this repo's own
+    AST-always rule for anything reasoning about workflow SHAPE."""
+
+    def test_auto_merge_job_steps_are_exactly_the_non_merging_set(self):
+        doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        steps = doc["jobs"]["auto-merge"]["steps"]
+        names = [s.get("name") for s in steps]
+        self.assertEqual(
+            names,
+            [
+                "Checkout",
+                "Fetch base ref",
+                "Get Dependabot metadata",
+                "Verify only manifest paths changed",
+                "Disable auto-merge (path check failed)",
+            ],
+            msg="job `auto-merge` merges nothing (cms-platform#437) -- a "
+            "merge-attempting step reappearing here needs a second look",
+        )
 
 
 if __name__ == "__main__":
