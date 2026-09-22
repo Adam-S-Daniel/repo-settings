@@ -72,45 +72,6 @@ class DependabotConfigTests(unittest.TestCase):
                     "dependabot/dependabot-core#14628.",
                 )
 
-    def test_github_actions_entries_ignore_cms_platform_unscoped(self):
-        doc = _load_config()
-        entries = _github_actions_entries(doc)
-        for index, entry in entries:
-            ignore_items = entry.get("ignore") or []
-            matches = [
-                item
-                for item in ignore_items
-                if item.get("dependency-name") == CMS_PLATFORM_DEPENDENCY_NAME
-            ]
-            self.assertTrue(
-                matches,
-                f"updates[{index}] must ignore dependency-name: "
-                f"{CMS_PLATFORM_DEPENDENCY_NAME!r}. cms-platform's version "
-                "is carried TWICE in scheduled-run-health.yml's thin "
-                "caller -- the reusable's `uses:@<tag>` and the "
-                "`platform_ref:` input that pins the sparse-checked-out "
-                "audit script -- and this ecosystem only sees the `uses:` "
-                "half, so an unignored bump moves the workflow and strands "
-                "the script pin, half-bumping it the way GHA-bench is "
-                "today: "
-                "https://github.com/Adam-S-Daniel/cms-platform/issues/424.",
-            )
-            for item in matches:
-                self.assertNotIn(
-                    "versions",
-                    item,
-                    f"updates[{index}]'s cms-platform ignore must stay "
-                    "unscoped (no `versions` key) -- see "
-                    "https://github.com/Adam-S-Daniel/cms-platform/issues/424.",
-                )
-                self.assertNotIn(
-                    "update-types",
-                    item,
-                    f"updates[{index}]'s cms-platform ignore must stay "
-                    "unscoped (no `update-types` key) -- see "
-                    "https://github.com/Adam-S-Daniel/cms-platform/issues/424.",
-                )
-
 
 if __name__ == "__main__":
     unittest.main()

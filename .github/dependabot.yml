@@ -39,20 +39,17 @@ updates:
     # request to add the support.
     cooldown:
       default-days: 7
-    # cms-platform's version is NOT Dependabot's to move. The
-    # scheduled-run-health.yml thin caller carries that version TWICE: the
-    # reusable's `uses:@<tag>` and the `platform_ref:` input that pins the
-    # audit script the reusable sparse-checks-out. This ecosystem sees only
-    # the `uses:` half, so an unignored bump moves the workflow and strands
-    # the script pin. GHA-bench, which has no such ignore, is half-bumped
-    # that way today (https://github.com/Adam-S-Daniel/cms-platform/issues/424).
-    # Here it would also land unattended: this repo has no ruleset (see
-    # dependabot-auto-merge.yml's header), so its sweep merges any green
-    # Dependabot PR directly. The ignore is deliberately UNSCOPED (no
-    # `versions` or `update-types`), the same rule _agent-guidance,
-    # skills-evals, fastmail-actions and both CMS sites carry. Bump both
-    # halves by hand until cms-platform#424 settles a mechanism that keeps
-    # them in step; if it does, remove this ignore and the matching assertion
-    # in tests/test_dependabot_config.py together.
-    ignore:
-      - dependency-name: "Adam-S-Daniel/cms-platform/*"
+      # cms-platform releases are this account's own code, gated by its own
+      # required checks before a tag ever exists, so they don't need the
+      # 7-day cooling-off above — that applies to third-party actions. This
+      # entry used to ignore cms-platform bumps outright: the
+      # scheduled-run-health.yml thin caller carried the platform version
+      # TWICE (the reusable's `uses:@<tag>` and a `platform_ref:` input),
+      # and this ecosystem saw only the `uses:` half, so an unignored bump
+      # would have moved the workflow and stranded the script pin — the fate
+      # GHA-bench, which never carried this ignore, was left in. The
+      # reusable now resolves its own script commit from the job context, so
+      # the caller names the version once, and this exclude is what lets
+      # that one bump land without the third-party wait
+      # (https://github.com/Adam-S-Daniel/cms-platform/issues/424).
+      exclude: ["Adam-S-Daniel/cms-platform/*"]
