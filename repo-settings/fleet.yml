@@ -253,14 +253,17 @@ defaults:
 # own design).
 
 # WHAT THIS LIST IS, AND THE TWO SETS IT IS NOT. It is what this file DECLARES:
-# 21 entries. The engine MANAGES 16 of them -- five carry `manage: false`, and
+# 22 entries as of 2026-09-24 (adam-agentskills added; agentskills-private
+# renamed to adam-agentskills-private in place, so the count it contributes is
+# unchanged). The engine MANAGES 17 of them -- five carry `manage: false`, and
 # cmd_diff/cmd_apply skip those before planning anything. The App's REACH is
 # wider than either: both installations are on "All repositories" (owner,
 # 2026-08-29), so the credential this file drives can administer every repo in
-# both accounts, listed here or not. Declared and in-account are equal today
-# (21 = 21, verified 2026-08-29), so a repo created in either account tomorrow
-# is the first that is reachable and undeclared -- and nothing compares them:
-# the engine never enumerates an account, it only reads this list.
+# both accounts, listed here or not. Declared and in-account were equal on
+# 2026-08-29 (21 = 21); this PR's addition has not yet been re-verified
+# against the account listing -- run `repo_settings.py coverage` per owner
+# before trusting that equality again. Nothing here compares them itself: the
+# engine never enumerates an account, it only reads this list.
 repos:
   # --- public, ruleset-safe (adversarially verified: no workflow pushes to main) ---
   # agentskills carries the fleet's only required status check.
@@ -282,10 +285,42 @@ repos:
   #     merge API with `405 Required status check ... is cancelled`.
   # agentskills' scripts/test_ci_workflow.py parses that workflow and fails if
   # either stops holding, so this list cannot be quietly outlived.
+  # RETIRING: superseded by Adam-S-Daniel/adam-agentskills below. Left
+  # declared and managed for now -- the owner will make this repo private and
+  # archive it later -- rather than dropping it from this file the moment its
+  # replacement exists.
   - name: Adam-S-Daniel/agentskills
     overrides:
       ruleset:
         required_status_checks: [pytest-windows]
+  # adam-agentskills: the new public skills registry replacing agentskills
+  # above. Same policy shape as agentskills (PR-only default branch, merge
+  # commits only, SHA pinning, fork-PR approval) via the shared `defaults:`
+  # block -- only the required-check override differs.
+  #
+  # Three status checks, not one: its ci.yml (verified 2026-09-24 via
+  # `contents/.github/workflows/ci.yml`) has jobs `privacy`, `pytest` and
+  # `pytest-windows`, none carrying a `name:` or `matrix:` (so each context
+  # name is the stable job id), no `concurrency:` block at workflow or job
+  # level (no cancelled-run-wins-the-context hazard --
+  # AGENTS.md, "A required status check gets no `concurrency` group"), no
+  # `timeout-minutes` on any of the three (so GitHub cannot report one
+  # `cancelled` by hitting a wall), and an unfiltered `pull_request:` trigger
+  # (all three report on every PR, never skipped by a path filter).
+  #
+  # Secret scanning + push protection: already enabled on this repo
+  # (`security_and_analysis.secret_scanning.status` /
+  # `.secret_scanning_push_protection.status`, both "enabled", checked
+  # 2026-09-24) but NOT declared here -- the engine's `security:` group
+  # covers only Dependabot alerts/security-updates
+  # (repo-settings/schema.md); there is no `secret_scanning` /
+  # `secret_scanning_push_protection` key anywhere in
+  # scripts/repo_settings.py, so adding one here would be inert config the
+  # engine silently never reads. Revisit if the engine ever grows that field.
+  - name: Adam-S-Daniel/adam-agentskills
+    overrides:
+      ruleset:
+        required_status_checks: [privacy, pytest, pytest-windows]
   # Five more repos gain a required status check here (cms-platform#437 --
   # https://github.com/Adam-S-Daniel/cms-platform/issues/437). WHY: the
   # account rule is that PR CI is required, and a GitHub-enforced ruleset
@@ -385,7 +420,11 @@ repos:
   #     See schema.md, "Downgrade behavior". ---
   - name: Adam-S-Daniel/rss-inator
   - name: Adam-S-Daniel/jc
-  - name: Adam-S-Daniel/agentskills-private
+  # Renamed from Adam-S-Daniel/agentskills-private 2026-09-24 (companion
+  # private repo to the new adam-agentskills public registry above). GitHub
+  # redirects the old name, but the engine keys targets by name verbatim, so
+  # this file has to track the rename rather than rely on the redirect.
+  - name: Adam-S-Daniel/adam-agentskills-private
   - name: Adam-S-Daniel/4A
 
   # --- this repo, managing itself. Previously absent from this list entirely --
