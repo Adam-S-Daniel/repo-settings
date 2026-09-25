@@ -607,7 +607,15 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         "Adam-S-Daniel/GHA-bench": ["test"],
         "Adam-S-Daniel/_agent-guidance": ["test"],
     }
-    PRE_EXISTING = {"Adam-S-Daniel/agentskills": ["pytest-windows"]}
+    PRE_EXISTING = {
+        "Adam-S-Daniel/agentskills": ["pytest-windows"],
+        # adam-agentskills: new public registry replacing agentskills above,
+        # onboarded with a required check from day one -- not part of the
+        # cms-platform#437 batch this class otherwise tests, so it belongs in
+        # this "allowed but not asserted exactly by the other tests" bucket
+        # rather than EXPECTED.
+        "Adam-S-Daniel/adam-agentskills": ["privacy", "pytest", "pytest-windows"],
+    }
 
     def setUp(self):
         import yaml
