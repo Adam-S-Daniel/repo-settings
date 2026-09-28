@@ -27,6 +27,15 @@ actions:
   # detects private repos and skips this automatically.
   fork_pr_approval: all_external_contributors
 
+  # Settings -> Actions -> General -> Workflow permissions (issue #51). Both
+  # keys live on one endpoint, .../actions/permissions/workflow; the engine
+  # PUTs whichever of the two are declared together, in one call. No
+  # private-repo gate -- this endpoint works on every plan. Omit either key,
+  # or set it to null, to leave it unmanaged. See "Workflow permissions"
+  # below for the 403 handling and the approval-review risk.
+  default_workflow_permissions: read      # "read" or "write" -- GITHUB_TOKEN's default scope
+  can_approve_pull_request_reviews: false # workflows may submit approving PR reviews
+
 # Dependabot alerts + security-update automation. See "security:" below for
 # the endpoints, the read/write semantics, and why grouped_security_updates
 # can be declared but never applied.
@@ -422,3 +431,37 @@ The correct enum values are the short forms returned by
 |-----------------|-----------|
 | Require approval for first-time contributors | `first_time_contributors` |
 | **Require approval for all outside collaborators** | `all_external_contributors` |
+
+## Workflow permissions (`actions.default_workflow_permissions` / `actions.can_approve_pull_request_reviews`)
+
+Settings -> Actions -> General -> Workflow permissions (issue #51). Both
+fields live on one endpoint: `GET`/`PUT repos/{repo}/actions/permissions/workflow`
+returns/accepts `{"default_workflow_permissions": "read"|"write",
+"can_approve_pull_request_reviews": bool}`, either or both keys at once.
+
+- **No private-repo gate.** Unlike `fork_pr_approval` and `ruleset`, this
+  endpoint answers on every plan, so the planner never calls `is_private()`
+  for it.
+- **One PUT carries the whole declared group**, same reasoning as
+  `write_merge_methods`: whichever declared key drifted, the apply sends
+  every declared key together, so re-applying is idempotent regardless of
+  which record triggered the write.
+- **`default_workflow_permissions` accepts only `"read"` or `"write"`.** Any
+  other value is refused at plan time (a `skipped` record naming the allowed
+  values), before any API call -- the same "refuse where a human is reading,
+  not as a failed fleet-wide PUT" pattern as the merge-commit-message pairs.
+- **A 403 on the read is a `skipped` record per declared key**, not an
+  aborted run -- same contract as `security.vulnerability_alerts`' 403
+  handling: the App grant this surface is bolted onto predates the setting,
+  so a scope gap must not take the whole apply down.
+- **A key absent from the payload is a `skipped` record naming that key**,
+  not a `KeyError` -- the same defensive-read pattern as every other
+  repo/actions field in this file.
+
+**Risk: `can_approve_pull_request_reviews: true` lets `GITHUB_TOKEN` submit
+approving reviews.** On a repo whose ruleset requires approvals
+(`require_pull_request.required_approving_review_count` > 0), a workflow that
+approves its own PR makes that PR count as approved -- the review comes from
+a token the repo's own Action controls, not an independent reviewer.
+Revisit this setting before raising `required_approving_review_count` on any
+repo that has it `true`.

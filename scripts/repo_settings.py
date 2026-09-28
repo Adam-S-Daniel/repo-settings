@@ -19,6 +19,9 @@ Three subcommands:
 Managed settings:
   * actions.sha_pinning_required           -> repos/{repo}/actions/permissions
   * actions.fork_pr_approval               -> .../actions/permissions/fork-pr-contributor-approval
+  * actions.default_workflow_permissions   -> .../actions/permissions/workflow  (PUT, one call
+    actions.can_approve_pull_request_reviews  for the declared group -- see
+                                               write_workflow_permissions; no private-repo gate)
   * ruleset (default-branch protection)    -> repos/{repo}/rulesets  (idempotent BY NAME)
   * repo.allow_auto_merge                  -> repos/{repo}  (PATCH; skipped on
                                                private repos -- see the downgrade
@@ -216,6 +219,29 @@ def write_merge_commit_message(repo: str, desired: dict) -> None:
 # --------------------------------------------------------------------------- #
 def read_actions(repo: str) -> dict:
     return gh_api(f"repos/{repo}/actions/permissions")
+
+
+# Settings -> Actions -> General -> Workflow permissions (issue #51): the
+# GITHUB_TOKEN default scope and "Allow GitHub Actions to create and approve
+# pull requests". One endpoint, repos/{repo}/actions/permissions/workflow,
+# carries both -- GET/PUT accept either or both keys.
+WORKFLOW_PERMISSIONS_KEYS = ("default_workflow_permissions", "can_approve_pull_request_reviews")
+
+
+def read_workflow_permissions(repo: str) -> dict:
+    # `or {}`: gh_api returns None for an empty body, and callers test key
+    # membership -- a None here would TypeError past every GhError guard.
+    return gh_api(f"repos/{repo}/actions/permissions/workflow") or {}
+
+
+def write_workflow_permissions(repo: str, desired: dict) -> None:
+    """PUT the whole declared workflow-permissions group in ONE call.
+
+    Same reasoning as write_merge_methods above: the two fields live on one
+    endpoint, so sending the declared group together is idempotent regardless
+    of which record in the group triggered the write.
+    """
+    gh_api(f"repos/{repo}/actions/permissions/workflow", method="PUT", body=dict(desired))
 
 
 def read_fork_approval(repo: str) -> str | None:
@@ -721,6 +747,74 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
             except GhError as e:
                 records.append(_err("actions.fork_pr_approval", fork, e))
 
+    # -- workflow permissions (GITHUB_TOKEN scope + PR-approval) ------------- #
+    # No plan gate, unlike fork_pr_approval above: this endpoint works on
+    # every plan, public and private alike -- the planner must not even ask
+    # whether the repo is private.
+    wp_wanted = {
+        key: actions_cfg[key]
+        for key in WORKFLOW_PERMISSIONS_KEYS
+        if actions_cfg.get(key, "unset") not in ("unset", None)
+    }
+    if wp_wanted:
+        perm = wp_wanted.get("default_workflow_permissions")
+        if "default_workflow_permissions" in wp_wanted and perm not in ("read", "write"):
+            # Refused here, where a human is reading, rather than as a failed
+            # PUT against the fleet -- GitHub only accepts these two values.
+            for key, desired in wp_wanted.items():
+                records.append(
+                    _skip(f"actions.{key}", desired,
+                          "default_workflow_permissions must be 'read' or 'write'")
+                )
+        else:
+            try:
+                payload = read_workflow_permissions(repo)
+            except GhError as e:
+                if e.status == 403:
+                    for key, desired in wp_wanted.items():
+                        records.append(
+                            _skip(f"actions.{key}", desired,
+                                  "cannot read -- HTTP 403 (token lacks Administration "
+                                  "on this repo)")
+                        )
+                else:
+                    for key, desired in wp_wanted.items():
+                        records.append(_err(f"actions.{key}", desired, e))
+            else:
+                for key in WORKFLOW_PERMISSIONS_KEYS:
+                    if key not in wp_wanted:
+                        continue
+                    desired = wp_wanted[key]
+                    if key not in payload:
+                        # Same defensive read as the repo-field blocks below:
+                        # an unexpected payload shape must never KeyError past
+                        # plan_repo_records' GhError-only guard.
+                        records.append(
+                            _skip(f"actions.{key}", desired,
+                                  f"GitHub did not return {key} for this repo "
+                                  "(token scope or payload shape) -- leaving it "
+                                  "unmanaged")
+                        )
+                        continue
+                    if key == "can_approve_pull_request_reviews":
+                        current = bool(payload[key])
+                        desired_v: Any = bool(desired)
+                    else:
+                        current = payload[key]
+                        desired_v = str(desired)
+                    records.append(
+                        {
+                            "setting": f"actions.{key}",
+                            "status": "match" if current == desired_v else "drift",
+                            "current": current,
+                            "desired": desired_v,
+                            # Every record in the group carries the WHOLE
+                            # declared group: see write_workflow_permissions
+                            # for why it is one PUT.
+                            "_writer": ("workflow_permissions", None, wp_wanted),
+                        }
+                    )
+
     # -- security (Dependabot alerts + security updates) --------------------- #
     # Three possible leaves, at most three records, in an order that is a real
     # dependency and not cosmetics -- see below.
@@ -1125,6 +1219,8 @@ def apply_record(repo: str, rec: dict) -> None:
         write_sha_pinning(repo, a, b)
     elif kind == "fork":
         write_fork_approval(repo, b)
+    elif kind == "workflow_permissions":
+        write_workflow_permissions(repo, b)
     elif kind == "ruleset":
         write_ruleset(repo, a, b)
     elif kind == "auto_merge":
@@ -1192,6 +1288,14 @@ def cmd_generate(args) -> int:
         fork = read_fork_approval(repo)
         if fork is not None:
             doc["actions"]["fork_pr_approval"] = fork
+    try:
+        wp = read_workflow_permissions(repo)
+    except GhError:
+        pass  # workflow-permissions unavailable (e.g. scope gap) -- see plan_repo
+    else:
+        for key in WORKFLOW_PERMISSIONS_KEYS:
+            if key in wp:
+                doc["actions"][key] = wp[key]
     # Emit a ruleset block from the branch ruleset targeting the default branch,
     # if any is present; otherwise a disabled stub for public repos.
     try:

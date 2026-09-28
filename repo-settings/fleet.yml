@@ -101,6 +101,14 @@ defaults:
   actions:
     sha_pinning_required: true
     fork_pr_approval: all_external_contributors
+    # Settings -> Actions -> General -> Workflow permissions (issue #51).
+    # `read` keeps GITHUB_TOKEN least-privilege unless a workflow asks for
+    # more in its own `permissions:` block. `false` keeps workflows from
+    # opening or approving PRs with GITHUB_TOKEN -- the PR + auto-merge
+    # bot-write path the policy block below does not sanction. The one
+    # declared exception is skills-evals (its override, ADR 0003).
+    default_workflow_permissions: read
+    can_approve_pull_request_reviews: false
   # Dependabot alerts + security-update automation. Managed nowhere before
   # this group existed, and measurably off on at least some of the fleet:
   # 2026-08-31, `GET repos/{repo}/dependabot/alerts` against agentskills,
@@ -250,7 +258,12 @@ defaults:
 # that writes to every managed repo (currently agents-md-sync). Never a
 # hand-granted UI bypass. PR + auto-merge is not a sanctioned bot-write path in
 # this fleet (the cms-platform-managed repos, excluded here, use it by their
-# own design).
+# own design), with ONE declared exception: skills-evals' weekly roster PR
+# (docs/decisions/0003; issue #51), opened and auto-merged with GITHUB_TOKEN
+# behind the required `test` check. It is declared as that repo's
+# `actions.can_approve_pull_request_reviews: true` override; every other
+# managed repo inherits `false`, and tests/test_repo_settings.py fails if any
+# other repo gains it.
 
 # WHAT THIS LIST IS, AND THE TWO SETS IT IS NOT. It is what this file DECLARES:
 # 22 entries as of 2026-09-24 (adam-agentskills added; agentskills-private
@@ -370,6 +383,19 @@ repos:
     overrides:
       ruleset:
         required_status_checks: [test]
+      actions:
+        # why: the weekly Real eval run's `roster_mode: auto` opens the roster
+        # PR with GITHUB_TOKEN, dispatches ci.yml so `test` reports on its
+        # head, and enables auto-merge. The fleet's one declared PR +
+        # auto-merge bot-write path -- ADR 0003
+        # (docs/decisions/0003-scope-skills-evals-roster-auto-merge-as-declared-exception.md),
+        # chosen by the owner 2026-09-28 over a bypass-actor App, issue
+        # https://github.com/Adam-S-Daniel/repo-settings/issues/51.
+        # RISK: this also lets GITHUB_TOKEN approve PRs. With the fleet's
+        # required_approving_review_count: 0 that grants nothing today;
+        # raising the count on this repo without revisiting this line would
+        # let a workflow approve its own PR.
+        can_approve_pull_request_reviews: true
   - name: Adam-S-Daniel/claude-memory-map
     overrides:
       ruleset:
