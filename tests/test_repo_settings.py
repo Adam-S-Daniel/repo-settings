@@ -1481,3 +1481,219 @@ class SecurityFleetConfigTests(unittest.TestCase):
             self.assertIs(security["vulnerability_alerts"], True, msg=target["repo"])
             self.assertIs(security["automated_security_fixes"], True, msg=target["repo"])
             self.assertIs(security["grouped_security_updates"], True, msg=target["repo"])
+
+
+class WorkflowPermissionsTests(unittest.TestCase):
+    """Settings -> Actions -> General -> Workflow permissions: the GITHUB_TOKEN
+    default scope and "Allow GitHub Actions to create and approve pull
+    requests" (issue #51). One endpoint,
+    `repos/{repo}/actions/permissions/workflow`, carries both."""
+
+    LIVE = {"default_workflow_permissions": "read",
+            "can_approve_pull_request_reviews": False}
+
+    def _plan(self, actions, live=None, side_effect=None):
+        with patch.object(rs, "gh_api",
+                          return_value=dict(live if live is not None else self.LIVE),
+                          side_effect=side_effect) as mock_api:
+            records = rs.plan_repo_records("o/r", {"actions": actions})
+        return records, mock_api
+
+    def test_reads_the_workflow_permissions_endpoint(self):
+        _, mock_api = self._plan({"can_approve_pull_request_reviews": False})
+        mock_api.assert_called_once_with("repos/o/r/actions/permissions/workflow")
+
+    def test_match_when_live_equals_desired(self):
+        records, _ = self._plan({"default_workflow_permissions": "read",
+                                 "can_approve_pull_request_reviews": False})
+        self.assertEqual(
+            [(r["setting"], r["status"]) for r in records],
+            [("actions.default_workflow_permissions", "match"),
+             ("actions.can_approve_pull_request_reviews", "match")],
+        )
+
+    def test_drift_is_reported_per_field(self):
+        records, _ = self._plan({"default_workflow_permissions": "read",
+                                 "can_approve_pull_request_reviews": True})
+        by = {r["setting"]: r for r in records}
+        self.assertEqual(by["actions.default_workflow_permissions"]["status"], "match")
+        rec = by["actions.can_approve_pull_request_reviews"]
+        self.assertEqual(rec["status"], "drift")
+        self.assertIs(rec["current"], False)
+        self.assertIs(rec["desired"], True)
+
+    def test_omitted_keys_are_unmanaged(self):
+        records, mock_api = self._plan({})
+        self.assertEqual(records, [])
+        mock_api.assert_not_called()
+
+    def test_explicit_null_is_unmanaged(self):
+        records, mock_api = self._plan({"can_approve_pull_request_reviews": None,
+                                        "default_workflow_permissions": None})
+        self.assertEqual(records, [])
+        mock_api.assert_not_called()
+
+    def test_a_value_github_does_not_accept_is_refused_at_plan_time(self):
+        records, mock_api = self._plan({"default_workflow_permissions": "admin"})
+        self.assertEqual([r["status"] for r in records], ["skipped"])
+        self.assertIn("read", records[0]["note"])
+        mock_api.assert_not_called()
+
+    def test_absent_field_is_skipped_not_a_crash(self):
+        records, _ = self._plan({"can_approve_pull_request_reviews": False}, live={})
+        self.assertEqual([r["status"] for r in records], ["skipped"])
+        self.assertIn("can_approve_pull_request_reviews", records[0]["note"])
+
+    def test_empty_body_is_skipped_not_a_crash(self):
+        with patch.object(rs, "gh_api", return_value=None):
+            records = rs.plan_repo_records("o/r", {"actions": {"can_approve_pull_request_reviews": False}})
+        self.assertEqual([r["status"] for r in records], ["skipped"])
+
+    def test_403_is_a_skip_not_an_abort(self):
+        records, _ = self._plan(
+            {"default_workflow_permissions": "read",
+             "can_approve_pull_request_reviews": False},
+            side_effect=rs.GhError(403, "Resource not accessible by integration"),
+        )
+        self.assertEqual([r["status"] for r in records], ["skipped", "skipped"])
+
+    def test_other_read_failure_is_an_error_record_per_field(self):
+        records, _ = self._plan(
+            {"default_workflow_permissions": "read",
+             "can_approve_pull_request_reviews": False},
+            side_effect=rs.GhError(500, "boom"),
+        )
+        self.assertEqual([r["status"] for r in records], ["error", "error"])
+
+    def test_private_repos_are_managed_too(self):
+        # No plan gate: the endpoint works on every plan. The planner must not
+        # even ask whether the repo is private.
+        with patch.object(rs, "get_repo") as mock_get_repo, \
+                patch.object(rs, "gh_api", return_value=dict(self.LIVE)):
+            records = rs.plan_repo("o/r", {"actions": {"can_approve_pull_request_reviews": True}})
+        mock_get_repo.assert_not_called()
+        self.assertEqual([r["status"] for r in records], ["drift"])
+
+    def test_apply_puts_the_whole_declared_group_in_one_call(self):
+        records, _ = self._plan({"default_workflow_permissions": "read",
+                                 "can_approve_pull_request_reviews": True})
+        rec = next(r for r in records if r["status"] == "drift")
+        with patch.object(rs, "gh_api") as mock_api:
+            rs.apply_record("o/r", rec)
+        mock_api.assert_called_once_with(
+            "repos/o/r/actions/permissions/workflow",
+            method="PUT",
+            body={"default_workflow_permissions": "read",
+                  "can_approve_pull_request_reviews": True},
+        )
+
+    def test_a_partial_group_only_puts_what_the_config_names(self):
+        records, _ = self._plan({"can_approve_pull_request_reviews": True})
+        with patch.object(rs, "gh_api") as mock_api:
+            rs.apply_record("o/r", records[0])
+        mock_api.assert_called_once_with(
+            "repos/o/r/actions/permissions/workflow",
+            method="PUT",
+            body={"can_approve_pull_request_reviews": True},
+        )
+
+    def test_apply_dry_run_and_live_run_through_cmd_apply(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "c.yml"
+            cfg.write_text(
+                "repo: o/r\nactions:\n  can_approve_pull_request_reviews: true\n",
+                encoding="utf-8",
+            )
+            calls = []
+
+            def fake(path, method="GET", body=None):
+                calls.append((path, method, body))
+                return dict(self.LIVE)
+
+            args = argparse.Namespace(config=str(cfg), repo=None, owner=None, dry_run=False)
+            with patch.object(rs, "gh_api", side_effect=fake), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = rs.cmd_apply(args)
+        self.assertEqual(rc, 0)
+        self.assertIn(
+            ("repos/o/r/actions/permissions/workflow", "PUT",
+             {"can_approve_pull_request_reviews": True}),
+            calls,
+        )
+
+    def test_generate_emits_both_fields(self):
+        def fake(path, method="GET", body=None):
+            if path == "repos/o/r":
+                return {"private": True}
+            if path == "repos/o/r/actions/permissions":
+                return {"sha_pinning_required": True}
+            if path == "repos/o/r/actions/permissions/workflow":
+                return {"default_workflow_permissions": "write",
+                        "can_approve_pull_request_reviews": True}
+            if path == "repos/o/r/rulesets":
+                raise rs.GhError(403, "upgrade")
+            raise AssertionError(path)
+
+        out = io.StringIO()
+        with patch.object(rs, "gh_api", side_effect=fake), contextlib.redirect_stdout(out):
+            rs.cmd_generate(argparse.Namespace(repo="o/r"))
+        import yaml
+        doc = yaml.safe_load(out.getvalue())
+        self.assertEqual(doc["actions"]["default_workflow_permissions"], "write")
+        self.assertIs(doc["actions"]["can_approve_pull_request_reviews"], True)
+
+    def test_generate_survives_an_unreadable_endpoint(self):
+        def fake(path, method="GET", body=None):
+            if path == "repos/o/r":
+                return {"private": True}
+            if path == "repos/o/r/actions/permissions":
+                return {"sha_pinning_required": True}
+            if path == "repos/o/r/actions/permissions/workflow":
+                raise rs.GhError(403, "nope")
+            if path == "repos/o/r/rulesets":
+                raise rs.GhError(403, "upgrade")
+            raise AssertionError(path)
+
+        out = io.StringIO()
+        with patch.object(rs, "gh_api", side_effect=fake), contextlib.redirect_stdout(out):
+            rc = rs.cmd_generate(argparse.Namespace(repo="o/r"))
+        self.assertEqual(rc, 0)
+        import yaml
+        self.assertNotIn("can_approve_pull_request_reviews", yaml.safe_load(out.getvalue())["actions"])
+
+
+class WorkflowPermissionsFleetConfigTests(unittest.TestCase):
+    """issue #51: the fleet default, and skills-evals as the one declared
+    exception. Parsed and resolved through the engine, never regex-scanned."""
+
+    FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
+    # Repos allowed to let GITHUB_TOKEN create and approve PRs. Adding one is a
+    # policy decision (fleet.yml's bot-write block, ADR 0001), not a config tweak.
+    MAY_APPROVE = {"Adam-S-Daniel/skills-evals"}
+
+    def setUp(self):
+        import yaml
+
+        with open(self.FLEET, encoding="utf-8") as fh:
+            self.cfg = yaml.safe_load(fh)
+        self.targets = [t for t in rs.resolve_targets(self.cfg, None) if t["manage"]]
+
+    def test_defaults_declare_read_and_no_pr_approval(self):
+        actions = self.cfg["defaults"]["actions"]
+        self.assertEqual(actions["default_workflow_permissions"], "read")
+        self.assertIs(actions["can_approve_pull_request_reviews"], False)
+
+    def test_only_the_declared_exceptions_may_approve(self):
+        allowed = {
+            t["repo"] for t in self.targets
+            if t["settings"]["actions"]["can_approve_pull_request_reviews"] is True
+        }
+        self.assertEqual(allowed, self.MAY_APPROVE)
+
+    def test_every_managed_repo_declares_both_fields(self):
+        for t in self.targets:
+            actions = t["settings"]["actions"]
+            self.assertIn(actions.get("default_workflow_permissions"), ("read", "write"),
+                          msg=t["repo"])
+            self.assertIsInstance(actions.get("can_approve_pull_request_reviews"), bool,
+                                  msg=t["repo"])
