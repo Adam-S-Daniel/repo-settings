@@ -429,15 +429,17 @@ class SweepTokenCanReadCheckRollupTests(unittest.TestCase):
     `checks: read` and `statuses: read` on the job's GITHUB_TOKEN, GraphQL
     answers "Resource not accessible by integration" and the sweep dies
     before judging a single PR (runs 36433063619 and 36571817487, issue #53).
-    An explicit `permissions:` block sets every unlisted scope to none, so
-    both must be named."""
+    `gh` also resolves each check's `checkSuite.workflowRun` (the
+    `workflowName` the sweep's outside-this-workflow floor reads), which
+    needs `actions: read` (run 36623969002). An explicit `permissions:`
+    block sets every unlisted scope to none, so all three must be named."""
 
-    def test_sweep_job_token_grants_checks_and_statuses_read(self):
+    def test_sweep_job_token_grants_rollup_read_scopes(self):
         doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
         job = doc["jobs"]["sweep"]
         perms = job.get("permissions", doc.get("permissions"))
         self.assertIsInstance(perms, dict)
-        for scope in ("checks", "statuses"):
+        for scope in ("actions", "checks", "statuses"):
             self.assertIn(
                 perms.get(scope),
                 ("read", "write"),

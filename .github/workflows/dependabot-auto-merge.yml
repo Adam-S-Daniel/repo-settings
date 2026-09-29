@@ -129,6 +129,9 @@ permissions:
   pull-requests: write
   # The sweep reads `statusCheckRollup` via `gh pr view`; without these the
   # GraphQL call answers "Resource not accessible by integration" (issue #53).
+  # `actions: read` covers each check's `checkSuite.workflowRun`, which `gh`
+  # resolves for the `workflowName` the sweep's outside-CI floor reads.
+  actions: read
   checks: read
   statuses: read
 
