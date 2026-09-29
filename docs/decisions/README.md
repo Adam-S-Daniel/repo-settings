@@ -92,4 +92,4 @@ Optional sections for high-impact decisions:
 |-----|-------|--------|
 | [0001](0001-bot-writes-results-branch-or-declared-bypass.md) | Route bot writes to results branches; declare rare ruleset bypasses in fleet.yml | Accepted |
 | [0002](0002-declare-dependabot-security-settings-including-the-unenforceable-one.md) | Manage Dependabot security settings as fleet code, including one the engine can never apply | Accepted |
-| [0003](0003-scope-skills-evals-roster-auto-merge-as-declared-exception.md) | Scope skills-evals' roster auto-merge as a declared exception to ADR 0001 | Accepted |
+| [0003](0003-scope-skills-evals-roster-auto-merge-as-declared-exception.md) | Scope skills-evals' roster auto-merge as a declared exception to ADR 0001 | Superseded in part (2026-09-29): GitHub App replaced GITHUB_TOKEN |

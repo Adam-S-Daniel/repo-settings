@@ -1,6 +1,6 @@
 # 0003. Scope skills-evals' roster auto-merge as a declared exception to ADR 0001
 
-- **Status:** Accepted
+- **Status:** Superseded in part (2026-09-29): the GITHUB_TOKEN path was replaced by a dedicated GitHub App; see Amendment
 - **Date:** 2026-09-28
 - **Deciders:** Adam Daniel (path chosen 2026-09-28)
 
@@ -78,3 +78,38 @@ fleet default and break the roster run.
 - Issue: [Adam-S-Daniel/repo-settings#51](https://github.com/Adam-S-Daniel/repo-settings/issues/51)
 - ADR 0001: [Route bot writes to results branches; declare rare ruleset bypasses in fleet.yml](0001-bot-writes-results-branch-or-declared-bypass.md)
 - Schema: [`repo-settings/schema.md`](../../repo-settings/schema.md) (`actions.can_approve_pull_request_reviews`)
+
+## Amendment (2026-09-29)
+
+The `GITHUB_TOKEN` path above did not work in practice. A PR opened by
+`github-actions[bot]` had its `pull_request` CI run held `action_required`, and
+a dispatched `ci.yml` run did not satisfy the required `test` check
+([run 36509251840](https://github.com/Adam-S-Daniel/skills-evals/actions/runs/36509251840),
+PR [#214](https://github.com/Adam-S-Daniel/skills-evals/pull/214)).
+
+skills-evals [PR #216](https://github.com/Adam-S-Daniel/skills-evals/pull/216)
+(merged) moved the roster PR to a dedicated GitHub App,
+`adam-s-daniel-skills-evals-roster` (App id 5116415): installed on skills-evals
+only, Contents R/W and Pull requests R/W, and not a ruleset bypass actor. It
+opens, reopens and arms auto-merge on the roster PR. Proven live 2026-09-29:
+[run 36516990079](https://github.com/Adam-S-Daniel/skills-evals/actions/runs/36516990079)
+had the App close, reopen and arm #214, `test` ran without approval, and #214
+auto-merged at 03:36:23Z as merge commit 7548298 by
+`app/adam-s-daniel-skills-evals-roster`.
+
+What changes:
+
+- The exception to ADR 0001's "PR + auto-merge is not a sanctioned bot-write
+  path" still stands for the roster PR; its identity is now the App, not
+  `GITHUB_TOKEN`.
+- `actions.can_approve_pull_request_reviews` returns to the fleet default
+  `false` for every managed repo. `GITHUB_TOKEN` no longer creates or approves
+  PRs there, and leaving it `true` would keep the risk named in Consequences
+  (a workflow approving its own PR if required approvals ever rise above 0).
+  The test allowlist in `WorkflowPermissionsFleetConfigTests` is now empty.
+- The App is not a bypass actor, so the ruleset (required `test`, merge commits
+  only) still gates the merge.
+
+Existing Apps were rejected: agents-md-sync is an always-bypass actor
+fleet-wide; the repo-settings App administers all repos; the CMS automation
+App's key would reach the CMS site repos.
