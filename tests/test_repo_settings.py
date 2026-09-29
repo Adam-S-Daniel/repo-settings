@@ -1663,13 +1663,15 @@ class WorkflowPermissionsTests(unittest.TestCase):
 
 
 class WorkflowPermissionsFleetConfigTests(unittest.TestCase):
-    """issue #51: the fleet default, and skills-evals as the one declared
-    exception. Parsed and resolved through the engine, never regex-scanned."""
+    """issue #51: the fleet default, with no repo declared as an exception.
+    Parsed and resolved through the engine, never regex-scanned."""
 
     FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
-    # Repos allowed to let GITHUB_TOKEN create and approve PRs. Adding one is a
-    # policy decision (fleet.yml's bot-write block, ADR 0001), not a config tweak.
-    MAY_APPROVE = {"Adam-S-Daniel/skills-evals"}
+    # Repos allowed to let GITHUB_TOKEN create and approve PRs: none. skills-evals'
+    # roster PR is opened and merged by a dedicated GitHub App (ADR 0003 as
+    # amended). Adding one is a policy decision (fleet.yml's bot-write block,
+    # ADR 0001), not a config tweak.
+    MAY_APPROVE = set()
 
     def setUp(self):
         import yaml
@@ -1683,7 +1685,7 @@ class WorkflowPermissionsFleetConfigTests(unittest.TestCase):
         self.assertEqual(actions["default_workflow_permissions"], "read")
         self.assertIs(actions["can_approve_pull_request_reviews"], False)
 
-    def test_only_the_declared_exceptions_may_approve(self):
+    def test_no_managed_repo_may_approve(self):
         allowed = {
             t["repo"] for t in self.targets
             if t["settings"]["actions"]["can_approve_pull_request_reviews"] is True
