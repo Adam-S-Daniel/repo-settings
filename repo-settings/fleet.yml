@@ -364,6 +364,26 @@ repos:
     overrides:
       ruleset:
         required_status_checks: [test]
+      # why: the weekly roster PR is armed for auto-merge by the roster App
+      # (App id 5116415). GitHub checks --match-head-commit only when
+      # auto-merge is enabled, so ANY write-access actor that later pushes
+      # roster/proposal retargets the armed PR (known instance: skills-evals'
+      # dependabot-auto-merge.yml job holds a persisted GITHUB_TOKEN with
+      # contents: write). This ruleset lets only the App and the repo Admin
+      # role (actor_id 5, same encoding as admin_bypass) update that branch.
+      # github-actions is deliberately NOT a bypass actor: it is the
+      # Dependabot job's identity too. ORDER: skills-evals' App-push PR (moves
+      # the roster push to the App) must be merged first, or the weekly roster
+      # push by GITHUB_TOKEN is blocked. Removing this entry does not delete
+      # the live ruleset. docs/decisions/0004; ADR 0003:
+      # https://github.com/Adam-S-Daniel/skills-evals/blob/main/docs/decisions/0003-roster-merges-automatically.md
+      extra_rulesets:
+        - name: roster proposal branch
+          target_branches: [roster/proposal]
+          rules: [creation, update, deletion, non_fast_forward]
+          bypass_actors:
+            - {actor_type: Integration, actor_id: 5116415, bypass_mode: always}
+            - {actor_type: RepositoryRole, actor_id: 5, bypass_mode: always}
   - name: Adam-S-Daniel/claude-memory-map
     overrides:
       ruleset:

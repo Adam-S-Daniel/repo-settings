@@ -50,7 +50,8 @@ Managed settings:
 We use repository RULESETS rather than classic branch protection so the fleet
 speaks the same primitive as the cms-platform-managed repos. A managed ruleset
 is identified by its `name`: apply creates it if absent, updates it in place if
-present, and never touches other rulesets.
+present, and never touches other rulesets. A repo may declare additional
+named rulesets (`extra_rulesets`, per-repo only) handled the same way.
 
 All GitHub access goes through the `gh` CLI, so authentication is whatever `gh`
 is configured with: locally your `gh auth` keyring, or in CI the `GH_TOKEN`
@@ -425,6 +426,33 @@ def find_ruleset(repo: str, name: str) -> dict | None:
     return get_ruleset(repo, summary["id"])
 
 
+def _bypass_entries(actors: list | None) -> list[dict]:
+    """Validate and render `bypass_actors` config entries (shared by the
+    default ruleset and every `extra_rulesets` entry)."""
+    out: list[dict] = []
+    for actor in actors or []:
+        if not isinstance(actor, dict) or "actor_id" not in actor:
+            raise SystemExit(
+                f"error: bypass_actors entries must be mappings with an "
+                f"actor_id (got {actor!r})"
+            )
+        actor_type = actor.get("actor_type")
+        if actor_type not in BYPASS_ACTOR_TYPES:
+            raise SystemExit(
+                f"error: bypass_actors entry has invalid actor_type "
+                f"{actor_type!r} (expected one of "
+                f"{', '.join(sorted(BYPASS_ACTOR_TYPES))})"
+            )
+        entry = {
+            "actor_id": int(actor["actor_id"]),
+            "actor_type": actor_type,
+            "bypass_mode": actor.get("bypass_mode", "always"),
+        }
+        if entry not in out:
+            out.append(entry)
+    return out
+
+
 def build_ruleset_body(cfg: dict) -> dict:
     """Build the POST/PUT body for a desired ruleset from config."""
     name = cfg.get("name", DEFAULT_RULESET_NAME)
@@ -513,24 +541,7 @@ def build_ruleset_body(cfg: dict) -> dict:
                 "bypass_mode": "always",
             }
         )
-    for actor in cfg.get("bypass_actors") or []:
-        if not isinstance(actor, dict) or "actor_id" not in actor:
-            raise SystemExit(
-                f"error: bypass_actors entries must be mappings with an "
-                f"actor_id (got {actor!r})"
-            )
-        actor_type = actor.get("actor_type")
-        if actor_type not in BYPASS_ACTOR_TYPES:
-            raise SystemExit(
-                f"error: bypass_actors entry has invalid actor_type "
-                f"{actor_type!r} (expected one of "
-                f"{', '.join(sorted(BYPASS_ACTOR_TYPES))})"
-            )
-        entry = {
-            "actor_id": int(actor["actor_id"]),
-            "actor_type": actor_type,
-            "bypass_mode": actor.get("bypass_mode", "always"),
-        }
+    for entry in _bypass_entries(cfg.get("bypass_actors")):
         if entry not in bypass:
             bypass.append(entry)
     return {
@@ -540,6 +551,103 @@ def build_ruleset_body(cfg: dict) -> dict:
         "conditions": {"ref_name": {"include": include, "exclude": []}},
         "rules": rules,
         "bypass_actors": bypass,
+    }
+
+
+# Simple (parameterless, bar `update`) rule types an `extra_rulesets` entry may
+# use. `update` restricts who may update the ref; with
+# update_allows_fetch_and_merge false only bypass actors may push it.
+EXTRA_RULE_TYPES = ("creation", "update", "deletion", "non_fast_forward")
+
+
+def build_extra_ruleset_body(cfg: dict) -> dict:
+    """Build the POST/PUT body for one `extra_rulesets` entry (a ref-protection
+    ruleset on non-default branches). Unlike the default ruleset there is no
+    implicit admin bypass: every bypass actor is declared."""
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"error: extra_rulesets entries must be mappings (got {cfg!r})")
+    name = cfg.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise SystemExit("error: extra_rulesets entry needs a non-empty `name`")
+    branches = cfg.get("target_branches")
+    if (
+        not isinstance(branches, list)
+        or not branches
+        or not all(isinstance(b, str) and b for b in branches)
+    ):
+        raise SystemExit(
+            f"error: extra_rulesets[{name}] needs a non-empty `target_branches` "
+            f"list of branch names/patterns"
+        )
+    rule_names = cfg.get("rules")
+    if not isinstance(rule_names, list) or not rule_names:
+        raise SystemExit(f"error: extra_rulesets[{name}] needs a non-empty `rules` list")
+    rules: list[dict] = []
+    for rt in rule_names:
+        if rt not in EXTRA_RULE_TYPES:
+            raise SystemExit(
+                f"error: extra_rulesets[{name}] has unsupported rule type {rt!r} "
+                f"(allowed: {', '.join(EXTRA_RULE_TYPES)})"
+            )
+        if any(r["type"] == rt for r in rules):
+            raise SystemExit(f"error: extra_rulesets[{name}] lists rule {rt!r} twice")
+        rule: dict = {"type": rt}
+        if rt == "update":
+            rule["parameters"] = {"update_allows_fetch_and_merge": False}
+        rules.append(rule)
+    return {
+        "name": name,
+        "target": "branch",
+        "enforcement": cfg.get("enforcement", "active"),
+        "conditions": {
+            "ref_name": {"include": [f"refs/heads/{b}" for b in branches], "exclude": []}
+        },
+        "rules": rules,
+        "bypass_actors": _bypass_entries(cfg.get("bypass_actors")),
+    }
+
+
+def build_extra_ruleset_bodies(settings: dict) -> list[dict]:
+    """Validate and build every `extra_rulesets` entry of one repo's settings.
+    Names must be unique and must not collide with the default-branch ruleset
+    (the engine matches live rulesets BY NAME)."""
+    entries = settings.get("extra_rulesets") or []
+    if not isinstance(entries, list):
+        raise SystemExit("error: extra_rulesets must be a list")
+    default_name = (settings.get("ruleset") or {}).get("name", DEFAULT_RULESET_NAME)
+    seen = {default_name}
+    bodies = []
+    for cfg in entries:
+        body = build_extra_ruleset_body(cfg)
+        if body["name"] in seen:
+            raise SystemExit(
+                f"error: extra_rulesets name {body['name']!r} is duplicated or "
+                f"collides with the default-branch ruleset name"
+            )
+        seen.add(body["name"])
+        bodies.append(body)
+    return bodies
+
+
+def normalize_extra_ruleset(rs_: dict | None) -> dict | None:
+    """Reduce an extra ruleset (live or desired) to comparable fields. Rules are
+    compared as a set of (type, parameters); includes and bypass sorted."""
+    if rs_ is None:
+        return None
+    cond = rs_.get("conditions", {}).get("ref_name", {})
+    rules = sorted(
+        (r["type"], json.dumps(r.get("parameters") or {}, sort_keys=True))
+        for r in rs_.get("rules", [])
+    )
+    return {
+        "enforcement": rs_.get("enforcement"),
+        "include": sorted(cond.get("include", [])),
+        "exclude": sorted(cond.get("exclude", [])),
+        "rules": rules,
+        "bypass": sorted(
+            (b.get("actor_type"), b.get("actor_id"), b.get("bypass_mode"))
+            for b in rs_.get("bypass_actors", [])
+        ),
     }
 
 
@@ -663,6 +771,14 @@ def load_config(path: str) -> dict:
 def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
     if "repos" in cfg:  # fleet mode
         defaults = cfg.get("defaults", {})
+        # Per-repo only: deep_merge REPLACES lists, so a defaults-level list
+        # would be silently dropped by any repo that declares its own, and a
+        # ruleset with bypass actors is a repo-specific grant (ADR 0004).
+        if "extra_rulesets" in defaults:
+            raise SystemExit(
+                "error: extra_rulesets is per-repo only -- declare it under a "
+                "repo's `overrides:`, not `defaults:`"
+            )
         targets = []
         for entry in cfg["repos"]:
             if isinstance(entry, str):
@@ -687,7 +803,7 @@ def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
             "error: single-repo config needs a top-level `repo: owner/name` "
             "or a --repo argument."
         )
-    settings = {k: v for k, v in cfg.items() if k in ("actions", "ruleset")}
+    settings = {k: v for k, v in cfg.items() if k in ("actions", "ruleset", "extra_rulesets")}
     if isinstance(repo_field, dict):
         settings["repo"] = repo_field
     return [{"repo": repo, "settings": settings, "manage": True}]
@@ -915,19 +1031,17 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
         )
 
     # -- ruleset ------------------------------------------------------------ #
-    if ruleset_cfg.get("enabled"):
-        name = ruleset_cfg.get("name", DEFAULT_RULESET_NAME)
-        body = build_ruleset_body(ruleset_cfg)
+    def plan_ruleset(name: str, body: dict, normalize) -> None:
         try:
             existing = find_ruleset(repo, name)
             existing_id = existing["id"] if existing else None
-            same = normalize_ruleset(existing) == normalize_ruleset(body)
+            same = normalize(existing) == normalize(body)
             records.append(
                 {
                     "setting": f"ruleset[{name}]",
                     "status": "match" if same else "drift",
-                    "current": normalize_ruleset(existing),
-                    "desired": normalize_ruleset(body),
+                    "current": normalize(existing),
+                    "desired": normalize(body),
                     "_writer": ("ruleset", body, existing_id),
                 }
             )
@@ -938,6 +1052,15 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
                                      "not available (API 403)"))
             else:
                 records.append(_err(f"ruleset[{name}]", "enabled", e))
+
+    if ruleset_cfg.get("enabled"):
+        name = ruleset_cfg.get("name", DEFAULT_RULESET_NAME)
+        plan_ruleset(name, build_ruleset_body(ruleset_cfg), normalize_ruleset)
+
+    # Extra named rulesets: same by-name idempotence. Removing an entry from
+    # config leaves its live ruleset alone (never touches undeclared rulesets).
+    for extra_body in build_extra_ruleset_bodies(settings):
+        plan_ruleset(extra_body["name"], extra_body, normalize_extra_ruleset)
 
     # -- allow auto-merge ---------------------------------------------------- #
     auto_merge = repo_cfg.get("allow_auto_merge", "unset")
@@ -1301,10 +1424,18 @@ def cmd_generate(args) -> int:
     try:
         rulesets = list_rulesets(repo)
         branch_rs = None
-        for summary in rulesets:
-            if summary.get("target") == "branch":
-                branch_rs = get_ruleset(repo, summary["id"])
-                break
+        # Match the default ruleset BY NAME first: a repo may also carry
+        # `extra_rulesets`-style rulesets on other branches, and "first branch
+        # ruleset" would misattribute one as the default. The fallback keeps
+        # generate working for repos whose ruleset has another name.
+        # `generate` does not emit `extra_rulesets`.
+        branch_summaries = [x for x in rulesets if x.get("target") == "branch"]
+        chosen = next(
+            (x for x in branch_summaries if x.get("name") == DEFAULT_RULESET_NAME),
+            branch_summaries[0] if branch_summaries else None,
+        )
+        if chosen is not None:
+            branch_rs = get_ruleset(repo, chosen["id"])
         if branch_rs:
             doc["ruleset"] = ruleset_doc(branch_rs)
         elif not private:

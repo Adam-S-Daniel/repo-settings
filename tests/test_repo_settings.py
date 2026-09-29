@@ -988,6 +988,311 @@ class FaultIsolationTests(unittest.TestCase):
         self.assertEqual(mock_plan.call_count, 2)
 
 
+ROSTER_APP_ID = 5116415
+EXTRA_CFG = {
+    "name": "roster proposal branch",
+    "target_branches": ["roster/proposal"],
+    "rules": ["creation", "update", "deletion", "non_fast_forward"],
+    "bypass_actors": [
+        {"actor_type": "Integration", "actor_id": ROSTER_APP_ID, "bypass_mode": "always"},
+        {"actor_type": "RepositoryRole", "actor_id": 5, "bypass_mode": "always"},
+    ],
+}
+
+
+def _extra(**over):
+    cfg = dict(EXTRA_CFG)
+    cfg.update(over)
+    return cfg
+
+
+class ExtraRulesetBodyTests(unittest.TestCase):
+    def test_body_shape(self):
+        body = rs.build_extra_ruleset_body(EXTRA_CFG)
+        self.assertEqual(body["name"], "roster proposal branch")
+        self.assertEqual(body["target"], "branch")
+        self.assertEqual(body["enforcement"], "active")
+        self.assertEqual(
+            body["conditions"],
+            {"ref_name": {"include": ["refs/heads/roster/proposal"], "exclude": []}},
+        )
+        self.assertEqual(
+            body["bypass_actors"],
+            [
+                {"actor_id": ROSTER_APP_ID, "actor_type": "Integration", "bypass_mode": "always"},
+                {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"},
+            ],
+        )
+
+    def test_each_rule_type_renders(self):
+        for t in ("creation", "deletion", "non_fast_forward"):
+            body = rs.build_extra_ruleset_body(_extra(rules=[t]))
+            self.assertEqual(body["rules"], [{"type": t}])
+
+    def test_update_carries_its_parameter(self):
+        body = rs.build_extra_ruleset_body(_extra(rules=["update"]))
+        self.assertEqual(
+            body["rules"],
+            [{"type": "update", "parameters": {"update_allows_fetch_and_merge": False}}],
+        )
+
+    def test_unknown_rule_type_rejected(self):
+        for bad in ("pull_request", "required_status_checks", "bogus"):
+            with self.assertRaises(SystemExit) as cm:
+                rs.build_extra_ruleset_body(_extra(rules=["update", bad]))
+            self.assertIn(bad, str(cm.exception))
+
+    def test_missing_name_rejected(self):
+        cfg = _extra()
+        del cfg["name"]
+        with self.assertRaises(SystemExit):
+            rs.build_extra_ruleset_body(cfg)
+
+    def test_missing_or_empty_targets_or_rules_rejected(self):
+        for key in ("target_branches", "rules"):
+            for val in (None, []):
+                cfg = _extra()
+                if val is None:
+                    del cfg[key]
+                else:
+                    cfg[key] = val
+                with self.assertRaises(SystemExit, msg=f"{key}={val}"):
+                    rs.build_extra_ruleset_body(cfg)
+
+    def test_bad_bypass_actor_rejected(self):
+        with self.assertRaises(SystemExit):
+            rs.build_extra_ruleset_body(
+                _extra(bypass_actors=[{"actor_type": "Nope", "actor_id": 1}])
+            )
+        with self.assertRaises(SystemExit):
+            rs.build_extra_ruleset_body(
+                _extra(bypass_actors=[{"actor_type": "Integration"}])
+            )
+
+    def test_no_implicit_admin_bypass(self):
+        body = rs.build_extra_ruleset_body(_extra(bypass_actors=[]))
+        self.assertEqual(body["bypass_actors"], [])
+
+
+class ExtraRulesetValidationTests(unittest.TestCase):
+    def test_duplicate_names_rejected(self):
+        with self.assertRaises(SystemExit):
+            rs.build_extra_ruleset_bodies({"extra_rulesets": [EXTRA_CFG, EXTRA_CFG]})
+
+    def test_collision_with_default_ruleset_name_rejected(self):
+        with self.assertRaises(SystemExit):
+            rs.build_extra_ruleset_bodies(
+                {"extra_rulesets": [_extra(name=rs.DEFAULT_RULESET_NAME)]}
+            )
+        with self.assertRaises(SystemExit):
+            rs.build_extra_ruleset_bodies(
+                {
+                    "ruleset": {"enabled": True, "name": "custom"},
+                    "extra_rulesets": [_extra(name="custom")],
+                }
+            )
+
+    def test_absent_means_none(self):
+        self.assertEqual(rs.build_extra_ruleset_bodies({}), [])
+
+    def test_rejected_under_defaults(self):
+        cfg = {"defaults": {"extra_rulesets": [EXTRA_CFG]}, "repos": [{"name": "o/r"}]}
+        with self.assertRaises(SystemExit) as cm:
+            rs.resolve_targets(cfg, None)
+        self.assertIn("extra_rulesets", str(cm.exception))
+
+    def test_per_repo_override_flows_to_settings(self):
+        cfg = {
+            "defaults": {},
+            "repos": [{"name": "o/r", "overrides": {"extra_rulesets": [EXTRA_CFG]}}],
+        }
+        (t,) = rs.resolve_targets(cfg, None)
+        self.assertEqual(t["settings"]["extra_rulesets"], [EXTRA_CFG])
+
+
+class NormalizeExtraRulesetTests(unittest.TestCase):
+    def test_order_insensitive(self):
+        a = rs.build_extra_ruleset_body(EXTRA_CFG)
+        b = rs.build_extra_ruleset_body(
+            _extra(
+                rules=["non_fast_forward", "deletion", "update", "creation"],
+                bypass_actors=list(reversed(EXTRA_CFG["bypass_actors"])),
+            )
+        )
+        self.assertEqual(rs.normalize_extra_ruleset(a), rs.normalize_extra_ruleset(b))
+
+    def test_live_shape_without_parameters_key_matches(self):
+        desired = rs.build_extra_ruleset_body(_extra(rules=["deletion"]))
+        live = dict(desired, id=7, rules=[{"type": "deletion"}])
+        self.assertEqual(
+            rs.normalize_extra_ruleset(live), rs.normalize_extra_ruleset(desired)
+        )
+
+    def test_detects_differences(self):
+        base = rs.normalize_extra_ruleset(rs.build_extra_ruleset_body(EXTRA_CFG))
+        for change in (
+            {"rules": ["creation"]},
+            {"bypass_actors": EXTRA_CFG["bypass_actors"][:1]},
+            {"target_branches": ["other"]},
+            {"enforcement": "disabled"},
+        ):
+            other = rs.normalize_extra_ruleset(
+                rs.build_extra_ruleset_body(_extra(**change))
+            )
+            self.assertNotEqual(base, other, msg=str(change))
+
+    def test_update_parameter_drift_detected(self):
+        desired = rs.build_extra_ruleset_body(_extra(rules=["update"]))
+        live = dict(desired)
+        live["rules"] = [
+            {"type": "update", "parameters": {"update_allows_fetch_and_merge": True}}
+        ]
+        self.assertNotEqual(
+            rs.normalize_extra_ruleset(live), rs.normalize_extra_ruleset(desired)
+        )
+
+
+class ExtraRulesetPlanTests(unittest.TestCase):
+    """plan_repo with mocked gh: only the extra ruleset is configured."""
+
+    REPO = "o/r"
+
+    def _plan(self, live):
+        """live: list of full rulesets that exist (each with id and name)."""
+        summaries = [{"id": r["id"], "name": r["name"], "target": "branch"} for r in live]
+        by_id = {r["id"]: r for r in live}
+        with patch.object(rs, "list_rulesets", return_value=summaries), patch.object(
+            rs, "get_ruleset", side_effect=lambda repo, i: by_id[i]
+        ), patch.object(rs, "get_repo", return_value={"private": False}):
+            return rs.plan_repo(self.REPO, {"extra_rulesets": [EXTRA_CFG]})
+
+    def test_missing_plans_post(self):
+        (rec,) = self._plan([])
+        self.assertEqual(rec["setting"], "ruleset[roster proposal branch]")
+        self.assertEqual(rec["status"], "drift")
+        self.assertIsNone(rec["current"])
+        kind, body, existing_id = rec["_writer"]
+        self.assertEqual((kind, existing_id), ("ruleset", None))
+        self.assertEqual(body["name"], "roster proposal branch")
+
+    def test_drift_plans_put(self):
+        live = dict(rs.build_extra_ruleset_body(EXTRA_CFG), id=42, rules=[{"type": "deletion"}])
+        (rec,) = self._plan([live])
+        self.assertEqual(rec["status"], "drift")
+        self.assertEqual(rec["_writer"][2], 42)
+
+    def test_match_is_no_write(self):
+        live = dict(rs.build_extra_ruleset_body(EXTRA_CFG), id=42)
+        live["rules"] = list(reversed(live["rules"]))
+        (rec,) = self._plan([live])
+        self.assertEqual(rec["status"], "match")
+
+    def test_undeclared_live_ruleset_is_untouched(self):
+        other = {
+            "id": 9, "name": "something else", "target": "branch",
+            "enforcement": "active", "rules": [], "bypass_actors": [],
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+        }
+        records = self._plan([other])
+        self.assertEqual([r["setting"] for r in records], ["ruleset[roster proposal branch]"])
+        self.assertEqual(records[0]["_writer"][2], None)
+
+    def test_apply_record_posts_and_puts(self):
+        body = rs.build_extra_ruleset_body(EXTRA_CFG)
+        with patch.object(rs, "gh_api") as api:
+            rs.apply_record("o/r", {"_writer": ("ruleset", body, None)})
+            rs.apply_record("o/r", {"_writer": ("ruleset", body, 42)})
+        self.assertEqual(
+            [(c.args[0], c.kwargs.get("method", "GET")) for c in api.call_args_list],
+            [("repos/o/r/rulesets", "POST"), ("repos/o/r/rulesets/42", "PUT")],
+        )
+
+    def test_private_no_pro_is_skipped(self):
+        with patch.object(rs, "list_rulesets", side_effect=rs.GhError(403, "Upgrade")), patch.object(
+            rs, "get_repo", return_value={"private": True}
+        ):
+            (rec,) = rs.plan_repo(self.REPO, {"extra_rulesets": [EXTRA_CFG]})
+        self.assertEqual(rec["status"], "skipped")
+
+    def test_other_error_is_reported(self):
+        with patch.object(rs, "list_rulesets", side_effect=rs.GhError(500, "boom")), patch.object(
+            rs, "get_repo", return_value={"private": False}
+        ):
+            (rec,) = rs.plan_repo(self.REPO, {"extra_rulesets": [EXTRA_CFG]})
+        self.assertEqual(rec["status"], "error")
+
+
+class GenerateDefaultRulesetByNameTests(unittest.TestCase):
+    def test_extra_ruleset_is_not_misattributed_as_default(self):
+        extra = dict(rs.build_extra_ruleset_body(EXTRA_CFG), id=1)
+        default_body = rs.build_ruleset_body({"enabled": True})
+        default = dict(default_body, id=2)
+        summaries = [
+            {"id": 1, "name": extra["name"], "target": "branch"},
+            {"id": 2, "name": default["name"], "target": "branch"},
+        ]
+        by_id = {1: extra, 2: default}
+        args = argparse.Namespace(repo="o/r")
+        buf = io.StringIO()
+        with patch.object(rs, "get_repo", return_value={"private": False}), patch.object(
+            rs, "read_actions", return_value={}
+        ), patch.object(rs, "read_fork_approval", return_value=None), patch.object(
+            rs, "read_workflow_permissions", return_value={}
+        ), patch.object(rs, "list_rulesets", return_value=summaries), patch.object(
+            rs, "get_ruleset", side_effect=lambda repo, i: by_id[i]
+        ), contextlib.redirect_stdout(buf):
+            rs.cmd_generate(args)
+        import yaml
+
+        doc = yaml.safe_load(buf.getvalue())
+        self.assertEqual(doc["ruleset"]["name"], rs.DEFAULT_RULESET_NAME)
+
+
+class ExtraRulesetsFleetConfigTests(unittest.TestCase):
+    FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
+
+    def setUp(self):
+        import yaml
+
+        with open(self.FLEET, encoding="utf-8") as fh:
+            self.cfg = yaml.safe_load(fh)
+        self.targets = rs.resolve_targets(self.cfg, None)
+
+    def test_defaults_declare_none(self):
+        self.assertNotIn("extra_rulesets", self.cfg["defaults"])
+
+    def test_skills_evals_declares_exactly_the_roster_ruleset(self):
+        (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/skills-evals"]
+        self.assertEqual(t["settings"]["extra_rulesets"], [EXTRA_CFG])
+
+    def test_only_skills_evals_declares_extras(self):
+        repos = {t["repo"] for t in self.targets if t["settings"].get("extra_rulesets")}
+        self.assertEqual(repos, {"Adam-S-Daniel/skills-evals"})
+
+    def test_every_declared_extra_builds(self):
+        for t in self.targets:
+            rs.build_extra_ruleset_bodies(t["settings"])
+
+    def test_no_extra_ruleset_bypass_beyond_the_roster_app_and_admin(self):
+        # github-actions (Integration id 15368) is also the Dependabot job's
+        # identity; it must never bypass the roster ruleset.
+        for t in self.targets:
+            for body in rs.build_extra_ruleset_bodies(t["settings"]):
+                for a in body["bypass_actors"]:
+                    if a["actor_type"] == "Integration":
+                        self.assertEqual(a["actor_id"], ROSTER_APP_ID, msg=t["repo"])
+                    else:
+                        self.assertEqual(
+                            (a["actor_type"], a["actor_id"]), ("RepositoryRole", rs.ADMIN_ROLE_ID),
+                            msg=t["repo"],
+                        )
+
+    def test_roster_admin_role_matches_default_ruleset_encoding(self):
+        default = rs.build_ruleset_body({"enabled": True})
+        admin = default["bypass_actors"][0]
+        self.assertIn(admin, rs.build_extra_ruleset_body(EXTRA_CFG)["bypass_actors"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
