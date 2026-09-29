@@ -127,6 +127,10 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # The sweep reads `statusCheckRollup` via `gh pr view`; without these the
+  # GraphQL call answers "Resource not accessible by integration" (issue #53).
+  checks: read
+  statuses: read
 
 jobs:
   auto-merge:

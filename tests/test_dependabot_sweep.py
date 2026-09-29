@@ -424,5 +424,26 @@ class AutoMergeJobMergesNothingTests(unittest.TestCase):
         )
 
 
+class SweepTokenCanReadCheckRollupTests(unittest.TestCase):
+    """The sweep reads `statusCheckRollup` through `gh pr view`. Without
+    `checks: read` and `statuses: read` on the job's GITHUB_TOKEN, GraphQL
+    answers "Resource not accessible by integration" and the sweep dies
+    before judging a single PR (runs 36433063619 and 36571817487, issue #53).
+    An explicit `permissions:` block sets every unlisted scope to none, so
+    both must be named."""
+
+    def test_sweep_job_token_grants_checks_and_statuses_read(self):
+        doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        job = doc["jobs"]["sweep"]
+        perms = job.get("permissions", doc.get("permissions"))
+        self.assertIsInstance(perms, dict)
+        for scope in ("checks", "statuses"):
+            self.assertIn(
+                perms.get(scope),
+                ("read", "write"),
+                msg=f"job `sweep` needs `{scope}: read` to read statusCheckRollup",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
