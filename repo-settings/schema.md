@@ -121,6 +121,41 @@ ruleset:
   bypass_actors: []
 ```
 
+### `extra_rulesets:` -- additional named rulesets (per-repo only)
+
+A sibling of `ruleset:` (a top-level key in single-repo configs; under a repo's
+`overrides:` in fleet configs) holding a LIST of extra branch rulesets. The
+first use is skills-evals' `roster/proposal` ruleset (docs/decisions/0004).
+
+```yaml
+extra_rulesets:
+  - name: roster proposal branch        # required; unique; != the default ruleset's name
+    target_branches: [roster/proposal]  # required; each -> refs/heads/<b>; patterns allowed
+    rules: [creation, update, deletion, non_fast_forward]   # required; only these four
+    enforcement: active                 # optional; active | evaluate | disabled
+    bypass_actors:                      # same entry shape/validation as `ruleset.bypass_actors`
+      - {actor_type: Integration, actor_id: 5116415, bypass_mode: always}
+      - {actor_type: RepositoryRole, actor_id: 5, bypass_mode: always}
+```
+
+- **Rules.** Only `creation`, `update`, `deletion`, `non_fast_forward`; anything
+  else is rejected. `update` renders with
+  `update_allows_fetch_and_merge: false`, so only bypass actors can update the
+  ref. Rules compare as a set (type + parameters), so order never drifts.
+- **Bypass.** There is no implicit admin bypass here: list every actor,
+  including the Admin role (`RepositoryRole`, id 5), if it should bypass.
+- **By name, like `ruleset:`.** apply POSTs when the name is absent, PUTs when
+  present; `diff` reports `MISSING`/`DRIFT`. Private repos without Pro are
+  skipped as for `ruleset:`.
+- **Removal does not delete.** Dropping an entry leaves the live ruleset alone,
+  consistent with "never touches other rulesets"; delete it by hand.
+- **Per-repo only.** `extra_rulesets` under `defaults:` is rejected: list
+  values are replaced (not merged) by an override, so a fleet default would be
+  silently dropped by any repo that declares its own, and a bypass grant is a
+  repo-specific decision (ADR 0001).
+- `generate` does not emit `extra_rulesets`; it identifies the default ruleset
+  by its name.
+
 ### `repo:` -- plain repo settings
 
 A separate, optional top-level `repo:` block manages ordinary repository
