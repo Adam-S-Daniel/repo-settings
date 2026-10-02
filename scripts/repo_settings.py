@@ -629,6 +629,16 @@ def build_extra_ruleset_bodies(settings: dict) -> list[dict]:
     return bodies
 
 
+def _extra_rule_params(rule: dict) -> dict:
+    """A rule's parameters minus GitHub-omitted defaults: GitHub stores an
+    `update` rule with update_allows_fetch_and_merge false as a bare
+    {"type": "update"}, so a live/desired compare must treat them alike."""
+    params = dict(rule.get("parameters") or {})
+    if rule.get("type") == "update" and params.get("update_allows_fetch_and_merge") is False:
+        del params["update_allows_fetch_and_merge"]
+    return params
+
+
 def normalize_extra_ruleset(rs_: dict | None) -> dict | None:
     """Reduce an extra ruleset (live or desired) to comparable fields. Rules are
     compared as a set of (type, parameters); includes and bypass sorted."""
@@ -636,7 +646,7 @@ def normalize_extra_ruleset(rs_: dict | None) -> dict | None:
         return None
     cond = rs_.get("conditions", {}).get("ref_name", {})
     rules = sorted(
-        (r["type"], json.dumps(r.get("parameters") or {}, sort_keys=True))
+        (r["type"], json.dumps(_extra_rule_params(r), sort_keys=True))
         for r in rs_.get("rules", [])
     )
     return {

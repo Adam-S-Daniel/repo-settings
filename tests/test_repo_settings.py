@@ -1128,6 +1128,15 @@ class NormalizeExtraRulesetTests(unittest.TestCase):
             rs.normalize_extra_ruleset(live), rs.normalize_extra_ruleset(desired)
         )
 
+    def test_live_update_without_parameters_matches_explicit_false(self):
+        # GitHub omits update_allows_fetch_and_merge: false when storing the
+        # rule; the drift report showed a permanent false DRIFT before this.
+        desired = rs.build_extra_ruleset_body(_extra(rules=["update"]))
+        live = dict(desired, id=7, rules=[{"type": "update"}])
+        self.assertEqual(
+            rs.normalize_extra_ruleset(live), rs.normalize_extra_ruleset(desired)
+        )
+
     def test_detects_differences(self):
         base = rs.normalize_extra_ruleset(rs.build_extra_ruleset_body(EXTRA_CFG))
         for change in (
