@@ -50,7 +50,7 @@ The sanctioned patterns
 ([ADR 0001](docs/decisions/0001-bot-writes-results-branch-or-declared-bypass.md)):
 
 - **Generated data** (badges, run summaries, dashboards): publish to a
-  dedicated unprotected results branch (model: skills-evals' `eval-results`);
+  dedicated unprotected results branch (model: skills-evals' `persistent/eval-results`);
   consumers read from that branch. No ruleset changes.
 - **The rare bot that must write to the default branch**: declare its service
   identity as a ruleset bypass actor in `fleet.yml` (per-repo `bypass_actors:`

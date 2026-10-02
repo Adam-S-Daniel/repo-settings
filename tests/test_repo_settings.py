@@ -1261,9 +1261,22 @@ class ExtraRulesetsFleetConfigTests(unittest.TestCase):
     def test_defaults_declare_none(self):
         self.assertNotIn("extra_rulesets", self.cfg["defaults"])
 
-    def test_skills_evals_declares_exactly_the_roster_ruleset(self):
+    def test_skills_evals_declares_the_roster_and_persistent_rulesets(self):
         (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/skills-evals"]
-        self.assertEqual(t["settings"]["extra_rulesets"], [EXTRA_CFG])
+        self.assertEqual(
+            [r["name"] for r in t["settings"]["extra_rulesets"]],
+            [EXTRA_CFG["name"], "persistent branches"],
+        )
+        self.assertEqual(t["settings"]["extra_rulesets"][0], EXTRA_CFG)
+
+    def test_skills_evals_declares_deletion_only_persistent_ruleset(self):
+        # docs/decisions/0007: deletion blocked, no bypass actors.
+        (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/skills-evals"]
+        bodies = {b["name"]: b for b in rs.build_extra_ruleset_bodies(t["settings"])}
+        body = bodies["persistent branches"]
+        self.assertEqual(body["conditions"]["ref_name"]["include"], ["refs/heads/persistent/**"])
+        self.assertEqual(body["rules"], [{"type": "deletion"}])
+        self.assertEqual(body["bypass_actors"], [])
 
     def test_only_known_repos_declare_extras(self):
         repos = {t["repo"] for t in self.targets if t["settings"].get("extra_rulesets")}
