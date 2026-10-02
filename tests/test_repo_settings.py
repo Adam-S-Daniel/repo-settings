@@ -1128,6 +1128,15 @@ class NormalizeExtraRulesetTests(unittest.TestCase):
             rs.normalize_extra_ruleset(live), rs.normalize_extra_ruleset(desired)
         )
 
+    def test_live_update_without_parameters_matches_explicit_false(self):
+        # GitHub omits update_allows_fetch_and_merge: false when storing the
+        # rule; the drift report showed a permanent false DRIFT before this.
+        desired = rs.build_extra_ruleset_body(_extra(rules=["update"]))
+        live = dict(desired, id=7, rules=[{"type": "update"}])
+        self.assertEqual(
+            rs.normalize_extra_ruleset(live), rs.normalize_extra_ruleset(desired)
+        )
+
     def test_detects_differences(self):
         base = rs.normalize_extra_ruleset(rs.build_extra_ruleset_body(EXTRA_CFG))
         for change in (
@@ -1265,9 +1274,20 @@ class ExtraRulesetsFleetConfigTests(unittest.TestCase):
         (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/skills-evals"]
         self.assertEqual(t["settings"]["extra_rulesets"], [EXTRA_CFG])
 
-    def test_only_skills_evals_declares_extras(self):
+    def test_only_known_repos_declare_extras(self):
         repos = {t["repo"] for t in self.targets if t["settings"].get("extra_rulesets")}
-        self.assertEqual(repos, {"Adam-S-Daniel/skills-evals"})
+        self.assertEqual(
+            repos, {"Adam-S-Daniel/skills-evals", "Adam-S-Daniel/_agent-guidance"}
+        )
+
+    def test_agent_guidance_declares_deletion_only_persistent_ruleset(self):
+        # docs/decisions/0007: deletion blocked, no bypass actors.
+        (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/_agent-guidance"]
+        (body,) = rs.build_extra_ruleset_bodies(t["settings"])
+        self.assertEqual(body["name"], "persistent branches")
+        self.assertEqual(body["conditions"]["ref_name"]["include"], ["refs/heads/persistent/**"])
+        self.assertEqual(body["rules"], [{"type": "deletion"}])
+        self.assertEqual(body["bypass_actors"], [])
 
     def test_every_declared_extra_builds(self):
         for t in self.targets:

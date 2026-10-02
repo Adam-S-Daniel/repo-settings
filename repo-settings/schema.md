@@ -126,6 +126,7 @@ ruleset:
 A sibling of `ruleset:` (a top-level key in single-repo configs; under a repo's
 `overrides:` in fleet configs) holding a LIST of extra branch rulesets. The
 first use is skills-evals' `roster/proposal` ruleset (docs/decisions/0004).
+The `persistent/**` deletion-only ruleset (docs/decisions/0007) is the other use.
 
 ```yaml
 extra_rulesets:

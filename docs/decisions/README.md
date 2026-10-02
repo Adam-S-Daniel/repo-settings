@@ -94,4 +94,6 @@ Optional sections for high-impact decisions:
 | [0002](0002-declare-dependabot-security-settings-including-the-unenforceable-one.md) | Manage Dependabot security settings as fleet code, including one the engine can never apply | Accepted |
 | [0003](0003-scope-skills-evals-roster-auto-merge-as-declared-exception.md) | Scope skills-evals' roster auto-merge as a declared exception to ADR 0001 | Superseded in part (2026-09-29): GitHub App replaced GITHUB_TOKEN |
 | [0004](0004-confine-roster-proposal-branch-to-the-roster-app.md) | Confine skills-evals' roster/proposal branch to the roster App with an extra ruleset | Accepted |
-| [0005](0005-changelog-routine-merges-its-own-pr-through-a-gate.md) | Let the vendor changelog routine merge its own PR through a mechanical gate | Accepted |
+| [0005](0005-changelog-routine-merges-its-own-pr-through-a-gate.md) | Let the vendor changelog routine merge its own PR through a mechanical gate | Superseded by 0006 (2026-10-02) |
+| [0006](0006-changelog-routine-accumulates-on-a-persistent-branch-owner-merges.md) | Accumulate the changelog routine's work on a persistent branch; the owner merges | Accepted |
+| [0007](0007-persistent-branches-use-the-persistent-prefix-and-a-deletion-ruleset.md) | Name persistent branches `persistent/<purpose>` and protect them from deletion with a ruleset | Accepted |

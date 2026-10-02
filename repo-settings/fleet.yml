@@ -421,6 +421,15 @@ repos:
     overrides:
       ruleset:
         required_status_checks: [test]
+      # why: the changelog routine accumulates on `persistent/vendor-changelog`
+      # across PRs. Only deletion is blocked, with no bypass actors: bots and
+      # humans still push, and delete_branch_on_merge silently skips the
+      # branch. Removing this entry does not delete the live ruleset.
+      # docs/decisions/0007 (the standard), 0006 (the routine).
+      extra_rulesets:
+        - name: persistent branches
+          target_branches: ["persistent/**"]
+          rules: [deletion]
 
   # --- private: only SHA pinning applies. fork-PR approval (422), rulesets
   #     (403, needs Pro) and allow_auto_merge are all auto-skipped by the engine
