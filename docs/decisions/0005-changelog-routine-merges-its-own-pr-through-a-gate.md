@@ -1,10 +1,12 @@
 # 0005. Let the vendor changelog routine merge its own PR through a mechanical gate
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR 0006](0006-changelog-routine-accumulates-on-a-persistent-branch-owner-merges.md) (2026-10-02)
 - **Date:** 2026-09-30
 - **Deciders:** Adam Daniel (decided 2026-09-30)
 
 ## Context
+
+_Superseded: on both live attempts (2026-10-01, 2026-10-02) the gate passed but the claude.ai session's permission classifier denied the merge call. See ADR 0006._
 
 `_agent-guidance` runs a daily claude.ai cloud Routine, "agent changelog
 watcher" (spec:
