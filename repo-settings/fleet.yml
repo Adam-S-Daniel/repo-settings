@@ -419,6 +419,12 @@ repos:
     overrides:
       ruleset:
         required_status_checks: [test]
+      # why: benchmark result branches `persistent/benchmark-fable5` and
+      # `persistent/benchmark-sonnet5` are preserved results (docs/decisions/0007).
+      extra_rulesets:
+        - name: persistent branches
+          target_branches: ["persistent/**"]
+          rules: [deletion]
 
   # --- _agent-guidance: ruleset enabled. Previously held because drift-report.yml
   #     pushed to main as the Actions bot; fixed in _agent-guidance PR #20
