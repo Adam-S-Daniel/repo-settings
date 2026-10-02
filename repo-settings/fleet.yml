@@ -251,7 +251,7 @@ defaults:
 
 # Bot-write policy (issue #5; docs/decisions/0001): generated data (badges, run
 # summaries, dashboards) goes to a dedicated UNPROTECTED results branch -- the
-# model is skills-evals' `eval-results` -- never to the protected default
+# model is skills-evals' `persistent/eval-results` -- never to the protected default
 # branch. The rare bot that truly must write to a default branch gets a
 # `bypass_actors` grant declared HERE (auditable, drift-checked): per-repo
 # overrides for repo-specific bots, `defaults:` only for a fleet-standard bot
@@ -384,6 +384,15 @@ repos:
           bypass_actors:
             - {actor_type: Integration, actor_id: 5116415, bypass_mode: always}
             - {actor_type: RepositoryRole, actor_id: 5, bypass_mode: always}
+        # why: the eval workflow and the usage-census publisher accumulate
+        # results on `persistent/eval-results` across runs and PRs. Only
+        # deletion is blocked, with no bypass actors: bots and humans still
+        # push, and delete_branch_on_merge silently skips the branch.
+        # Removing this entry does not delete the live ruleset.
+        # docs/decisions/0007 (the standard), 0001 (the results branch).
+        - name: persistent branches
+          target_branches: ["persistent/**"]
+          rules: [deletion]
   - name: Adam-S-Daniel/claude-memory-map
     overrides:
       ruleset:
@@ -410,6 +419,12 @@ repos:
     overrides:
       ruleset:
         required_status_checks: [test]
+      # why: benchmark result branches `persistent/benchmark-fable5` and
+      # `persistent/benchmark-sonnet5` are preserved results (docs/decisions/0007).
+      extra_rulesets:
+        - name: persistent branches
+          target_branches: ["persistent/**"]
+          rules: [deletion]
 
   # --- _agent-guidance: ruleset enabled. Previously held because drift-report.yml
   #     pushed to main as the Actions bot; fixed in _agent-guidance PR #20
