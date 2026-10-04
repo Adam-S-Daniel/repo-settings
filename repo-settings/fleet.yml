@@ -411,16 +411,28 @@ repos:
     overrides:
       ruleset:
         required_status_checks: [pester]
-  # ai-usage-dashboard: public, onboarded 2026-10-03. Ruleset-safe (checked
-  # 2026-10-03): no `.github/` directory and so no workflows at all, nothing
-  # pushes to `main` from automation (its Windows collector only PATCHes a
-  # gist via `gh api`), hence no required status check to declare. It matters
-  # more than most: `main` is the live GitHub Pages site (legacy build from
-  # `main` `/`), so an unprotected `main` lets any push-capable token publish
-  # arbitrary JS on the owner's github.io origin. If CI is ever added, list
-  # its job ids under `overrides.ruleset.required_status_checks` after the
-  # same preconditions checked on the adam-agentskills entry.
+  # ai-usage-dashboard: public, onboarded 2026-10-03. Audit 2026-10-04 after
+  # [PR #5](https://github.com/Adam-S-Daniel/ai-usage-dashboard/pull/5)
+  # merged: the read-only CI workflow at
+  # https://github.com/Adam-S-Daniel/ai-usage-dashboard/blob/7da722793fe85f18c4d1a62e7b666032a6249a5e/.github/workflows/ci.yml
+  # runs unfiltered on pull_request and on pushes to main. It defines node-test
+  # and pester jobs, with no job-name overrides, matrix, concurrency, or job
+  # if; each job detects salient changes and gates later steps. Both checks
+  # passed on main at
+  # [7da7227](https://github.com/Adam-S-Daniel/ai-usage-dashboard/commit/7da722793fe85f18c4d1a62e7b666032a6249a5e):
+  # [node-test](https://github.com/Adam-S-Daniel/ai-usage-dashboard/actions/runs/37195248389/job/111415657422),
+  # [pester](https://github.com/Adam-S-Daniel/ai-usage-dashboard/actions/runs/37195248389/job/111415657548).
+  # Both jobs set timeout-minutes: 10, so the no-timeout precondition in the
+  # [required-check policy](https://github.com/Adam-S-Daniel/cms-platform/issues/437#issuecomment-5688908950)
+  # is NOT met. Keep this declaration pending timeout removal or an owner
+  # exception before merging/applying it. No automation pushes to main: the
+  # collector only PATCHes a gist. main remains the live GitHub Pages site
+  # (legacy build from main `/`), so an unprotected main lets any push-capable
+  # token publish arbitrary JS on the owner's github.io origin.
   - name: Adam-S-Daniel/ai-usage-dashboard
+    overrides:
+      ruleset:
+        required_status_checks: [node-test, pester]
 
   # --- GHA-bench: migrated from classic branch protection to a ruleset (the
   #     fleet standard). Now managed like the other public repos. ---

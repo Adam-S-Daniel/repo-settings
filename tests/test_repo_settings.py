@@ -591,8 +591,8 @@ class FleetConfigTests(unittest.TestCase):
 
 
 class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
-    """cms-platform#437: five more fleet repos gain a required status check
-    (agentskills already carried the fleet's only one, `pytest-windows`).
+    """cms-platform#437's five repos plus ai-usage-dashboard declare checks
+    (agentskills already carried the fleet's original `pytest-windows` check).
     Parsed from the shipped fleet.yml -- never regex-scanned -- and rendered
     through the engine's OWN resolve_targets/build_ruleset_body so a
     mismerge between an override and the shared defaults is a red here, not
@@ -606,6 +606,7 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         "Adam-S-Daniel/fastmail-actions": ["pester"],
         "Adam-S-Daniel/GHA-bench": ["test"],
         "Adam-S-Daniel/_agent-guidance": ["test"],
+        "Adam-S-Daniel/ai-usage-dashboard": ["node-test", "pester"],
     }
     PRE_EXISTING = {
         "Adam-S-Daniel/agentskills": ["pytest-windows"],
@@ -624,7 +625,7 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
             self.cfg = yaml.safe_load(fh)
         self.targets = {t["repo"]: t for t in rs.resolve_targets(self.cfg, None)}
 
-    def test_the_five_declare_exactly_the_named_contexts(self):
+    def test_declared_repos_declare_exactly_the_named_contexts(self):
         for repo, checks in self.EXPECTED.items():
             settings = self.targets[repo]["settings"]
             self.assertEqual(
