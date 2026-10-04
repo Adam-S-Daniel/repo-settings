@@ -412,23 +412,27 @@ repos:
       ruleset:
         required_status_checks: [pester]
   # ai-usage-dashboard: public, onboarded 2026-10-03. Audit 2026-10-04 after
-  # [PR #5](https://github.com/Adam-S-Daniel/ai-usage-dashboard/pull/5)
-  # merged: the read-only CI workflow at
-  # https://github.com/Adam-S-Daniel/ai-usage-dashboard/blob/7da722793fe85f18c4d1a62e7b666032a6249a5e/.github/workflows/ci.yml
-  # runs unfiltered on pull_request and on pushes to main. It defines node-test
-  # and pester jobs, with no job-name overrides, matrix, concurrency, or job
-  # if; each job detects salient changes and gates later steps. Both checks
-  # passed on main at
-  # [7da7227](https://github.com/Adam-S-Daniel/ai-usage-dashboard/commit/7da722793fe85f18c4d1a62e7b666032a6249a5e):
-  # [node-test](https://github.com/Adam-S-Daniel/ai-usage-dashboard/actions/runs/37195248389/job/111415657422),
-  # [pester](https://github.com/Adam-S-Daniel/ai-usage-dashboard/actions/runs/37195248389/job/111415657548).
-  # Both jobs set timeout-minutes: 10, so the no-timeout precondition in the
-  # [required-check policy](https://github.com/Adam-S-Daniel/cms-platform/issues/437#issuecomment-5688908950)
-  # is NOT met. Keep this declaration pending timeout removal or an owner
-  # exception before merging/applying it. No automation pushes to main: the
-  # collector only PATCHes a gist. main remains the live GitHub Pages site
-  # (legacy build from main `/`), so an unprotected main lets any push-capable
-  # token publish arbitrary JS on the owner's github.io origin.
+  # [PR #5](https://github.com/Adam-S-Daniel/ai-usage-dashboard/pull/5) and
+  # [PR #6](https://github.com/Adam-S-Daniel/ai-usage-dashboard/pull/6)
+  # merged. The read-only workflow at
+  # https://github.com/Adam-S-Daniel/ai-usage-dashboard/blob/0d9f90e537fad0b16e81a2324f5b0e2441ed247d/.github/workflows/ci.yml
+  # runs unfiltered on pull_request and on pushes to main. Its stable job IDs
+  # are node-test and pester, with no job-name overrides, matrix, job if, or
+  # concurrency at workflow or job level. Neither job nor any step sets a
+  # timeout; [PR #6](https://github.com/Adam-S-Daniel/ai-usage-dashboard/pull/6)
+  # adds a parsed-YAML Pester test that prevents job or step timeout
+  # reintroduction. Each job detects salient changes and gates later steps
+  # internally.
+  # Both checks passed on main at
+  # [0d9f90e](https://github.com/Adam-S-Daniel/ai-usage-dashboard/commit/0d9f90e537fad0b16e81a2324f5b0e2441ed247d):
+  # [node-test](https://github.com/Adam-S-Daniel/ai-usage-dashboard/actions/runs/37196336217/job/111418884960),
+  # [pester](https://github.com/Adam-S-Daniel/ai-usage-dashboard/actions/runs/37196336217/job/111418885047).
+  # contents: read; preconditions MET (2026-10-04) under the
+  # [required-check policy](https://github.com/Adam-S-Daniel/cms-platform/issues/437#issuecomment-5688908950).
+  # No automation pushes to main: the collector only PATCHes a gist. main
+  # remains the live GitHub Pages site (legacy build from main `/`), so an
+  # unprotected main lets any push-capable token publish arbitrary JS on the
+  # owner's github.io origin.
   - name: Adam-S-Daniel/ai-usage-dashboard
     overrides:
       ruleset:
