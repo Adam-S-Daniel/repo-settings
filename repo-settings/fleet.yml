@@ -265,15 +265,16 @@ defaults:
 # tests/test_repo_settings.py fails if any repo gains it.
 
 # WHAT THIS LIST IS, AND THE TWO SETS IT IS NOT. It is what this file DECLARES:
-# 22 entries as of 2026-09-24 (adam-agentskills added; agentskills-private
-# renamed to adam-agentskills-private in place, so the count it contributes is
-# unchanged). The engine MANAGES 16 of them -- six carry `manage: false`, and
+# 23 entries as of 2026-10-03 (ai-usage-dashboard added to the 22 of
+# 2026-09-24, where adam-agentskills was added and agentskills-private
+# renamed to adam-agentskills-private in place). The engine MANAGES 17 of
+# them -- six carry `manage: false`, and
 # cmd_diff/cmd_apply skip those before planning anything. The App's REACH is
 # wider than either: both installations are on "All repositories" (owner,
 # 2026-08-29), so the credential this file drives can administer every repo in
 # both accounts, listed here or not. Declared and in-account were equal on
-# 2026-08-29 (21 = 21); this PR's addition has not yet been re-verified
-# against the account listing -- run `repo_settings.py coverage` per owner
+# 2026-08-29 (21 = 21); the additions since (adam-agentskills, ai-usage-dashboard) have
+# not yet been re-verified against the account listing -- run `repo_settings.py coverage` per owner
 # before trusting that equality again. Nothing here compares them itself: the
 # engine never enumerates an account, it only reads this list.
 repos:
@@ -410,6 +411,16 @@ repos:
     overrides:
       ruleset:
         required_status_checks: [pester]
+  # ai-usage-dashboard: public, onboarded 2026-10-03. Ruleset-safe (checked
+  # 2026-10-03): no `.github/` directory and so no workflows at all, nothing
+  # pushes to `main` from automation (its Windows collector only PATCHes a
+  # gist via `gh api`), hence no required status check to declare. It matters
+  # more than most: `main` is the live GitHub Pages site (legacy build from
+  # `main` `/`), so an unprotected `main` lets any push-capable token publish
+  # arbitrary JS on the owner's github.io origin. If CI is ever added, list
+  # its job ids under `overrides.ruleset.required_status_checks` after the
+  # same preconditions checked on the adam-agentskills entry.
+  - name: Adam-S-Daniel/ai-usage-dashboard
 
   # --- GHA-bench: migrated from classic branch protection to a ruleset (the
   #     fleet standard). Now managed like the other public repos. ---
