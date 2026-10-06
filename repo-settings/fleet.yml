@@ -106,7 +106,7 @@ defaults:
     # more in its own `permissions:` block. `false` keeps workflows from
     # opening or approving PRs with GITHUB_TOKEN -- the PR + auto-merge
     # bot-write path the policy block below does not sanction. The one
-    # declared exception is skills-evals (its override, ADR 0003).
+    # declared exception is skills-evals (its override, ADR 0008).
     default_workflow_permissions: read
     can_approve_pull_request_reviews: false
   # Dependabot alerts + security-update automation. Managed nowhere before
@@ -260,9 +260,12 @@ defaults:
 # this fleet (the cms-platform-managed repos, excluded here, use it by their
 # own design). skills-evals' weekly roster PR (docs/decisions/0003, as
 # amended 2026-09-29; issue #51) is opened and auto-merged by a dedicated
-# per-repo GitHub App behind the required `test` check, not by GITHUB_TOKEN, so
-# no managed repo gets `actions.can_approve_pull_request_reviews: true`;
-# tests/test_repo_settings.py fails if any repo gains it.
+# per-repo GitHub App behind the required `test` check, not by GITHUB_TOKEN.
+# The one repo that does get `actions.can_approve_pull_request_reviews: true` is
+# skills-evals, so its scaffold gate can open DRAFT fixture PRs with
+# GITHUB_TOKEN (docs/decisions/0008); tests/test_repo_settings.py fails if any
+# other repo gains it, or if skills-evals' ruleset ever requires approving
+# reviews while it has it.
 
 # WHAT THIS LIST IS, AND THE TWO SETS IT IS NOT. It is what this file DECLARES:
 # 23 entries as of 2026-10-03 (ai-usage-dashboard added to the 22 of
@@ -365,6 +368,23 @@ repos:
     overrides:
       ruleset:
         required_status_checks: [test]
+      # why: skills-evals' scaffold gate opens DRAFT fixture PRs with the
+      # workflow GITHUB_TOKEN, which GitHub allows only while "Allow GitHub
+      # Actions to create and approve pull requests" is on. The same switch
+      # lets GITHUB_TOKEN submit approving reviews; that grants nothing while
+      # the ruleset requires 0 approving reviews, and a test fails if that
+      # count is raised without revisiting this. A draft PR cannot merge, and
+      # a PR opened by GITHUB_TOKEN gets no passing `test` on its own (ADR 0003,
+      # amendment), so the required check still gates it. docs/decisions/0008.
+      actions:
+        can_approve_pull_request_reviews: true
+      # The label that gate puts on the draft PRs it opens. Declared, not
+      # hand-made, so a fresh skills-evals clone or a deleted label converges.
+      # Removing this entry does not delete the live label.
+      labels:
+        - name: eval-scaffold
+          color: C5DEF5
+          description: Draft real-work fixture opened by the scaffold gate
       # why: the weekly roster PR is armed for auto-merge by the roster App
       # (App id 5116415). GitHub checks --match-head-commit only when
       # auto-merge is enabled, so ANY write-access actor that later pushes

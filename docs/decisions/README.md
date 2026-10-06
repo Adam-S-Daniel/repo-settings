@@ -97,3 +97,4 @@ Optional sections for high-impact decisions:
 | [0005](0005-changelog-routine-merges-its-own-pr-through-a-gate.md) | Let the vendor changelog routine merge its own PR through a mechanical gate | Superseded by 0006 (2026-10-02) |
 | [0006](0006-changelog-routine-accumulates-on-a-persistent-branch-owner-merges.md) | Accumulate the changelog routine's work on a persistent branch; the owner merges | Accepted |
 | [0007](0007-persistent-branches-use-the-persistent-prefix-and-a-deletion-ruleset.md) | Name persistent branches `persistent/<purpose>` and protect them from deletion with a ruleset | Accepted |
+| [0008](0008-let-skills-evals-open-draft-scaffold-prs-with-github-token.md) | Let skills-evals' scaffold gate open draft PRs with GITHUB_TOKEN | Accepted |

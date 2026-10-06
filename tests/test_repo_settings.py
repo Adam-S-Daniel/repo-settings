@@ -2021,11 +2021,12 @@ class WorkflowPermissionsFleetConfigTests(unittest.TestCase):
     Parsed and resolved through the engine, never regex-scanned."""
 
     FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
-    # Repos allowed to let GITHUB_TOKEN create and approve PRs: none. skills-evals'
-    # roster PR is opened and merged by a dedicated GitHub App (ADR 0003 as
-    # amended). Adding one is a policy decision (fleet.yml's bot-write block,
+    # Repos allowed to let GITHUB_TOKEN create and approve PRs: skills-evals
+    # only, so its scaffold gate can open draft fixture PRs (ADR 0008). Its
+    # roster PR still goes through a dedicated GitHub App (ADR 0003 as
+    # amended). Adding a repo is a policy decision (fleet.yml's bot-write block,
     # ADR 0001), not a config tweak.
-    MAY_APPROVE = set()
+    MAY_APPROVE = {"Adam-S-Daniel/skills-evals"}
 
     def setUp(self):
         import yaml
@@ -2033,6 +2034,24 @@ class WorkflowPermissionsFleetConfigTests(unittest.TestCase):
         with open(self.FLEET, encoding="utf-8") as fh:
             self.cfg = yaml.safe_load(fh)
         self.targets = [t for t in rs.resolve_targets(self.cfg, None) if t["manage"]]
+
+    def test_approving_repos_require_no_approving_reviews(self):
+        # With can_approve_pull_request_reviews true, GITHUB_TOKEN can submit an
+        # approving review. That grants nothing only while the ruleset needs no
+        # approvals; raising the count (or requiring approval for unattributed
+        # changes) must revisit the setting first (ADR 0008).
+        for t in self.targets:
+            if t["settings"]["actions"]["can_approve_pull_request_reviews"] is not True:
+                continue
+            pr = t["settings"]["ruleset"]["require_pull_request"]
+            self.assertEqual(pr["required_approving_review_count"], 0, msg=t["repo"])
+            self.assertIs(pr["require_extra_approval_for_unattributed_changes"], False,
+                          msg=t["repo"])
+
+    def test_skills_evals_override_keeps_the_other_workflow_permission_default(self):
+        (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/skills-evals"]
+        self.assertEqual(t["settings"]["actions"]["default_workflow_permissions"], "read")
+        self.assertIs(t["settings"]["actions"]["can_approve_pull_request_reviews"], True)
 
     def test_defaults_declare_read_and_no_pr_approval(self):
         actions = self.cfg["defaults"]["actions"]
@@ -2053,3 +2072,207 @@ class WorkflowPermissionsFleetConfigTests(unittest.TestCase):
                           msg=t["repo"])
             self.assertIsInstance(actions.get("can_approve_pull_request_reviews"), bool,
                                   msg=t["repo"])
+
+
+class LabelSpecTests(unittest.TestCase):
+    CFG = {"name": "eval-scaffold", "color": "C5DEF5",
+           "description": "Draft real-work fixture opened by the scaffold gate"}
+
+    def test_color_is_lowercased_and_description_kept(self):
+        (spec,) = rs.build_label_specs({"labels": [self.CFG]})
+        self.assertEqual(spec, {"name": "eval-scaffold", "color": "c5def5",
+                                "description": self.CFG["description"]})
+
+    def test_description_defaults_to_empty(self):
+        (spec,) = rs.build_label_specs({"labels": [{"name": "x", "color": "000000"}]})
+        self.assertEqual(spec["description"], "")
+
+    def test_no_labels_is_no_specs(self):
+        self.assertEqual(rs.build_label_specs({}), [])
+        self.assertEqual(rs.build_label_specs({"labels": None}), [])
+
+    def test_invalid_entries_are_refused(self):
+        for bad in (
+            "not a mapping",
+            {"color": "000000"},
+            {"name": " ", "color": "000000"},
+            {"name": "x"},
+            {"name": "x", "color": "#c5def5"},
+            {"name": "x", "color": "c5def"},
+            {"name": "x", "color": "gggggg"},
+            {"name": "x", "color": "000000", "description": 5},
+            {"name": "x", "color": "000000", "description": "d" * 101},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                rs.build_label_specs({"labels": [bad]})
+
+    def test_labels_must_be_a_list(self):
+        with self.assertRaises(SystemExit):
+            rs.build_label_specs({"labels": {"name": "x", "color": "000000"}})
+
+    def test_names_are_unique_case_insensitively(self):
+        with self.assertRaises(SystemExit):
+            rs.build_label_specs({"labels": [
+                {"name": "Eval", "color": "000000"}, {"name": "eval", "color": "111111"}]})
+
+    def test_labels_are_per_repo_only(self):
+        cfg = {"defaults": {"labels": [self.CFG]}, "repos": [{"name": "o/r"}]}
+        with self.assertRaises(SystemExit) as cm:
+            rs.resolve_targets(cfg, None)
+        self.assertIn("labels", str(cm.exception))
+
+    def test_a_repo_override_carries_labels(self):
+        cfg = {"defaults": {}, "repos": [{"name": "o/r", "overrides": {"labels": [self.CFG]}}]}
+        (t,) = rs.resolve_targets(cfg, None)
+        self.assertEqual(t["settings"]["labels"], [self.CFG])
+
+    def test_single_repo_shape_carries_labels(self):
+        (t,) = rs.resolve_targets({"repo": "o/r", "labels": [self.CFG]}, None)
+        self.assertEqual(t["settings"]["labels"], [self.CFG])
+
+
+class LabelPlanTests(unittest.TestCase):
+    """plan_repo with mocked gh: only labels are configured."""
+
+    REPO = "o/r"
+    CFG = LabelSpecTests.CFG
+    LIVE = {"name": "eval-scaffold", "color": "c5def5",
+            "description": CFG["description"], "id": 1, "url": "ignored"}
+
+    def _plan(self, side_effect=None, return_value=None, repo_side_effect=None):
+        with patch.object(rs, "gh_api", side_effect=side_effect, return_value=return_value) as api, \
+                patch.object(rs, "get_repo", return_value={"private": False},
+                             side_effect=repo_side_effect) as get_repo:
+            records = rs.plan_repo(self.REPO, {"labels": [self.CFG]})
+        return records, api, get_repo
+
+    def test_match_is_a_read_only_no_write(self):
+        records, api, get_repo = self._plan(return_value=dict(self.LIVE))
+        (rec,) = records
+        self.assertEqual((rec["setting"], rec["status"]), ("label[eval-scaffold]", "match"))
+        api.assert_called_once_with("repos/o/r/labels/eval-scaffold")
+        get_repo.assert_not_called()
+
+    def test_match_ignores_color_case_and_a_null_description(self):
+        live = dict(self.LIVE, color="C5DEF5")
+        (rec,), _, _ = self._plan(return_value=live)
+        self.assertEqual(rec["status"], "match")
+        cfg = {"name": "x", "color": "000000"}
+        with patch.object(rs, "gh_api", return_value={"name": "x", "color": "000000",
+                                                      "description": None}):
+            (rec,) = rs.plan_repo(self.REPO, {"labels": [cfg]})
+        self.assertEqual(rec["status"], "match")
+
+    def test_missing_label_plans_a_create_after_probing_the_repo(self):
+        records, _, get_repo = self._plan(side_effect=rs.GhError(404, "Not Found"))
+        (rec,) = records
+        self.assertEqual(rec["status"], "drift")
+        self.assertIsNone(rec["current"])
+        kind, spec, exists = rec["_writer"]
+        self.assertEqual((kind, exists), ("label", False))
+        self.assertEqual(spec["name"], "eval-scaffold")
+        get_repo.assert_called_once_with(self.REPO)
+
+    def test_404_on_an_invisible_repo_is_an_error_not_a_create(self):
+        records, _, _ = self._plan(side_effect=rs.GhError(404, "Not Found"),
+                                   repo_side_effect=rs.GhError(404, "Not Found"))
+        (rec,) = records
+        self.assertEqual(rec["status"], "error")
+        self.assertNotIn("_writer", rec)
+
+    def test_drifted_color_or_description_plans_a_patch(self):
+        for live in (dict(self.LIVE, color="000000"), dict(self.LIVE, description="old")):
+            with self.subTest(live=live):
+                (rec,), _, _ = self._plan(return_value=live)
+                self.assertEqual(rec["status"], "drift")
+                self.assertEqual(rec["_writer"][0], "label")
+                self.assertIs(rec["_writer"][2], True)
+
+    def test_a_name_differing_only_in_case_is_drift(self):
+        (rec,), _, _ = self._plan(return_value=dict(self.LIVE, name="Eval-Scaffold"))
+        self.assertEqual(rec["status"], "drift")
+
+    def test_other_read_errors_are_reported_per_label(self):
+        (rec,), _, _ = self._plan(side_effect=rs.GhError(403, "Resource not accessible"))
+        self.assertEqual(rec["status"], "error")
+
+    def test_names_are_url_quoted(self):
+        cfg = {"name": "needs review/x y", "color": "000000"}
+        with patch.object(rs, "gh_api", return_value={"name": cfg["name"], "color": "000000",
+                                                      "description": ""}) as api:
+            rs.plan_repo(self.REPO, {"labels": [cfg]})
+        api.assert_called_once_with("repos/o/r/labels/needs%20review%2Fx%20y")
+
+    def test_unmanaged_when_undeclared(self):
+        with patch.object(rs, "gh_api") as api, patch.object(rs, "get_repo") as get_repo:
+            self.assertEqual(rs.plan_repo(self.REPO, {"repo": {}}), [])
+        api.assert_not_called()
+        get_repo.assert_not_called()
+
+    def test_apply_posts_a_new_label(self):
+        (rec,), _, _ = self._plan(side_effect=rs.GhError(404, "Not Found"))
+        with patch.object(rs, "gh_api") as api:
+            rs.apply_record(self.REPO, rec)
+        api.assert_called_once_with(
+            "repos/o/r/labels", method="POST",
+            body={"name": "eval-scaffold", "color": "c5def5",
+                  "description": self.CFG["description"]})
+
+    def test_apply_patches_an_existing_label(self):
+        (rec,), _, _ = self._plan(return_value=dict(self.LIVE, color="000000"))
+        with patch.object(rs, "gh_api") as api:
+            rs.apply_record(self.REPO, rec)
+        api.assert_called_once_with(
+            "repos/o/r/labels/eval-scaffold", method="PATCH",
+            body={"color": "c5def5", "description": self.CFG["description"],
+                  "new_name": "eval-scaffold"})
+
+    def test_dry_run_through_cmd_apply_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "c.yml"
+            cfg.write_text(
+                "defaults: {}\nrepos:\n  - name: o/r\n    overrides:\n      labels:\n"
+                "        - {name: eval-scaffold, color: C5DEF5}\n",
+                encoding="utf-8",
+            )
+            calls = []
+
+            def fake(path, method="GET", body=None):
+                calls.append((method, path))
+                if method == "GET" and "labels" in path:
+                    raise rs.GhError(404, "Not Found")
+                return {"private": False}
+
+            args = argparse.Namespace(config=str(cfg), repo=None, owner=None, dry_run=True)
+            with patch.object(rs, "gh_api", side_effect=fake), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = rs.cmd_apply(args)
+        self.assertEqual(rc, 0)
+        self.assertIn("would change", out.getvalue())
+        self.assertEqual({m for m, _ in calls}, {"GET"})
+
+
+class LabelsFleetConfigTests(unittest.TestCase):
+    FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
+
+    def setUp(self):
+        import yaml
+
+        with open(self.FLEET, encoding="utf-8") as fh:
+            self.cfg = yaml.safe_load(fh)
+        self.targets = rs.resolve_targets(self.cfg, None)
+
+    def test_defaults_declare_none(self):
+        self.assertNotIn("labels", self.cfg["defaults"])
+
+    def test_only_skills_evals_declares_labels(self):
+        repos = {t["repo"] for t in self.targets if t["settings"].get("labels")}
+        self.assertEqual(repos, {"Adam-S-Daniel/skills-evals"})
+
+    def test_skills_evals_declares_the_scaffold_label(self):
+        (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/skills-evals"]
+        self.assertEqual(
+            rs.build_label_specs(t["settings"]),
+            [{"name": "eval-scaffold", "color": "c5def5",
+              "description": "Draft real-work fixture opened by the scaffold gate"}],
+        )

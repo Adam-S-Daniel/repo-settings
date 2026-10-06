@@ -42,6 +42,10 @@ Managed settings:
                                                vulnerability_alerts -- apply
                                                order is dependency-aware, see
                                                plan_repo)
+  * labels (per-repo only)                 -> repos/{repo}/labels/{name}  (GET, then
+                                               POST when absent or PATCH on
+                                               drift; idempotent BY NAME, never
+                                               deletes a label)
   * security.grouped_security_updates      -> NOT APPLYABLE. No REST endpoint
                                                exists at any scope; declared
                                                and always reported `skipped`
@@ -90,8 +94,10 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import subprocess
 import sys
+import urllib.parse
 from typing import Any
 
 try:
@@ -761,6 +767,90 @@ def write_ruleset(repo: str, body: dict, existing_id: int | None) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Labels (per-repo only)
+# --------------------------------------------------------------------------- #
+LABEL_COLOR_RE = re.compile(r"[0-9a-fA-F]{6}")
+LABEL_DESCRIPTION_MAX = 100  # GitHub rejects longer descriptions (422)
+
+
+def build_label_specs(settings: dict) -> list[dict]:
+    """Validate and normalize every `labels` entry of one repo's settings.
+
+    A label is identified BY NAME, and GitHub compares names case-insensitively,
+    so two entries differing only in case are the same label and are refused.
+    Color is six hex digits with no leading `#` (the REST shape), lowercased so
+    the compare against the live value is exact. Description is optional and
+    defaults to empty, which is also what GitHub returns for none."""
+    entries = settings.get("labels") or []
+    if not isinstance(entries, list):
+        raise SystemExit("error: labels must be a list")
+    specs: list[dict] = []
+    seen: set[str] = set()
+    for cfg in entries:
+        if not isinstance(cfg, dict):
+            raise SystemExit(f"error: labels entries must be mappings (got {cfg!r})")
+        name = cfg.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise SystemExit("error: labels entry needs a non-empty `name`")
+        color = cfg.get("color")
+        if not isinstance(color, str) or not LABEL_COLOR_RE.fullmatch(color):
+            raise SystemExit(
+                f"error: labels[{name}] needs a `color` of six hex digits with "
+                f"no leading '#' (got {color!r})"
+            )
+        description = cfg.get("description", "")
+        if description is None:
+            description = ""
+        if not isinstance(description, str) or len(description) > LABEL_DESCRIPTION_MAX:
+            raise SystemExit(
+                f"error: labels[{name}] `description` must be a string of at most "
+                f"{LABEL_DESCRIPTION_MAX} characters"
+            )
+        if name.lower() in seen:
+            raise SystemExit(f"error: labels name {name!r} is duplicated (names are case-insensitive)")
+        seen.add(name.lower())
+        specs.append({"name": name, "color": color.lower(), "description": description})
+    return specs
+
+
+def normalize_label(label: dict | None) -> dict | None:
+    """Reduce a label (live or desired) to the fields we manage."""
+    if label is None:
+        return None
+    return {
+        "name": label.get("name"),
+        "color": str(label.get("color") or "").lower(),
+        "description": label.get("description") or "",
+    }
+
+
+def _label_path(repo: str, name: str) -> str:
+    return f"repos/{repo}/labels/{urllib.parse.quote(name, safe='')}"
+
+
+def read_label(repo: str, name: str) -> dict | None:
+    """The live label, or None on a 404. A bare 404 is ambiguous (label gone, or
+    repo invisible to this credential): the caller probes the repo to tell."""
+    try:
+        return gh_api(_label_path(repo, name))
+    except GhError as e:
+        if e.status == 404:
+            return None
+        raise
+
+
+def write_label(repo: str, spec: dict, exists: bool) -> None:
+    """Create the label (POST), or converge an existing one in place (PATCH,
+    which also repairs a name that differs only in case). Never deletes."""
+    body = {"color": spec["color"], "description": spec["description"]}
+    if exists:
+        gh_api(_label_path(repo, spec["name"]), method="PATCH",
+               body=dict(body, new_name=spec["name"]))
+    else:
+        gh_api(f"repos/{repo}/labels", method="POST", body=dict(body, name=spec["name"]))
+
+
+# --------------------------------------------------------------------------- #
 # Config handling
 # --------------------------------------------------------------------------- #
 def deep_merge(base: dict, over: dict) -> dict:
@@ -789,6 +879,13 @@ def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
                 "error: extra_rulesets is per-repo only -- declare it under a "
                 "repo's `overrides:`, not `defaults:`"
             )
+        # Same list-replacement hazard, and a label is a per-repo fixture of one
+        # workflow: a defaults-level label would be created in every repo.
+        if "labels" in defaults:
+            raise SystemExit(
+                "error: labels is per-repo only -- declare it under a "
+                "repo's `overrides:`, not `defaults:`"
+            )
         targets = []
         for entry in cfg["repos"]:
             if isinstance(entry, str):
@@ -813,7 +910,7 @@ def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
             "error: single-repo config needs a top-level `repo: owner/name` "
             "or a --repo argument."
         )
-    settings = {k: v for k, v in cfg.items() if k in ("actions", "ruleset", "extra_rulesets")}
+    settings = {k: v for k, v in cfg.items() if k in ("actions", "ruleset", "extra_rulesets", "labels")}
     if isinstance(repo_field, dict):
         settings["repo"] = repo_field
     return [{"repo": repo, "settings": settings, "manage": True}]
@@ -1315,6 +1412,38 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
                             }
                         )
 
+    # -- labels --------------------------------------------------------------- #
+    # Per-repo only, by name, never deleting: an entry removed from config
+    # leaves its live label alone. No private-repo gate: labels exist on every
+    # plan. Writing one needs the credential's Issues (or Pull requests) write
+    # permission, which is NOT part of the fan-out App's Administration +
+    # Actions + Metadata grant -- so a write the credential cannot make comes
+    # back as an `error` record, not a silent skip.
+    for spec in build_label_specs(settings):
+        setting = f"label[{spec['name']}]"
+        desired = normalize_label(spec)
+        try:
+            live = read_label(repo, spec["name"])
+            if live is None:
+                # A bare 404 reads the same whether the label is missing or the
+                # repo is invisible to this credential. Probe the repo: it
+                # raises GhError for the second case, which then surfaces as an
+                # error record instead of a bogus "missing -> create".
+                get_repo(repo)
+        except GhError as e:
+            records.append(_err(setting, desired, e))
+            continue
+        current = normalize_label(live)
+        records.append(
+            {
+                "setting": setting,
+                "status": "match" if current == desired else "drift",
+                "current": current,
+                "desired": desired,
+                "_writer": ("label", spec, live is not None),
+            }
+        )
+
     return records
 
 
@@ -1356,6 +1485,8 @@ def apply_record(repo: str, rec: dict) -> None:
         write_workflow_permissions(repo, b)
     elif kind == "ruleset":
         write_ruleset(repo, a, b)
+    elif kind == "label":
+        write_label(repo, a, b)
     elif kind == "auto_merge":
         write_allow_auto_merge(repo, b)
     elif kind == "merge_methods":
