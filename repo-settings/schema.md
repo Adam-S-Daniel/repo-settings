@@ -157,6 +157,42 @@ extra_rulesets:
 - `generate` does not emit `extra_rulesets`; it identifies the default ruleset
   by its name.
 
+### `labels:` -- repo labels (per-repo only)
+
+A sibling of `extra_rulesets:` (a top-level key in single-repo configs; under a
+repo's `overrides:` in fleet configs) holding a LIST of labels the repo must
+carry. The first use is skills-evals' `eval-scaffold` label (docs/decisions/0008).
+
+```yaml
+labels:
+  - name: eval-scaffold                  # required; the label's identity
+    color: C5DEF5                        # required; six hex digits, no leading '#'
+    description: Draft real-work fixture opened by the scaffold gate   # optional, <= 100 chars
+```
+
+- **By name, like `ruleset:`.** The plan reads `GET repos/{repo}/labels/{name}`:
+  a match is `ok`; a 404 is `DRIFT` (apply POSTs `repos/{repo}/labels`); a
+  different color, description or name casing is `DRIFT` (apply PATCHes the
+  label in place). Names compare case-insensitively on GitHub, so two entries
+  differing only in case are refused; color compares case-insensitively.
+- **A bare 404 is probed, not trusted.** A 404 reads the same whether the label
+  is missing or the repo is invisible to the credential, so the plan then reads
+  the repo itself: if that fails, the record is an `error`, never a create.
+- **Removal does not delete.** Dropping an entry leaves the live label alone,
+  consistent with "never touches other rulesets"; delete it by hand.
+- **Per-repo only.** `labels` under `defaults:` is rejected, for the same
+  list-replacement reason as `extra_rulesets`, and because a label belongs to
+  one repo's workflow.
+- **Not visibility-gated.** Labels exist on every plan.
+- **Needs a permission the fan-out App may not hold.** Creating or editing a
+  label needs the credential's **Issues** (or Pull requests) **write**
+  permission, which is not part of the documented Administration + Actions +
+  Metadata grant. A write the credential cannot make comes back as an `error`
+  record naming the HTTP failure, never a silent skip. Verify the App's grant
+  (or apply from ambient `gh auth`) before relying on the scheduled run to
+  create a label.
+- `generate` does not emit `labels`.
+
 ### `repo:` -- plain repo settings
 
 A separate, optional top-level `repo:` block manages ordinary repository
@@ -500,4 +536,6 @@ approving reviews.** On a repo whose ruleset requires approvals
 approves its own PR makes that PR count as approved -- the review comes from
 a token the repo's own Action controls, not an independent reviewer.
 Revisit this setting before raising `required_approving_review_count` on any
-repo that has it `true`.
+repo that has it `true`. skills-evals is the one repo that has it `true`
+(docs/decisions/0008); `WorkflowPermissionsFleetConfigTests` fails if it, or
+any repo with the setting on, requires approving reviews.
