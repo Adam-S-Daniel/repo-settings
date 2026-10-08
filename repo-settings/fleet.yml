@@ -472,7 +472,16 @@ repos:
   #     fleet standard). Now managed like the other public repos. ---
   # required_status_checks: [test] -- see the cms-platform#437 comment above
   # Adam-S-Daniel/skills-evals for the preconditions checked 2026-09-15.
+  #
+  # ARCHIVED (found 2026-10-08): GitHub refuses settings changes on an
+  # archived repo, so the 2026-10-08 apply failed on
+  # security.vulnerability_alerts ("Failed to change dependabot alerts
+  # status"). `manage: false` keeps it declared (so `coverage` still counts
+  # it) while the engine stops planning changes against it, as for the
+  # retired agentskills entry. The overrides below stay as the record of its
+  # policy if it is ever unarchived.
   - name: Adam-S-Daniel/GHA-bench
+    manage: false
     overrides:
       ruleset:
         required_status_checks: [test]
