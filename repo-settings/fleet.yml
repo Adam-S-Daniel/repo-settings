@@ -314,10 +314,20 @@ repos:
   # `secret_scanning_push_protection` key anywhere in
   # scripts/repo_settings.py, so adding one here would be inert config the
   # engine silently never reads. Revisit if the engine ever grows that field.
+  #
+  # Fourth check, `plugin-runtime-approval` (added 2026-10-08): the job in
+  # .github/workflows/plugin-runtime-review.yml that holds a PR changing a
+  # plugin's hooks, bin/, package.json or settings until the owner approves
+  # the `plugin-runtime-review` environment (adam-agentskills ADR 0016/0017).
+  # It runs ONLY on `pull_request_target` (types opened/synchronize/reopened),
+  # so no push/dispatch run can publish the context; no `name:`, no matrix,
+  # no `concurrency:`, no `paths:` (an ungated PR reports success at once).
+  # Verified on adam-agentskills#60 before adding it here: the context landed
+  # on the PR head sha, waited for the owner, and passed after approval.
   - name: Adam-S-Daniel/adam-agentskills
     overrides:
       ruleset:
-        required_status_checks: [privacy, pytest, pytest-windows]
+        required_status_checks: [privacy, pytest, pytest-windows, plugin-runtime-approval]
   # Five more repos gain a required status check here (cms-platform#437 --
   # https://github.com/Adam-S-Daniel/cms-platform/issues/437). WHY: the
   # account rule is that PR CI is required, and a GitHub-enforced ruleset
