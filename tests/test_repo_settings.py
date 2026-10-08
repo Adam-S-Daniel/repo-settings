@@ -614,8 +614,9 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         # onboarded with a required check from day one -- not part of the
         # cms-platform#437 batch this class otherwise tests, so it belongs in
         # this "allowed but not asserted exactly by the other tests" bucket
-        # rather than EXPECTED.
-        "Adam-S-Daniel/adam-agentskills": ["privacy", "pytest", "pytest-windows"],
+        # rather than EXPECTED. `plugin-runtime-approval` (2026-10-08) is its
+        # owner-approval gate for plugin runtime changes (its ADR 0016/0017).
+        "Adam-S-Daniel/adam-agentskills": ["privacy", "pytest", "pytest-windows", "plugin-runtime-approval"],
     }
 
     def setUp(self):
