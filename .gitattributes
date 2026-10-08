@@ -1,0 +1,2 @@
+# managed by _agent-guidance: hook scripts must stay LF for bash (see ADR 0019)
+.claude/hooks/*.sh text eol=lf
