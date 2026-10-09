@@ -324,10 +324,29 @@ repos:
   # no `concurrency:`, no `paths:` (an ungated PR reports success at once).
   # Verified on adam-agentskills#60 before adding it here: the context landed
   # on the PR head sha, waited for the owner, and passed after approval.
+  #
+  # Actions event policy (added 2026-10-09): on 2026-11-02 GitHub restricts
+  # `pull_request_target` on public repos by default unless an Actions policy
+  # allows it (warning on
+  # https://github.com/Adam-S-Daniel/adam-agentskills/actions/runs/37841935690/job/113533312463).
+  # `plugin-runtime-approval` is a REQUIRED check here, so a blocked event
+  # would leave every PR unmergeable. The policy is scoped to that one workflow
+  # file because `allowed_events` is an allowlist for the workflows a policy
+  # covers (any unlisted event is blocked), and plugin-runtime-review.yml
+  # triggers only on `pull_request_target`. If that workflow ever gains a
+  # trigger, list it here too or its runs are blocked. Why, and the fallback if
+  # GitHub still shows the warning: docs/decisions/0009.
   - name: Adam-S-Daniel/adam-agentskills
     overrides:
       ruleset:
         required_status_checks: [privacy, pytest, pytest-windows, plugin-runtime-approval]
+      actions_policies:
+        - name: "plugin-runtime-review: allow pull_request_target"
+          enforcement: active
+          workflow_paths:
+            include: [.github/workflows/plugin-runtime-review.yml]
+            exclude: []
+          allowed_events: [pull_request_target]
   # Five more repos gain a required status check here (cms-platform#437 --
   # https://github.com/Adam-S-Daniel/cms-platform/issues/437). WHY: the
   # account rule is that PR CI is required, and a GitHub-enforced ruleset

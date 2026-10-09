@@ -1,6 +1,7 @@
 # Offline tests of the pure config -> ruleset-body logic (no gh/network).
 import argparse
 import contextlib
+import copy
 import io
 import os
 import sys
@@ -1977,7 +1978,7 @@ class WorkflowPermissionsTests(unittest.TestCase):
         )
 
     def test_generate_emits_both_fields(self):
-        def fake(path, method="GET", body=None):
+        def fake(path, method="GET", body=None, api_version=None):
             if path == "repos/o/r":
                 return {"private": True}
             if path == "repos/o/r/actions/permissions":
@@ -1987,6 +1988,8 @@ class WorkflowPermissionsTests(unittest.TestCase):
                         "can_approve_pull_request_reviews": True}
             if path == "repos/o/r/rulesets":
                 raise rs.GhError(403, "upgrade")
+            if path.startswith("repos/o/r/actions/policies"):
+                raise rs.GhError(403, "no admin")
             raise AssertionError(path)
 
         out = io.StringIO()
@@ -1998,7 +2001,7 @@ class WorkflowPermissionsTests(unittest.TestCase):
         self.assertIs(doc["actions"]["can_approve_pull_request_reviews"], True)
 
     def test_generate_survives_an_unreadable_endpoint(self):
-        def fake(path, method="GET", body=None):
+        def fake(path, method="GET", body=None, api_version=None):
             if path == "repos/o/r":
                 return {"private": True}
             if path == "repos/o/r/actions/permissions":
@@ -2007,6 +2010,8 @@ class WorkflowPermissionsTests(unittest.TestCase):
                 raise rs.GhError(403, "nope")
             if path == "repos/o/r/rulesets":
                 raise rs.GhError(403, "upgrade")
+            if path.startswith("repos/o/r/actions/policies"):
+                raise rs.GhError(403, "no admin")
             raise AssertionError(path)
 
         out = io.StringIO()
@@ -2277,3 +2282,547 @@ class LabelsFleetConfigTests(unittest.TestCase):
             [{"name": "eval-scaffold", "color": "c5def5",
               "description": "Draft real-work fixture opened by the scaffold gate"}],
         )
+
+
+class GhApiVersionHeaderTests(unittest.TestCase):
+    def _cmd(self, **kwargs):
+        done = argparse.Namespace(returncode=0, stdout="{}", stderr="")
+        with patch.object(rs.subprocess, "run", return_value=done) as run:
+            rs.gh_api("repos/o/r", **kwargs)
+        return run.call_args.args[0]
+
+    def test_api_version_adds_the_header(self):
+        cmd = self._cmd(api_version="2026-03-10")
+        i = cmd.index("-H")
+        self.assertEqual(cmd[i + 1], "X-GitHub-Api-Version: 2026-03-10")
+
+    def test_header_comes_before_the_stdin_flag(self):
+        done = argparse.Namespace(returncode=0, stdout="{}", stderr="")
+        with patch.object(rs.subprocess, "run", return_value=done) as run:
+            rs.gh_api("repos/o/r", method="POST", body={"a": 1}, api_version="2026-03-10")
+        cmd = run.call_args.args[0]
+        self.assertLess(cmd.index("-H"), cmd.index("--input"))
+
+    def test_no_api_version_no_header(self):
+        self.assertNotIn("-H", self._cmd())
+
+
+POLICY_CFG = {
+    "name": "plugin-runtime-review: allow pull_request_target",
+    "enforcement": "active",
+    "workflow_paths": {
+        "include": [".github/workflows/plugin-runtime-review.yml"],
+        "exclude": [],
+    },
+    "allowed_events": ["pull_request_target"],
+}
+
+
+def _policy_cfg(**changes):
+    cfg = copy.deepcopy(POLICY_CFG)
+    cfg.update(changes)
+    return cfg
+
+
+class ActionsPolicyBodyTests(unittest.TestCase):
+    def test_fleet_entry_builds_the_exact_body(self):
+        self.assertEqual(
+            rs.build_actions_policy_body(POLICY_CFG),
+            {
+                "name": "plugin-runtime-review: allow pull_request_target",
+                "enforcement": "active",
+                "conditions": {
+                    "workflow_path": {
+                        "include": [".github/workflows/plugin-runtime-review.yml"],
+                        "exclude": [],
+                    }
+                },
+                "rules": [
+                    {
+                        "type": "restrict_action_events",
+                        "parameters": {"allowed_events": ["pull_request_target"]},
+                    }
+                ],
+            },
+        )
+
+    def test_enforcement_defaults_to_active(self):
+        cfg = _policy_cfg()
+        del cfg["enforcement"]
+        self.assertEqual(rs.build_actions_policy_body(cfg)["enforcement"], "active")
+
+    def test_disabled_is_accepted_and_exclude_defaults_empty(self):
+        cfg = _policy_cfg(enforcement="disabled", workflow_paths={"include": ["a.yml"]})
+        body = rs.build_actions_policy_body(cfg)
+        self.assertEqual(body["enforcement"], "disabled")
+        self.assertEqual(body["conditions"]["workflow_path"]["exclude"], [])
+
+    def test_config_list_order_is_preserved(self):
+        cfg = _policy_cfg(allowed_events=["push", "pull_request"],
+                          workflow_paths={"include": ["b.yml", "a.yml"], "exclude": ["z.yml", "y.yml"]})
+        body = rs.build_actions_policy_body(cfg)
+        self.assertEqual(body["rules"][0]["parameters"]["allowed_events"], ["push", "pull_request"])
+        self.assertEqual(body["conditions"]["workflow_path"],
+                         {"include": ["b.yml", "a.yml"], "exclude": ["z.yml", "y.yml"]})
+
+    def test_evaluate_is_refused_as_enterprise_only(self):
+        with self.assertRaises(SystemExit) as cm:
+            rs.build_actions_policy_body(_policy_cfg(enforcement="evaluate"))
+        self.assertIn("Enterprise Cloud", str(cm.exception))
+
+    def test_bogus_enforcement_is_refused(self):
+        with self.assertRaises(SystemExit):
+            rs.build_actions_policy_body(_policy_cfg(enforcement="loud"))
+
+    def test_bad_name_is_refused(self):
+        for bad in (None, "", "  ", 7):
+            with self.subTest(name=bad), self.assertRaises(SystemExit):
+                rs.build_actions_policy_body(_policy_cfg(name=bad))
+        cfg = _policy_cfg()
+        del cfg["name"]
+        with self.assertRaises(SystemExit):
+            rs.build_actions_policy_body(cfg)
+
+    def test_non_mapping_entry_is_refused(self):
+        with self.assertRaises(SystemExit):
+            rs.build_actions_policy_body("plugin-runtime-review")
+
+    def test_unknown_top_level_key_is_refused_and_named(self):
+        cfg = _policy_cfg()
+        del cfg["enforcement"]
+        cfg["enforcment"] = "disabled"
+        with self.assertRaises(SystemExit) as cm:
+            rs.build_actions_policy_body(cfg)
+        self.assertIn("enforcment", str(cm.exception))
+
+    def test_unknown_workflow_paths_key_is_refused(self):
+        cfg = _policy_cfg(workflow_paths={"include": ["a.yml"], "inlcude": ["b.yml"]})
+        with self.assertRaises(SystemExit):
+            rs.build_actions_policy_body(cfg)
+
+    def test_workflow_paths_must_be_a_mapping(self):
+        for bad in (None, ["a.yml"]):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                rs.build_actions_policy_body(_policy_cfg(workflow_paths=bad))
+
+    def test_include_must_be_a_non_empty_list_of_strings(self):
+        for bad in (None, [], "a.yml", [""], [1]):
+            with self.subTest(include=bad), self.assertRaises(SystemExit):
+                rs.build_actions_policy_body(_policy_cfg(workflow_paths={"include": bad}))
+
+    def test_all_with_another_path_is_refused_but_alone_is_accepted(self):
+        with self.assertRaises(SystemExit):
+            rs.build_actions_policy_body(_policy_cfg(workflow_paths={"include": ["~ALL", "a.yml"]}))
+        body = rs.build_actions_policy_body(_policy_cfg(workflow_paths={"include": ["~ALL"]}))
+        self.assertEqual(body["conditions"]["workflow_path"]["include"], ["~ALL"])
+
+    def test_exclude_must_be_a_list_of_strings(self):
+        for bad in ("a.yml", None, [""], [1]):
+            with self.subTest(exclude=bad), self.assertRaises(SystemExit):
+                rs.build_actions_policy_body(
+                    _policy_cfg(workflow_paths={"include": ["a.yml"], "exclude": bad}))
+
+    def test_allowed_events_must_be_a_non_empty_unique_list_of_strings(self):
+        for bad in (None, [], "push", [""], [1], ["push", "push"]):
+            with self.subTest(events=bad), self.assertRaises(SystemExit):
+                rs.build_actions_policy_body(_policy_cfg(allowed_events=bad))
+
+    def test_bodies_absent_is_empty(self):
+        self.assertEqual(rs.build_actions_policy_bodies({}), [])
+        self.assertEqual(rs.build_actions_policy_bodies({"actions_policies": None}), [])
+
+    def test_bodies_must_be_a_list(self):
+        with self.assertRaises(SystemExit):
+            rs.build_actions_policy_bodies({"actions_policies": POLICY_CFG})
+
+    def test_duplicate_names_across_entries_are_refused(self):
+        with self.assertRaises(SystemExit):
+            rs.build_actions_policy_bodies({"actions_policies": [POLICY_CFG, _policy_cfg()]})
+
+
+class NormalizeActionsPolicyTests(unittest.TestCase):
+    DESIRED = rs.normalize_actions_policy(rs.build_actions_policy_body(
+        _policy_cfg(workflow_paths={"include": ["a.yml", "b.yml"], "exclude": ["c.yml", "d.yml"]},
+                    allowed_events=["pull_request_target", "push"])))
+
+    def _live(self, **changes):
+        live = {
+            "id": 42,
+            "node_id": "N_1",
+            "name": POLICY_CFG["name"],
+            "target": "actions",
+            "source_type": "Repository",
+            "source": "o/r",
+            "enforcement": "active",
+            "conditions": {"workflow_path": {"include": ["b.yml", "a.yml"],
+                                             "exclude": ["d.yml", "c.yml"]}},
+            "rules": [{"type": "restrict_action_events",
+                       "parameters": {"allowed_events": ["push", "pull_request_target"]}}],
+            "_links": {"self": {"href": "https://api.github.com/x"}},
+            "created_at": "2026-10-01T00:00:00Z",
+            "updated_at": "2026-10-02T00:00:00Z",
+        }
+        live.update(changes)
+        return live
+
+    def test_live_payload_normalizes_equal_to_desired(self):
+        self.assertEqual(rs.normalize_actions_policy(self._live()), self.DESIRED)
+
+    def test_none_is_none(self):
+        self.assertIsNone(rs.normalize_actions_policy(None))
+
+    def test_absent_or_null_sections_do_not_raise(self):
+        for changes in ({"conditions": None}, {"rules": None},
+                        {"conditions": {"workflow_path": None}},
+                        {"rules": [{"type": "restrict_action_events", "parameters": None}]},
+                        {"rules": [{"type": "restrict_action_events"}]}):
+            with self.subTest(changes=changes):
+                self.assertIsInstance(rs.normalize_actions_policy(self._live(**changes)), dict)
+        self.assertIsInstance(rs.normalize_actions_policy({}), dict)
+
+    def test_different_events_normalize_different(self):
+        live = self._live(rules=[{"type": "restrict_action_events",
+                                  "parameters": {"allowed_events": ["push"]}}])
+        self.assertNotEqual(rs.normalize_actions_policy(live), self.DESIRED)
+
+    def test_an_extra_actors_rule_normalizes_different(self):
+        live = self._live()
+        live["rules"].append({"type": "restrict_actions_actors",
+                              "parameters": {"allowed_actors": ["octocat"]}})
+        self.assertNotEqual(rs.normalize_actions_policy(live), self.DESIRED)
+
+    def test_enforcement_and_paths_are_compared(self):
+        self.assertNotEqual(rs.normalize_actions_policy(self._live(enforcement="disabled")),
+                            self.DESIRED)
+        live = self._live(conditions={"workflow_path": {"include": ["a.yml"], "exclude": []}})
+        self.assertNotEqual(rs.normalize_actions_policy(live), self.DESIRED)
+
+
+class ActionsPolicyPlanTests(unittest.TestCase):
+    """plan_repo with mocked gh: only actions_policies is configured."""
+
+    REPO = "o/r"
+    BODY = rs.build_actions_policy_body(POLICY_CFG)
+    V = rs.ACTIONS_POLICIES_API_VERSION
+
+    def _live(self, id=42, name=POLICY_CFG["name"], **changes):
+        return dict(copy.deepcopy(self.BODY), id=id, name=name, source_type="Repository", **changes)
+
+    def _plan(self, listing, by_id=None, cfgs=(POLICY_CFG,), list_error=None):
+        """listing: payload for the policies list (or an exception to raise)."""
+        by_id = by_id or {}
+        calls = []
+
+        def fake(path, method="GET", body=None, api_version=None):
+            calls.append((path, method, api_version))
+            if "/actions/policies?" in path:
+                if isinstance(listing, Exception):
+                    raise listing
+                return listing
+            pid = path.rsplit("/", 1)[1]
+            value = by_id[int(pid)]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with patch.object(rs, "gh_api", side_effect=fake), \
+                patch.object(rs, "get_repo") as get_repo:
+            records = rs.plan_repo(self.REPO, {"actions_policies": list(cfgs)})
+        get_repo.assert_not_called()
+        return records, calls
+
+    def _listing(self, *policies):
+        return {"total_count": len(policies), "policies": list(policies)}
+
+    def test_absent_plans_a_create(self):
+        (rec,), calls = self._plan(self._listing())
+        self.assertEqual(rec["setting"], f"actions_policy[{POLICY_CFG['name']}]")
+        self.assertEqual(rec["status"], "drift")
+        self.assertIsNone(rec["current"])
+        self.assertEqual(rec["_writer"], ("actions_policy", self.BODY, None))
+        self.assertTrue(calls)
+        self.assertTrue(all(v == self.V for _, _, v in calls))
+
+    def test_present_and_equal_matches_with_no_write(self):
+        live = self._live(node_id="N", _links={}, created_at="x", updated_at="y")
+        (rec,), calls = self._plan(self._listing(live), {42: live})
+        self.assertEqual(rec["status"], "match")
+        self.assertEqual([m for _, m, _ in calls], ["GET", "GET"])
+        self.assertTrue(calls[1][0].endswith("/actions/policies/42"))
+        self.assertTrue(all(v == self.V for _, _, v in calls))
+
+    def test_present_and_different_plans_a_put_on_the_live_id(self):
+        live = self._live(enforcement="disabled")
+        (rec,), _ = self._plan(self._listing(live), {42: live})
+        self.assertEqual(rec["status"], "drift")
+        self.assertEqual(rec["_writer"], ("actions_policy", self.BODY, 42))
+
+    def test_unreadable_list_is_skipped_per_declared_policy(self):
+        second = _policy_cfg(name="second")
+        for status in (403, 404, 422):
+            with self.subTest(status=status):
+                recs, _ = self._plan(rs.GhError(status, "nope"), cfgs=(POLICY_CFG, second))
+                self.assertEqual([r["status"] for r in recs], ["skipped", "skipped"])
+                self.assertIn(f"HTTP {status}", recs[0]["note"])
+                self.assertTrue(all("_writer" not in r for r in recs))
+
+    def test_other_list_failure_is_an_error(self):
+        (rec,), _ = self._plan(rs.GhError(500, "boom"))
+        self.assertEqual(rec["status"], "error")
+
+    def test_payload_without_a_policies_list_is_skipped(self):
+        for payload in ({}, None, [], {"policies": None}, {"total_count": 0}):
+            with self.subTest(payload=payload):
+                (rec,), _ = self._plan(payload)
+                self.assertEqual(rec["status"], "skipped")
+                self.assertNotIn("_writer", rec)
+
+    def test_two_live_policies_with_the_name_is_an_error(self):
+        a, b = self._live(id=1), self._live(id=2)
+        (rec,), calls = self._plan(self._listing(a, b), {})
+        self.assertEqual(rec["status"], "error")
+        self.assertNotIn("_writer", rec)
+        self.assertIn("2 repository Actions policies", rec["note"])
+        self.assertEqual(len(calls), 1)  # the list only; neither fetched by id
+
+    def test_undeclared_live_policy_is_ignored_and_never_fetched(self):
+        other = self._live(id=9, name="something else")
+        (rec,), calls = self._plan(self._listing(other))
+        self.assertEqual(rec["status"], "drift")
+        self.assertIsNone(rec["_writer"][2])
+        self.assertFalse(any(p.endswith("/9") for p, _, _ in calls))
+
+    def test_inherited_policy_with_the_same_name_is_ignored(self):
+        inherited = self._live(id=7)
+        inherited["source_type"] = "Organization"
+        (rec,), calls = self._plan(self._listing(inherited))
+        self.assertEqual(rec["status"], "drift")
+        self.assertIsNone(rec["_writer"][2])
+        self.assertEqual(len(calls), 1)
+
+    def test_a_match_without_an_id_is_skipped(self):
+        live = self._live()
+        del live["id"]
+        (rec,), _ = self._plan(self._listing(live))
+        self.assertEqual(rec["status"], "skipped")
+        self.assertIn("id", rec["note"])
+
+    def test_get_by_id_403_is_skipped(self):
+        live = self._live()
+        (rec,), _ = self._plan(self._listing(live), {42: rs.GhError(403, "nope")})
+        self.assertEqual(rec["status"], "skipped")
+
+    def test_get_by_id_500_is_an_error(self):
+        live = self._live()
+        (rec,), _ = self._plan(self._listing(live), {42: rs.GhError(500, "boom")})
+        self.assertEqual(rec["status"], "error")
+
+    def test_one_policy_failing_does_not_stop_the_next(self):
+        second_cfg = _policy_cfg(name="second")
+        first = self._live(id=1)
+        second = dict(self._live(id=2, name="second"))
+        recs, _ = self._plan(self._listing(first, second),
+                             {1: rs.GhError(403, "nope"), 2: second}, cfgs=(POLICY_CFG, second_cfg))
+        self.assertEqual([r["status"] for r in recs], ["skipped", "match"])
+
+    def test_pagination_reads_page_two_when_page_one_is_full(self):
+        full = [self._live(id=i, name=f"p{i}") for i in range(100)]
+        pages = []
+
+        def fake(path, method="GET", body=None, api_version=None):
+            pages.append(path)
+            if path.endswith("page=1"):
+                return {"total_count": 101, "policies": full}
+            return {"total_count": 101, "policies": [self._live(id=500)]}
+
+        with patch.object(rs, "gh_api", side_effect=fake):
+            out = rs.list_actions_policies(self.REPO)
+        self.assertEqual(len(out), 101)
+        self.assertEqual([p.rsplit("&", 1)[1] for p in pages], ["page=1", "page=2"])
+
+    def test_a_short_page_stops_pagination(self):
+        with patch.object(rs, "gh_api", return_value=self._listing(self._live())) as api:
+            rs.list_actions_policies(self.REPO)
+        api.assert_called_once()
+
+    def test_undeclared_config_makes_no_gh_calls(self):
+        with patch.object(rs, "gh_api") as api, patch.object(rs, "get_repo") as get_repo:
+            self.assertEqual(rs.plan_repo(self.REPO, {}), [])
+        api.assert_not_called()
+        get_repo.assert_not_called()
+
+
+class ActionsPolicyApplyTests(unittest.TestCase):
+    BODY = rs.build_actions_policy_body(POLICY_CFG)
+
+    def test_create_posts_the_full_body(self):
+        with patch.object(rs, "gh_api") as api:
+            rs.apply_record("o/r", {"_writer": ("actions_policy", self.BODY, None)})
+        api.assert_called_once_with("repos/o/r/actions/policies", method="POST",
+                                    body=self.BODY, api_version="2026-03-10")
+
+    def test_update_puts_the_full_body_on_the_id(self):
+        with patch.object(rs, "gh_api") as api:
+            rs.apply_record("o/r", {"_writer": ("actions_policy", self.BODY, 42)})
+        api.assert_called_once_with("repos/o/r/actions/policies/42", method="PUT",
+                                    body=self.BODY, api_version="2026-03-10")
+
+    def _run(self, cmd, **ns):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "c.yml"
+            cfg.write_text(
+                "defaults: {}\nrepos:\n  - name: o/r\n    overrides:\n      actions_policies:\n"
+                "        - name: p\n          workflow_paths: {include: [a.yml]}\n"
+                "          allowed_events: [pull_request_target]\n",
+                encoding="utf-8",
+            )
+            calls = []
+
+            def fake(path, method="GET", body=None, api_version=None):
+                calls.append((method, path))
+                return {"total_count": 0, "policies": []}
+
+            args = argparse.Namespace(config=str(cfg), repo=None, owner=None, **ns)
+            with patch.object(rs, "gh_api", side_effect=fake), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = cmd(args)
+        return rc, out.getvalue(), calls
+
+    def test_dry_run_through_cmd_apply_issues_only_gets(self):
+        rc, out, calls = self._run(rs.cmd_apply, dry_run=True)
+        self.assertEqual(rc, 0)
+        self.assertIn("would change", out)
+        self.assertEqual({m for m, _ in calls}, {"GET"})
+
+    def test_cmd_diff_reports_drift(self):
+        rc, out, _ = self._run(rs.cmd_diff)
+        self.assertEqual(rc, 1)
+        self.assertIn("DRIFT", out)
+
+
+class ActionsPolicyGenerateTests(unittest.TestCase):
+    def _live(self, **changes):
+        live = dict(rs.build_actions_policy_body(POLICY_CFG), id=42, source_type="Repository")
+        live.update(changes)
+        return live
+
+    def test_doc_round_trips(self):
+        live = self._live(rules=[
+            {"type": "restrict_action_events", "parameters": {"allowed_events": ["push", "schedule"]}},
+            {"type": "restrict_action_events", "parameters": {"allowed_events": ["schedule", "pull_request"]}},
+        ])
+        doc = rs.actions_policy_doc(live)
+        self.assertEqual(doc["allowed_events"], ["push", "schedule", "pull_request"])
+        self.assertEqual(
+            rs.normalize_actions_policy(rs.build_actions_policy_body(doc)),
+            rs.normalize_actions_policy(dict(live, rules=[{
+                "type": "restrict_action_events",
+                "parameters": {"allowed_events": ["push", "schedule", "pull_request"]}}])),
+        )
+        self.assertEqual(rs.actions_policy_doc(self._live()), POLICY_CFG)
+
+    def test_inexpressible_policies_return_none(self):
+        actors = {"type": "restrict_actions_actors", "parameters": {"allowed_actors": ["x"]}}
+        events = self._live()["rules"]
+        cases = {
+            "actors rule": self._live(rules=events + [actors]),
+            "no rules": self._live(rules=[]),
+            "null rules": self._live(rules=None),
+            "evaluate": self._live(enforcement="evaluate"),
+            "empty include": self._live(conditions={"workflow_path": {"include": [], "exclude": []}}),
+            "no conditions": self._live(conditions=None),
+        }
+        for label, live in cases.items():
+            with self.subTest(label):
+                self.assertIsNone(rs.actions_policy_doc(live))
+
+    def _generate(self, summaries, by_id):
+        import yaml
+
+        def get(repo, pid):
+            value = by_id[pid]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(rs, "get_repo", return_value={"private": True}), \
+                patch.object(rs, "read_actions", return_value={"sha_pinning_required": True}), \
+                patch.object(rs, "read_fork_approval", return_value=None), \
+                patch.object(rs, "read_workflow_permissions", return_value={}), \
+                patch.object(rs, "list_rulesets", return_value=[]), \
+                patch.object(rs, "list_actions_policies", return_value=summaries), \
+                patch.object(rs, "get_actions_policy", side_effect=get), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rs.cmd_generate(argparse.Namespace(repo="o/r"))
+        return yaml.safe_load(out.getvalue()), err.getvalue()
+
+    def test_generate_emits_the_expressible_policy_and_notes_the_rest(self):
+        good = self._live()
+        bad = self._live(id=43, name="actors", rules=[
+            {"type": "restrict_actions_actors", "parameters": {"allowed_actors": ["x"]}}])
+        doc, err = self._generate(
+            [{"id": 42, "name": good["name"]}, {"id": 43, "name": "actors"}], {42: good, 43: bad})
+        self.assertEqual(doc["actions_policies"], [POLICY_CFG])
+        self.assertIn("generate: skipping Actions policy 'actors' -- not expressible in "
+                      "actions_policies", err)
+
+    def test_generate_notes_a_policy_it_cannot_read(self):
+        doc, err = self._generate([{"id": 42, "name": "p"}], {42: rs.GhError(403, "nope")})
+        self.assertNotIn("actions_policies", doc)
+        self.assertIn("generate: skipping Actions policy 'p' -- ", err)
+
+    def test_generate_omits_the_block_when_policies_are_unavailable(self):
+        doc, err = self._generate(None, {})
+        self.assertNotIn("actions_policies", doc)
+        self.assertEqual(err, "")
+
+
+class ActionsPoliciesFleetConfigTests(unittest.TestCase):
+    FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
+
+    def setUp(self):
+        import yaml
+
+        with open(self.FLEET, encoding="utf-8") as fh:
+            self.cfg = yaml.safe_load(fh)
+        self.targets = rs.resolve_targets(self.cfg, None)
+
+    def test_defaults_declare_none(self):
+        self.assertNotIn("actions_policies", self.cfg["defaults"])
+
+    def test_only_adam_agentskills_declares_policies(self):
+        repos = {t["repo"] for t in self.targets if t["settings"].get("actions_policies")}
+        self.assertEqual(repos, {"Adam-S-Daniel/adam-agentskills"})
+
+    def test_adam_agentskills_allows_only_pull_request_target_on_its_review_workflow(self):
+        (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/adam-agentskills"]
+        self.assertEqual(
+            rs.build_actions_policy_bodies(t["settings"]),
+            [{"name": "plugin-runtime-review: allow pull_request_target",
+              "enforcement": "active",
+              "conditions": {"workflow_path": {
+                  "include": [".github/workflows/plugin-runtime-review.yml"], "exclude": []}},
+              "rules": [{"type": "restrict_action_events",
+                         "parameters": {"allowed_events": ["pull_request_target"]}}]}],
+        )
+
+    def test_no_declared_policy_uses_all(self):
+        # `allowed_events` is an allowlist for every workflow a policy covers: a
+        # ~ALL policy would block each event it does not list, repo-wide.
+        for t in self.targets:
+            for body in rs.build_actions_policy_bodies(t["settings"]):
+                self.assertNotIn("~ALL", body["conditions"]["workflow_path"]["include"])
+
+
+class ActionsPoliciesDefaultsTests(unittest.TestCase):
+    def test_defaults_level_actions_policies_is_refused(self):
+        cfg = {"defaults": {"actions_policies": [POLICY_CFG]}, "repos": [{"name": "o/r"}]}
+        with self.assertRaises(SystemExit) as cm:
+            rs.resolve_targets(cfg, None)
+        self.assertIn("per-repo only", str(cm.exception))
+
+    def test_single_repo_config_carries_the_key(self):
+        cfg = {"repo": "o/r", "actions_policies": [POLICY_CFG]}
+        (t,) = rs.resolve_targets(cfg, None)
+        self.assertEqual(t["settings"]["actions_policies"], [POLICY_CFG])
