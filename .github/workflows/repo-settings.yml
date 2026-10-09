@@ -8,10 +8,9 @@
 # rotate, and it reaches both. The engine already accepts `--owner`, so each
 # matrix leg processes only its owner's repos with that owner's token.
 #
-# Place this in the central repo that owns fleet settings (e.g. a dedicated
-# `repo-settings` repo), alongside:
-#   scripts/repo_settings.py     (copied from the github-actions-repo-settings skill)
-#   repo-settings/fleet.yml      (your fleet config -- see repo-settings.schema.md)
+# Runs from this repo, the canonical home of the engine (README), alongside:
+#   scripts/repo_settings.py     (the engine)
+#   repo-settings/fleet.yml      (the fleet config -- see repo-settings/schema.md)
 #
 # One-time setup (must be done by a human -- creating an App and its key cannot
 # be automated):

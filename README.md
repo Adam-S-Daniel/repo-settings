@@ -5,9 +5,13 @@ Repository security settings as code for the `Adam-S-Daniel` (user) and
 state (`repo-settings/fleet.yml`), the engine (`scripts/repo_settings.py`), and a
 scheduled fan-out workflow that reconciles drift.
 
-The engine and schema come from the `github-actions-repo-settings` skill in
-[Adam-S-Daniel/agentskills](https://github.com/Adam-S-Daniel/agentskills). Schema
-reference: [`repo-settings/schema.md`](repo-settings/schema.md).
+This repo is the **canonical home** of the engine, its schema and the fan-out
+workflow. The `github-actions-repo-settings` skill in
+[Adam-S-Daniel/adam-agentskills](https://github.com/Adam-S-Daniel/adam-agentskills)
+used to ship a copy; it now points here instead
+([adam-agentskills#62](https://github.com/Adam-S-Daniel/adam-agentskills/issues/62)),
+so change the engine here and nowhere else. Schema reference:
+[`repo-settings/schema.md`](repo-settings/schema.md).
 
 ## What it enforces
 
