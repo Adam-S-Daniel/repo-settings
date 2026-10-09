@@ -193,6 +193,69 @@ labels:
   create a label.
 - `generate` does not emit `labels`.
 
+### `actions_policies:` -- repository Actions event policies (per-repo only)
+
+A sibling of `labels:` (a top-level key in single-repo configs; under a repo's
+`overrides:` in fleet configs) holding a LIST of repository Actions event
+policies (Settings -> Actions -> Policies). The first use is adam-agentskills'
+`pull_request_target` allowance (docs/decisions/0009).
+
+```yaml
+actions_policies:
+  - name: "plugin-runtime-review: allow pull_request_target"   # required; the policy's identity
+    enforcement: active                  # optional; active (default) | disabled
+    workflow_paths:                      # required
+      include: [.github/workflows/plugin-runtime-review.yml]   # required, non-empty; or [~ALL] alone
+      exclude: []                        # optional, default []
+    allowed_events: [pull_request_target]   # required, non-empty, no duplicates
+```
+
+- **What it is.** On 2026-11-02 GitHub restricts `pull_request_target` on public
+  repos by default unless an Actions policy applies
+  ([docs](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target)).
+  A policy's rule `restrict_action_events` carries `allowed_events`.
+- **`allowed_events` is an allowlist** for every workflow the policy covers:
+  an unlisted event is blocked ("Event 'workflow_dispatch' is not allowed to
+  trigger Actions workflows"). So scope the policy to workflow paths and prefer
+  one policy per workflow over `~ALL`; a `~ALL` policy must list every event
+  every workflow uses, `schedule` and `workflow_dispatch` included. If a covered
+  workflow gains a trigger, add it to `allowed_events` or its runs are blocked.
+- **By name, like `ruleset:`.** The plan lists `GET repos/{repo}/actions/policies`
+  and matches by `name`: absent is `DRIFT` (apply POSTs); present and different
+  is `DRIFT` (apply PUTs the full body); equal is `ok`. `diff` reports DRIFT.
+- **Ownership.** The engine owns only the names a repo declares. It never edits
+  or deletes an undeclared policy, and it ignores inherited org or enterprise
+  policies (`source_type` other than `Repository`) even when the name matches.
+  Two live policies with a declared name is an `error`: the engine will not
+  guess which one to converge; delete the extras by hand.
+- **Removal does not delete.** Dropping an entry leaves the live policy alone.
+  To retire one, set `enforcement: disabled`, let it apply, delete the policy by
+  hand, then drop the entry. For adam-agentskills' policy, dropping it
+  re-exposes `plugin-runtime-review.yml` to the default block.
+- **Compared fields:** enforcement, `include` and `exclude` (as sets) and the
+  rules (as a set of type and parameters, `allowed_events` as a set). Server
+  fields (`id`, `node_id`, `_links`, timestamps, `source`, `source_type`,
+  `target`) are ignored.
+- **Refused at plan time.** `enforcement: evaluate` (GitHub Enterprise Cloud
+  only), any unknown key (a typo like `enforcment` must not become `active`),
+  and `~ALL` together with another include path. Only `restrict_action_events`
+  rules are supported (not `restrict_actions_actors`), and only at repository
+  level.
+- **Per-repo only.** `actions_policies` under `defaults:` is rejected, for the
+  same list-replacement reason as `extra_rulesets`, and because a policy names
+  one repo's workflow files.
+- **Permission.** Every repository endpoint, GET included, needs the repository
+  **Administration: write** permission
+  ([docs](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps#repository-permissions-for-administration)),
+  which the fan-out App already holds. A 403, 404 or 422 on a read is a
+  `skipped` record, and a list payload without `policies` is also `skipped`,
+  never a `KeyError`; any other failure is an `error`.
+- **API version.** Requests carry `X-GitHub-Api-Version: 2026-03-10`.
+- **Not visibility-gated.** Policies are planned on every repo.
+- `generate` emits only the policies expressible in this shape (one or more
+  `restrict_action_events` rules, `active` or `disabled`, a non-empty include)
+  and notes the rest on stderr.
+
 ### `repo:` -- plain repo settings
 
 A separate, optional top-level `repo:` block manages ordinary repository

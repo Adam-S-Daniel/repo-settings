@@ -46,6 +46,9 @@ Managed settings:
                                                POST when absent or PATCH on
                                                drift; idempotent BY NAME, never
                                                deletes a label)
+  * actions_policies (per-repo only)       -> repos/{repo}/actions/policies  (idempotent
+                                               BY NAME; never edits or deletes an
+                                               undeclared policy)
   * security.grouped_security_updates      -> NOT APPLYABLE. No REST endpoint
                                                exists at any scope; declared
                                                and always reported `skipped`
@@ -127,10 +130,15 @@ class GhError(Exception):
         super().__init__(f"HTTP {status}: {message}" if status else message)
 
 
-def gh_api(path: str, method: str = "GET", body: dict | None = None) -> Any:
+def gh_api(path: str, method: str = "GET", body: dict | None = None,
+           api_version: str | None = None) -> Any:
     """Call `gh api`. Return parsed JSON (or None for empty). Raise GhError on
-    HTTP failure, parsing the HTTP status out of gh's output when possible."""
+    HTTP failure, parsing the HTTP status out of gh's output when possible.
+    `api_version` pins the X-GitHub-Api-Version header for endpoints that need
+    a newer one than gh's default."""
     cmd = ["gh", "api", "-X", method, path]
+    if api_version:
+        cmd += ["-H", f"X-GitHub-Api-Version: {api_version}"]
     stdin = None
     if body is not None:
         cmd += ["--input", "-"]
@@ -233,6 +241,14 @@ def read_actions(repo: str) -> dict:
 # pull requests". One endpoint, repos/{repo}/actions/permissions/workflow,
 # carries both -- GET/PUT accept either or both keys.
 WORKFLOW_PERMISSIONS_KEYS = ("default_workflow_permissions", "can_approve_pull_request_reviews")
+
+# Settings -> Actions -> Policies: repository Actions event policies (REST
+# actions/policies, ADR 0009). The endpoints need a newer API version than gh's
+# default; `evaluate` enforcement is GitHub Enterprise Cloud only, so it is not
+# offered here.
+ACTIONS_POLICIES_API_VERSION = "2026-03-10"
+ACTIONS_POLICY_ENFORCEMENTS = ("active", "disabled")
+ACTIONS_POLICY_KEYS = ("name", "enforcement", "workflow_paths", "allowed_events")
 
 
 def read_workflow_permissions(repo: str) -> dict:
@@ -851,6 +867,199 @@ def write_label(repo: str, spec: dict, exists: bool) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Actions policies (per-repo only)
+# --------------------------------------------------------------------------- #
+def _str_list(value: Any, allow_empty: bool) -> bool:
+    return (
+        isinstance(value, list)
+        and (allow_empty or bool(value))
+        and all(isinstance(v, str) and v for v in value)
+    )
+
+
+def build_actions_policy_body(cfg: dict) -> dict:
+    """Build the POST/PUT body for one `actions_policies` entry: a repository
+    Actions event policy that allows only the listed events for the workflow
+    files it covers. `allowed_events` is an ALLOWLIST -- every unlisted event is
+    blocked for those workflows -- so the scope is declared, never defaulted."""
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"error: actions_policies entries must be mappings (got {cfg!r})")
+    unknown = [k for k in cfg if k not in ACTIONS_POLICY_KEYS]
+    if unknown:
+        raise SystemExit(
+            f"error: actions_policies entry has unknown key(s) {', '.join(map(repr, unknown))} "
+            f"(allowed: {', '.join(ACTIONS_POLICY_KEYS)})"
+        )
+    name = cfg.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise SystemExit("error: actions_policies entry needs a non-empty `name`")
+    enforcement = cfg.get("enforcement", "active")
+    if enforcement == "evaluate":
+        raise SystemExit(
+            f"error: actions_policies[{name}] enforcement 'evaluate' is GitHub "
+            f"Enterprise Cloud only (allowed: {', '.join(ACTIONS_POLICY_ENFORCEMENTS)})"
+        )
+    if enforcement not in ACTIONS_POLICY_ENFORCEMENTS:
+        raise SystemExit(
+            f"error: actions_policies[{name}] enforcement must be one of "
+            f"{', '.join(ACTIONS_POLICY_ENFORCEMENTS)} (got {enforcement!r})"
+        )
+    paths = cfg.get("workflow_paths")
+    if not isinstance(paths, dict):
+        raise SystemExit(
+            f"error: actions_policies[{name}] needs a `workflow_paths` mapping "
+            f"with an `include` list"
+        )
+    bad = [k for k in paths if k not in ("include", "exclude")]
+    if bad:
+        raise SystemExit(
+            f"error: actions_policies[{name}] workflow_paths has unknown key(s) "
+            f"{', '.join(map(repr, bad))} (allowed: include, exclude)"
+        )
+    include = paths.get("include")
+    if not _str_list(include, allow_empty=False):
+        raise SystemExit(
+            f"error: actions_policies[{name}] workflow_paths.include needs a "
+            f"non-empty list of workflow file paths (or '~ALL')"
+        )
+    if "~ALL" in include and len(include) > 1:
+        raise SystemExit(
+            f"error: actions_policies[{name}] workflow_paths.include '~ALL' must "
+            f"stand alone"
+        )
+    exclude = paths.get("exclude", [])
+    if not _str_list(exclude, allow_empty=True):
+        raise SystemExit(
+            f"error: actions_policies[{name}] workflow_paths.exclude must be a "
+            f"list of workflow file paths"
+        )
+    events = cfg.get("allowed_events")
+    if not _str_list(events, allow_empty=False):
+        raise SystemExit(
+            f"error: actions_policies[{name}] needs a non-empty `allowed_events` "
+            f"list of event names"
+        )
+    if len(set(events)) != len(events):
+        raise SystemExit(f"error: actions_policies[{name}] allowed_events lists an event twice")
+    return {
+        "name": name,
+        "enforcement": enforcement,
+        "conditions": {"workflow_path": {"include": include, "exclude": exclude}},
+        "rules": [
+            {"type": "restrict_action_events", "parameters": {"allowed_events": events}}
+        ],
+    }
+
+
+def build_actions_policy_bodies(settings: dict) -> list[dict]:
+    """Validate and build every `actions_policies` entry of one repo's settings.
+    Names must be unique (the engine matches live policies BY NAME)."""
+    entries = settings.get("actions_policies") or []
+    if not isinstance(entries, list):
+        raise SystemExit("error: actions_policies must be a list")
+    seen: set[str] = set()
+    bodies = []
+    for cfg in entries:
+        body = build_actions_policy_body(cfg)
+        if body["name"] in seen:
+            raise SystemExit(f"error: actions_policies name {body['name']!r} is duplicated")
+        seen.add(body["name"])
+        bodies.append(body)
+    return bodies
+
+
+def normalize_actions_policy(p: dict | None) -> dict | None:
+    """Reduce an Actions policy (live or desired) to the managed fields, so the
+    server-added ones (id, node_id, _links, timestamps, source, source_type,
+    target) never register as drift. Rules compare as a set of (type,
+    parameters); the name is the match key, not a compared field."""
+    if p is None:
+        return None
+    cond = (p.get("conditions") or {}).get("workflow_path") or {}
+    rules = []
+    for r in p.get("rules") or []:
+        params = dict(r.get("parameters") or {})
+        if isinstance(params.get("allowed_events"), list):
+            params["allowed_events"] = sorted(params["allowed_events"])
+        rules.append((r.get("type"), json.dumps(params, sort_keys=True)))
+    return {
+        "enforcement": p.get("enforcement"),
+        "include": sorted(cond.get("include") or []),
+        "exclude": sorted(cond.get("exclude") or []),
+        "rules": sorted(rules),
+    }
+
+
+def list_actions_policies(repo: str) -> list[dict] | None:
+    """Return the repository's own Actions policies (every page), or None when a
+    page is not a payload carrying a `policies` list. Inherited org/enterprise
+    policies are dropped: they are not ours even when the name matches. Raises
+    GhError (403/404/422 without Administration: write)."""
+    out: list[dict] = []
+    page = 1
+    while True:
+        data = gh_api(
+            f"repos/{repo}/actions/policies?per_page=100&page={page}",
+            api_version=ACTIONS_POLICIES_API_VERSION,
+        )
+        if not isinstance(data, dict) or not isinstance(data.get("policies"), list):
+            return None
+        batch = data["policies"]
+        out += [
+            p for p in batch
+            if isinstance(p, dict) and p.get("source_type", "Repository") == "Repository"
+        ]
+        if len(batch) < 100:
+            return out
+        page += 1
+
+
+def get_actions_policy(repo: str, policy_id: int) -> dict:
+    return gh_api(
+        f"repos/{repo}/actions/policies/{policy_id}",
+        api_version=ACTIONS_POLICIES_API_VERSION,
+    ) or {}
+
+
+def write_actions_policy(repo: str, body: dict, existing_id: int | None) -> None:
+    """Converging writer, like write_ruleset: PUT the whole body over an existing
+    policy, else POST it. Never DELETEs -- retiring a policy is a manual step."""
+    if existing_id is not None:
+        gh_api(f"repos/{repo}/actions/policies/{existing_id}", method="PUT",
+               body=body, api_version=ACTIONS_POLICIES_API_VERSION)
+    else:
+        gh_api(f"repos/{repo}/actions/policies", method="POST",
+               body=body, api_version=ACTIONS_POLICIES_API_VERSION)
+
+
+def actions_policy_doc(p: dict) -> dict | None:
+    """Render a live policy as an `actions_policies` config entry (for
+    `generate`), or None when it is not expressible in that shape: no rules, a
+    rule other than `restrict_action_events`, an enforcement we do not manage,
+    or an empty include."""
+    rules = p.get("rules") or []
+    if not rules or any(r.get("type") != "restrict_action_events" for r in rules):
+        return None
+    if p.get("enforcement") not in ACTIONS_POLICY_ENFORCEMENTS:
+        return None
+    cond = (p.get("conditions") or {}).get("workflow_path") or {}
+    include = list(cond.get("include") or [])
+    if not include:
+        return None
+    events: list[str] = []
+    for r in rules:
+        for ev in (r.get("parameters") or {}).get("allowed_events") or []:
+            if ev not in events:
+                events.append(ev)
+    return {
+        "name": p.get("name"),
+        "enforcement": p["enforcement"],
+        "workflow_paths": {"include": include, "exclude": list(cond.get("exclude") or [])},
+        "allowed_events": events,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Config handling
 # --------------------------------------------------------------------------- #
 def deep_merge(base: dict, over: dict) -> dict:
@@ -886,6 +1095,13 @@ def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
                 "error: labels is per-repo only -- declare it under a "
                 "repo's `overrides:`, not `defaults:`"
             )
+        # Same list-replacement hazard, and a policy names one repo's workflow
+        # files: a defaults-level policy would point at files other repos lack.
+        if "actions_policies" in defaults:
+            raise SystemExit(
+                "error: actions_policies is per-repo only -- declare it under a "
+                "repo's `overrides:`, not `defaults:`"
+            )
         targets = []
         for entry in cfg["repos"]:
             if isinstance(entry, str):
@@ -910,7 +1126,11 @@ def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
             "error: single-repo config needs a top-level `repo: owner/name` "
             "or a --repo argument."
         )
-    settings = {k: v for k, v in cfg.items() if k in ("actions", "ruleset", "extra_rulesets", "labels")}
+    settings = {
+        k: v
+        for k, v in cfg.items()
+        if k in ("actions", "ruleset", "extra_rulesets", "labels", "actions_policies")
+    }
     if isinstance(repo_field, dict):
         settings["repo"] = repo_field
     return [{"repo": repo, "settings": settings, "manage": True}]
@@ -1412,6 +1632,89 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
                             }
                         )
 
+    # -- Actions policies ---------------------------------------------------- #
+    # Per-repo, by name (like `ruleset:`): the engine owns only the names a repo
+    # declares, never edits or deletes an undeclared or inherited policy, and an
+    # entry removed from config leaves its live policy alone. Not
+    # visibility-gated. Every endpoint, GET included, needs the repository
+    # Administration: write permission, so a read the credential cannot make is
+    # an informational skip, not drift (see schema.md).
+    policy_bodies = build_actions_policy_bodies(settings)
+    if policy_bodies:
+
+        def policy_skip(status: int | None) -> str:
+            return (
+                f"cannot read Actions policies -- HTTP {status} (needs the repository "
+                "Administration: write permission; see schema.md)"
+            )
+
+        try:
+            live_policies = list_actions_policies(repo)
+        except GhError as e:
+            for body in policy_bodies:
+                setting = f"actions_policy[{body['name']}]"
+                desired = normalize_actions_policy(body)
+                if e.status in (403, 404, 422):
+                    records.append(_skip(setting, desired, policy_skip(e.status)))
+                else:
+                    records.append(_err(setting, desired, e))
+        else:
+            for body in policy_bodies:
+                name = body["name"]
+                setting = f"actions_policy[{name}]"
+                desired = normalize_actions_policy(body)
+                if live_policies is None:
+                    records.append(
+                        _skip(setting, desired,
+                              "GitHub did not return a `policies` list for this repo "
+                              "(token scope or payload shape) -- leaving Actions "
+                              "policies unmanaged")
+                    )
+                    continue
+                matches = [p for p in live_policies if p.get("name") == name]
+                if len(matches) > 1:
+                    records.append(
+                        {
+                            "setting": setting,
+                            "status": "error",
+                            "current": None,
+                            "desired": desired,
+                            "note": f"{len(matches)} repository Actions policies are "
+                                    f"named {name!r} -- the engine matches by name and "
+                                    "will not guess; delete the extras by hand",
+                        }
+                    )
+                    continue
+                existing = None
+                existing_id = None
+                if matches:
+                    existing_id = matches[0].get("id")
+                    if existing_id is None:
+                        records.append(
+                            _skip(setting, desired,
+                                  f"the live Actions policy named {name!r} carries no "
+                                  "id -- leaving it unmanaged")
+                        )
+                        continue
+                    try:
+                        existing = get_actions_policy(repo, existing_id)
+                    except GhError as e:
+                        if e.status in (403, 404, 422):
+                            records.append(_skip(setting, desired, policy_skip(e.status)))
+                        else:
+                            records.append(_err(setting, desired, e))
+                        continue
+                current = normalize_actions_policy(existing)
+                records.append(
+                    {
+                        "setting": setting,
+                        "status": "match" if current == desired else "drift",
+                        "current": current,
+                        "desired": desired,
+                        "_writer": ("actions_policy", body, existing_id),
+                    }
+                )
+
     # -- labels --------------------------------------------------------------- #
     # Per-repo only, by name, never deleting: an entry removed from config
     # leaves its live label alone. No private-repo gate: labels exist on every
@@ -1487,6 +1790,8 @@ def apply_record(repo: str, rec: dict) -> None:
         write_ruleset(repo, a, b)
     elif kind == "label":
         write_label(repo, a, b)
+    elif kind == "actions_policy":
+        write_actions_policy(repo, a, b)
     elif kind == "auto_merge":
         write_allow_auto_merge(repo, b)
     elif kind == "merge_methods":
@@ -1583,6 +1888,29 @@ def cmd_generate(args) -> int:
             doc["ruleset"] = {"enabled": False, "name": DEFAULT_RULESET_NAME}
     except GhError:
         pass  # rulesets unavailable (e.g. private-no-Pro)
+    # Emit only the policies expressible as an `actions_policies` entry.
+    try:
+        live_policies = list_actions_policies(repo)
+    except GhError:
+        live_policies = None  # policies unavailable (e.g. scope gap) -- see plan_repo
+    policy_docs = []
+    for summary in live_policies or []:
+        pname = summary.get("name")
+        try:
+            full = get_actions_policy(repo, summary.get("id"))
+        except GhError as e:
+            sys.stderr.write(f"generate: skipping Actions policy {pname!r} -- {e}\n")
+            continue
+        policy_doc = actions_policy_doc(full)
+        if policy_doc is None:
+            sys.stderr.write(
+                f"generate: skipping Actions policy {pname!r} -- "
+                "not expressible in actions_policies\n"
+            )
+            continue
+        policy_docs.append(policy_doc)
+    if policy_docs:
+        doc["actions_policies"] = policy_docs
     header = (
         "# Generated by repo_settings.py generate. Edit to describe DESIRED state,\n"
         "# then `repo_settings.py apply --config <this file>`.\n"

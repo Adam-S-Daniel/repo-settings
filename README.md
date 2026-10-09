@@ -35,6 +35,15 @@ Per repo, according to `fleet.yml`:
   record but is **reported-only** — GitHub exposes no API for it at any scope,
   so the engine always reports it `skipped` and names the manual UI path
   instead of pretending it converged.
+- **Actions event policies** (`actions_policies`, per-repo only) — repository
+  Actions policies that restrict which events may trigger a workflow. The one
+  use is adam-agentskills' `plugin-runtime-review.yml`, which triggers only on
+  `pull_request_target` and publishes a required check; GitHub blocks that event
+  on public repos by default from 2026-11-02 unless a policy allows it
+  ([ADR 0009](docs/decisions/0009-allow-pull-request-target-with-a-workflow-scoped-policy-owned-by-name.md)).
+  Policies are matched by name and the engine owns only the names `fleet.yml`
+  declares. They need the repository Administration permission, which the
+  fan-out App already holds.
 
 Private repos get SHA pinning + `repo.allow_auto_merge` — the API rejects
 fork-PR approval (422) and rulesets (403, needs GitHub Pro); the engine logs an
