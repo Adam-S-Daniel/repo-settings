@@ -66,7 +66,7 @@ environment variable. Writing these settings requires repo-admin (a fine-grained
 PAT with "Administration: read and write", a classic PAT with `repo` scope, or a
 GitHub App token). The default Actions `GITHUB_TOKEN` cannot change repo settings.
 
-Config schema: see ../assets/repo-settings.schema.md. Two shapes are accepted:
+Config schema: see ../repo-settings/schema.md. Two shapes are accepted:
 
   * Single-repo -- top-level `actions:` / `ruleset:` blocks, plus an optional
     top-level `repo:` key that is EITHER the identifier string `owner/name`
