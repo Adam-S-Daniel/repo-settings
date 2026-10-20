@@ -453,9 +453,15 @@ repos:
   #     already carried a hand-applied "default branch protection" ruleset
   #     (managed in place by name from here on). ---
   - name: Adam-S-Daniel/wsl-automation
-  # required_status_checks: [pester] -- see the cms-platform#437 comment
-  # above Adam-S-Daniel/skills-evals for the preconditions and why this one
-  # waits for its own always-run/early-skip PR before it can be listed here.
+    # All three CI jobs are required. Preconditions (cms-platform#437 comment
+    # above Adam-S-Daniel/skills-evals) checked against
+    # https://github.com/Adam-S-Daniel/wsl-automation/pull/58, which must merge
+    # FIRST: no on.paths (each job decides salience in an early step and still
+    # reports), plain job ids with no name/matrix, no concurrency, no
+    # timeout-minutes; tests/CiWorkflow.Tests.ps1 there keeps it that way.
+    overrides:
+      ruleset:
+        required_status_checks: [shell, test, test-linux]
   - name: Adam-S-Daniel/fastmail-actions
     overrides:
       ruleset:
