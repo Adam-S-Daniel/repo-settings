@@ -77,12 +77,13 @@ def pull_request_jobs():
 
 
 def required_checks():
-    with open(FLEET, encoding="utf-8") as fh:
-        cfg = yaml.safe_load(fh)
+    cfg = rs.load_config(str(FLEET))
     targets = [t for t in rs.resolve_targets(cfg, None) if t["repo"] == THIS_REPO]
     if len(targets) != 1:
         raise AssertionError(f"{THIS_REPO} appears {len(targets)} times in fleet.yml")
-    ruleset = targets[0]["settings"].get("ruleset")
+    # The effective settings: what the engine would plan, so a `manage` that
+    # leaves the ruleset out reads as "no ruleset" and fails, not as a pass.
+    ruleset = targets[0]["effective"].get("ruleset")
     if not ruleset:
         raise AssertionError(f"{THIS_REPO} resolves with no ruleset")
     checks = ruleset.get("required_status_checks")

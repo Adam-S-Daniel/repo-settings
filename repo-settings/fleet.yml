@@ -39,7 +39,7 @@ defaults:
     # is the only form that works anywhere in the fleet.
     #
     # NOT fleet-wide in practice: the three cms-platform-managed repos
-    # (cms-platform, adamdaniel.ai, jodidaniel.com) carry `manage: false`
+    # (cms-platform, adamdaniel.ai, jodidaniel.com) carry `manage: []`
     # below, so this never reaches them. That is deliberate and load-bearing,
     # not an oversight — their Decap publish chain arms SQUASH auto-merge on
     # every editorial PR, and squash is what collapses an editor's many
@@ -68,7 +68,7 @@ defaults:
     # 2026-09-15). Its merge subjects switch from `Merge pull request` to PR
     # titles between 2026-04-29 and 2026-05-11, before this file existed, and no
     # reason is recorded in its docs, its history or here. Every other repo --
-    # the three `manage: false` cms-platform repos included, which this never
+    # the three `manage: []` cms-platform repos included, which this never
     # reaches -- was already on MERGE_MESSAGE/PR_TITLE, so declaring it changes
     # agentskills alone.
     #
@@ -105,7 +105,7 @@ defaults:
     #
     # NOT plan-gated, unlike allow_auto_merge above: GitHub honours this on
     # private repos too, so no downgrade/skip handling is needed. It does NOT
-    # reach the three cms-platform-managed repos, which carry `manage: false`
+    # reach the three cms-platform-managed repos, which carry `manage: []`
     # below and are governed by cms-platform's own repo-settings.yml.
     delete_branch_on_merge: true
   actions:
@@ -158,7 +158,7 @@ defaults:
     # through the web UI (repo Settings -> Code security & analysis) -- there
     # is no field for it anywhere in `security_and_analysis` on the repos API,
     # and no field for it in org/enterprise code-security configurations
-    # either (which are org-scoped anyway, so unreachable for the 18 fleet
+    # either (which are org-scoped anyway, so unreachable for the fleet
     # repos that sit under a user account, not an org). Verified against
     # GitHub's own REST reference, not inferred from a failed call --
     # `integrations/terraform-provider-github` issue 3334 is the open
@@ -285,28 +285,29 @@ defaults:
 # reviews while it has it.
 
 # WHAT THIS LIST IS, AND THE TWO SETS IT IS NOT. It is what this file DECLARES:
-# 23 entries as of 2026-10-03 (ai-usage-dashboard added to the 22 of
-# 2026-09-24, where adam-agentskills was added and agentskills-private
-# renamed to adam-agentskills-private in place). The engine MANAGES 17 of
-# them -- six carry `manage: false`, and
-# cmd_diff/cmd_apply skip those before planning anything. The App's REACH is
-# wider than either: both installations are on "All repositories" (owner,
-# 2026-08-29), so the credential this file drives can administer every repo in
-# both accounts, listed here or not. Declared and in-account were equal on
-# 2026-08-29 (21 = 21); the additions since (adam-agentskills, ai-usage-dashboard) have
-# not yet been re-verified against the account listing -- run `repo_settings.py coverage` per owner
-# before trusting that equality again. Nothing here compares them itself: the
-# engine never enumerates an account, it only reads this list.
+# every element names one repo. Each element's `manage` says which surfaces
+# the engine MANAGES there: `["all"]` is every surface, including any the
+# engine adds later; `[]` declares the repo and manages nothing, and
+# cmd_diff/cmd_apply skip it before planning anything. `manage` is required:
+# an omitted one is refused rather than defaulted (schema.md, "manage";
+# docs/decisions/0011). No counts here on purpose -- hand-kept ones drifted;
+# count the elements, or read `coverage`'s summary line.
+#
+# The App's REACH is wider than either set: both installations are on "All
+# repositories" (owner, 2026-08-29), so the credential this file drives can
+# administer every repo in both accounts, listed here or not. Nothing here
+# compares the two; `repo_settings.py coverage` does, per owner, and the weekly
+# workflow files an issue naming any repo this file does not declare.
 repos:
   # --- public, ruleset-safe (adversarially verified: no workflow pushes to main) ---
   # RETIRED: superseded by Adam-S-Daniel/adam-agentskills below. The owner
-  # made this repo private and archived it; `manage: false` keeps it declared
+  # made this repo private and archived it; `manage: []` keeps it declared
   # (so `coverage` still counts it) while the engine stops planning changes
   # against an archived repo, whose settings API calls would fail.
   # Its former required check (`pytest-windows`) and the preconditions
   # recorded for it now live on the adam-agentskills entry.
   - name: Adam-S-Daniel/agentskills
-    manage: false
+    manage: []
   # adam-agentskills: the new public skills registry replacing agentskills
   # above. Same policy shape as agentskills (PR-only default branch, merge
   # commits only, SHA pinning, fork-PR approval) via the shared `defaults:`
@@ -354,6 +355,7 @@ repos:
   # trigger, list it here too or its runs are blocked. Why, and the fallback if
   # GitHub still shows the warning: docs/decisions/0009.
   - name: Adam-S-Daniel/adam-agentskills
+    manage: ["all"]
     overrides:
       ruleset:
         required_status_checks: [privacy, pytest, pytest-windows, plugin-runtime-approval, agent-checks]
@@ -411,6 +413,7 @@ repos:
   # that moment, whose head predates the check existing, needs "Update
   # branch" before the new required context can report on it at all.
   - name: Adam-S-Daniel/skills-evals
+    manage: ["all"]
     overrides:
       ruleset:
         required_status_checks: [test, agent-checks]
@@ -461,19 +464,23 @@ repos:
           target_branches: ["persistent/**"]
           rules: [deletion]
   - name: Adam-S-Daniel/claude-memory-map
+    manage: ["all"]
     overrides:
       ruleset:
         required_status_checks: [test, agent-checks]
   - name: jodidaniel/squarespacetemp
+    manage: ["all"]
   # --- onboarded 2026-07-21 after the same audit: all workflows contents:read,
   #     no pushes to the default branch, every action SHA-pinned. wsl-automation
   #     already carried a hand-applied "default branch protection" ruleset
   #     (managed in place by name from here on). ---
   - name: Adam-S-Daniel/wsl-automation
+    manage: ["all"]
   # required_status_checks: [pester] -- see the cms-platform#437 comment
   # above Adam-S-Daniel/skills-evals for the preconditions and why this one
   # waits for its own always-run/early-skip PR before it can be listed here.
   - name: Adam-S-Daniel/fastmail-actions
+    manage: ["all"]
     overrides:
       ruleset:
         required_status_checks: [pester, agent-checks]
@@ -500,6 +507,7 @@ repos:
   # unprotected main lets any push-capable token publish arbitrary JS on the
   # owner's github.io origin.
   - name: Adam-S-Daniel/ai-usage-dashboard
+    manage: ["all"]
     overrides:
       ruleset:
         required_status_checks: [node-test, pester, agent-checks]
@@ -512,12 +520,13 @@ repos:
   # ARCHIVED (found 2026-10-08): GitHub refuses settings changes on an
   # archived repo, so the 2026-10-08 apply failed on
   # security.vulnerability_alerts ("Failed to change dependabot alerts
-  # status"). `manage: false` keeps it declared (so `coverage` still counts
+  # status"). `manage: []` keeps it declared (so `coverage` still counts
   # it) while the engine stops planning changes against it, as for the
-  # retired agentskills entry. The overrides below stay as the record of its
-  # policy if it is ever unarchived.
+  # retired agentskills entry. The overrides below are kept ON PURPOSE, as
+  # the record of its policy if it is ever unarchived: the engine still
+  # validates them, and plans none of them while `manage` is `[]`.
   - name: Adam-S-Daniel/GHA-bench
-    manage: false
+    manage: []
     overrides:
       ruleset:
         required_status_checks: [test]
@@ -535,6 +544,7 @@ repos:
   # required_status_checks: [test] -- see the cms-platform#437 comment above
   # Adam-S-Daniel/skills-evals for the preconditions checked 2026-09-15.
   - name: Adam-S-Daniel/_agent-guidance
+    manage: ["all"]
     overrides:
       ruleset:
         required_status_checks: [test, agent-checks]
@@ -559,16 +569,20 @@ repos:
   #     False seven minutes later, while a public repo in the same run stuck.
   #     See schema.md, "Downgrade behavior". ---
   - name: Adam-S-Daniel/rss-inator
+    manage: ["all"]
   - name: Adam-S-Daniel/jc
+    manage: ["all"]
   # Renamed from Adam-S-Daniel/agentskills-private 2026-09-24 (companion
   # private repo to the new adam-agentskills public registry above). GitHub
   # redirects the old name, but the engine keys targets by name verbatim, so
   # this file has to track the rename rather than rely on the redirect.
   - name: Adam-S-Daniel/adam-agentskills-private
+    manage: ["all"]
   - name: Adam-S-Daniel/4A
+    manage: ["all"]
 
   # --- this repo, managing itself. Previously absent from this list entirely --
-  #     not even a `manage: false` entry -- so the repo that holds the
+  #     not even as an excluded element -- so the repo that holds the
   #     Administration-write App credentials was the one repo the engine never
   #     touched, and no drift on it was reportable.
   #
@@ -589,6 +603,7 @@ repos:
   #     dependabot-auto-merge.yml, and none runs `git push` -- its merges go
   #     through `gh pr merge`, which a PR-required ruleset permits. ---
   - name: Adam-S-Daniel/repo-settings
+    manage: ["all"]
     overrides:
       ruleset:
         # why: the fleet rule makes every CI job on pull requests a required
@@ -605,24 +620,27 @@ repos:
 
   # --- scratch/experimental: Actions hardening only, no ruleset ---
   - name: Adam-S-Daniel/scratch-jules-001
+    manage: ["all"]
     overrides: { ruleset: { enabled: false } }
   - name: Adam-S-Daniel/scratch-claude-001
+    manage: ["all"]
     overrides: { ruleset: { enabled: false } }
   - name: jodidaniel/scratch-claude-002
+    manage: ["all"]
     overrides: { ruleset: { enabled: false } }
 
   # --- forks: excluded (upstream workflows should not be hardened downstream) ---
   - name: Adam-S-Daniel/OctopusDeploy-Api
-    manage: false
+    manage: []
   - name: Adam-S-Daniel/SonosAmpJuicePi
-    manage: false
+    manage: []
 
   # --- cms-platform + consumers: owned by the platform's OWN settings-as-code
   #     (repo-settings.yml manifest + rulesets). Excluded to avoid a competing
   #     source of truth (GitHub enforces the union of rulesets). ---
   - name: Adam-S-Daniel/cms-platform
-    manage: false
+    manage: []
   - name: Adam-S-Daniel/adamdaniel.ai
-    manage: false
+    manage: []
   - name: jodidaniel/jodidaniel.com
-    manage: false
+    manage: []
