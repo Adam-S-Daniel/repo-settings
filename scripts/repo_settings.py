@@ -1998,7 +1998,15 @@ def _filter_owner(targets: list[dict], owner: str | None) -> list[dict]:
 
 
 def installation_repos(owner: str | None) -> list[str]:
-    """Every repository this credential can administer, as `owner/name`.
+    """Every repository this credential can administer, as `owner/name`."""
+    return sorted(installation_repo_visibility(owner))
+
+
+def installation_repo_visibility(owner: str | None) -> dict[str, bool]:
+    """Every repository this credential can administer, as `owner/name` mapped
+    to whether it is private. A response missing `private` counts as private:
+    withholding a name wrongly costs a local re-run, publishing one cannot be
+    undone.
 
     `/installation/repositories` rather than `/users/{o}/repos` or
     `/orgs/{o}/repos`, for three reasons and the third is the one that matters:
@@ -2009,7 +2017,7 @@ def installation_repos(owner: str | None) -> list[str]:
     and reporting those as "undeclared" would be reporting a gap nothing in
     this repo could close.
     """
-    repos: list[str] = []
+    repos: dict[str, bool] = {}
     page = 1
     while True:
         # `gh api` follows no pagination of its own here because the response
@@ -2018,14 +2026,15 @@ def installation_repos(owner: str | None) -> list[str]:
         chunk = (payload or {}).get("repositories") or []
         if not chunk:
             break
-        repos.extend(r["full_name"] for r in chunk)
+        for r in chunk:
+            repos[r["full_name"]] = bool(r.get("private", True))
         if len(chunk) < 100:
             break
         page += 1
     if owner:
         o = owner.lower()
-        repos = [r for r in repos if r.split("/", 1)[0].lower() == o]
-    return sorted(repos)
+        repos = {n: v for n, v in repos.items() if n.split("/", 1)[0].lower() == o}
+    return repos
 
 
 def cmd_coverage(args) -> int:
@@ -2044,6 +2053,13 @@ def cmd_coverage(args) -> int:
     when the question could not be asked -- never 0 on an enumeration that
     failed, because a clean line over zero repos reads exactly like a clean
     line over all of them.
+
+    The output goes to a public CI log and into an auto-filed issue, so the
+    name of an undeclared PRIVATE repo is withheld (a count is printed) unless
+    `--show-private` is passed, which is for local use only. Declared private
+    repos are still named: `fleet.yml` is in this repo and already names them,
+    so printing them adds no exposure. Only undeclared private names are new
+    information.
     """
     cfg = load_config(args.config)
     if "repos" not in cfg:
@@ -2054,7 +2070,9 @@ def cmd_coverage(args) -> int:
         return 2
 
     declared = {t["repo"].lower(): t for t in resolve_targets(cfg, None)}
-    reachable = installation_repos(getattr(args, "owner", None))
+    visibility = installation_repo_visibility(getattr(args, "owner", None))
+    reachable = sorted(visibility)
+    show_private = getattr(args, "show_private", False)
     if not reachable:
         sys.stderr.write(
             "coverage: the installation reported no repositories -- refusing to "
@@ -2063,14 +2081,23 @@ def cmd_coverage(args) -> int:
         return 2
 
     undeclared = [r for r in reachable if r.lower() not in declared]
+    withheld = 0
     for repo in reachable:
         t = declared.get(repo.lower())
-        if t is None:
+        if t is None and visibility[repo] and not show_private:
+            withheld += 1
+        elif t is None:
             print(f"UNDECLARED  {repo}: reachable by this credential, absent from the config")
         elif not t["manage"]:
             print(f"OK          {repo}: declared, manage: false")
         else:
             print(f"OK          {repo}: declared and managed")
+
+    if withheld:
+        print(
+            f"UNDECLARED (private)  {withheld} undeclared private repo(s); "
+            "names withheld because this log is public"
+        )
 
     print(
         f"\n{len(reachable)} reachable, {len(reachable) - len(undeclared)} declared, "
@@ -2149,6 +2176,12 @@ def main() -> int:
     )
     c.add_argument("--config", required=True)
     c.add_argument("--owner", help="only consider repos under this owner (account)")
+    c.add_argument(
+        "--show-private",
+        action="store_true",
+        help="name undeclared PRIVATE repos too; local use only, never in CI "
+        "(the log and the nudge issue are public)",
+    )
     c.set_defaults(func=cmd_coverage)
 
     args = p.parse_args()

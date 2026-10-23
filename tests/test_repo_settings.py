@@ -1516,13 +1516,17 @@ class CoverageTests(unittest.TestCase):
         ],
     }
 
-    def _run(self, reachable, owner=None):
-        args = argparse.Namespace(config="ignored.yml", owner=owner)
-        with patch.object(rs, "load_config", return_value=self.CFG), \
-             patch.object(rs, "installation_repos", return_value=reachable):
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+    def _run(self, reachable, owner=None, private=(), show_private=False, cfg=None):
+        args = argparse.Namespace(
+            config="ignored.yml", owner=owner, show_private=show_private
+        )
+        visibility = {r: r in private for r in reachable}
+        with patch.object(rs, "load_config", return_value=cfg or self.CFG), \
+             patch.object(rs, "installation_repo_visibility", return_value=visibility):
+            buf, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
                 rc = rs.cmd_coverage(args)
+        self.last_stderr = err.getvalue()
         return rc, buf.getvalue()
 
     def test_every_reachable_repo_declared_is_clean(self):
@@ -1555,9 +1559,9 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(rc, 2)
 
     def test_a_single_repo_config_has_no_fleet_to_be_complete_about(self):
-        args = argparse.Namespace(config="ignored.yml", owner=None)
+        args = argparse.Namespace(config="ignored.yml", owner=None, show_private=False)
         with patch.object(rs, "load_config", return_value={"repo": "acme/one"}), \
-             patch.object(rs, "installation_repos") as enumerate_mock:
+             patch.object(rs, "installation_repo_visibility") as enumerate_mock:
             with contextlib.redirect_stderr(io.StringIO()):
                 rc = rs.cmd_coverage(args)
         self.assertEqual(rc, 2)
@@ -1571,6 +1575,80 @@ class CoverageTests(unittest.TestCase):
         rc, out = self._run(["ACME/Declared-Managed", "acme/declared-unmanaged"])
         self.assertEqual(rc, 0)
         self.assertNotIn("UNDECLARED", out)
+
+    SECRET = "acme/secret-project"
+
+    def test_undeclared_private_name_is_withheld_but_counted(self):
+        rc, out = self._run(
+            ["acme/declared-managed", "acme/pub-new", self.SECRET, "acme/secret-two"],
+            private={self.SECRET, "acme/secret-two"},
+        )
+        self.assertEqual(rc, 1)
+        self.assertNotIn("secret", out + self.last_stderr)
+        self.assertIn("UNDECLARED  acme/pub-new", out)
+        self.assertIn("UNDECLARED (private)  2 undeclared private repo(s)", out)
+        self.assertIn("4 reachable, 1 declared, 3 undeclared", out)
+
+    def test_only_private_undeclared_still_exits_one(self):
+        rc, out = self._run(["acme/declared-managed", self.SECRET], private={self.SECRET})
+        self.assertEqual(rc, 1)
+        self.assertNotIn(self.SECRET, out + self.last_stderr)
+        self.assertIn("1 undeclared private repo(s)", out)
+
+    def test_show_private_names_them(self):
+        rc, out = self._run(
+            ["acme/declared-managed", self.SECRET], private={self.SECRET},
+            show_private=True,
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn(f"UNDECLARED  {self.SECRET}", out)
+        self.assertNotIn("withheld", out)
+
+    def test_declared_private_repos_are_still_named(self):
+        """fleet.yml already names them, so printing adds no exposure."""
+        rc, out = self._run(
+            ["acme/declared-managed", "acme/declared-unmanaged"],
+            private={"acme/declared-managed", "acme/declared-unmanaged"},
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("OK          acme/declared-managed", out)
+        self.assertIn("OK          acme/declared-unmanaged", out)
+
+    def test_empty_enumeration_still_exits_two_with_flag(self):
+        rc, _ = self._run([], show_private=True)
+        self.assertEqual(rc, 2)
+
+    def test_missing_private_field_is_treated_as_private(self):
+        payload = {"repositories": [{"full_name": "acme/x"}]}
+        with patch.object(rs, "gh_api", return_value=payload):
+            self.assertEqual(rs.installation_repo_visibility(None), {"acme/x": True})
+
+    def test_cli_accepts_show_private_flag(self):
+        with patch.object(sys, "argv", ["rs", "coverage", "--config", "c.yml", "--show-private"]), \
+             patch.object(rs, "cmd_coverage", return_value=0) as cmd:
+            rs.main()
+        self.assertTrue(cmd.call_args[0][0].show_private)
+
+    def test_no_workflow_step_passes_show_private(self):
+        """The log and the nudge issue are public. A step may TELL the owner
+        to pass it (inside an echo); none may run the engine with it."""
+        import yaml
+        wf_dir = Path(__file__).resolve().parent.parent / ".github" / "workflows"
+        invocations = 0
+        for wf in sorted(wf_dir.glob("*.y*ml")):
+            doc = yaml.safe_load(wf.read_text(encoding="utf-8"))
+            # PyYAML loads the bare `on:` key as boolean True; only `jobs`
+            # matters here.
+            for job in (doc.get("jobs") or {}).values():
+                for step in job.get("steps") or []:
+                    run = str(step.get("run", "")).replace("\\\n", " ")
+                    for cmd in run.splitlines():
+                        words = cmd.split()
+                        if "repo_settings.py" in cmd and words[:1] != ["echo"]:
+                            if "coverage" in words:
+                                invocations += 1
+                            self.assertNotIn("--show-private", words, (wf.name, cmd))
+        self.assertGreater(invocations, 0, "found no coverage step to check")
 
 
 class InstallationReposTests(unittest.TestCase):
