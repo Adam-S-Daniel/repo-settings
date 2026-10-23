@@ -101,13 +101,24 @@ ruleset:
   # (recommended unless you have stable, always-present check names).
   required_status_checks: []
 
-  # true  = the repo Admin role bypasses the ruleset ("always") -- the human
-  #         owner can still push directly; only non-admins (incl. the Actions
-  #         bot) are forced through PRs.
-  # false = nobody bypasses (stricter; matches the cms-platform `main` ruleset).
-  admin_bypass: true
+  # The repository Admin role's bypass. REQUIRED wherever the ruleset is
+  # enabled, after `defaults:` and a repo's `overrides:` are merged: the key
+  # grants access, so the engine has no default for it and refuses a ruleset
+  # that omits it. Exactly one of these string values:
+  #   always       = admins bypass every rule, including by pushing directly
+  #                  to the branch; only non-admins (incl. the Actions bot)
+  #                  are forced through PRs. GitHub's bypass_mode "always".
+  #   pull_request = admins can merge a PR past the rules but cannot push
+  #                  directly. GitHub's bypass_mode "pull_request".
+  #   none         = no admin bypass element is rendered; nobody bypasses
+  #                  (matches the cms-platform `main` ruleset).
+  # Any other value is refused, booleans included (`true`/`false`, and YAML
+  # 1.1's yes/no/on/off, which PyYAML loads as booleans). Under a disabled
+  # ruleset the key may be omitted; a value that is given is still checked.
+  # GitHub's own enum also has `exempt`, which this key does not accept.
+  admin_bypass: always
 
-  # Extra bypass actors beyond the Admin-role toggle above. This is the
+  # Extra bypass actors beyond the Admin-role setting above. This is the
   # sanctioned path for the RARE bot that genuinely must write to the protected
   # default branch (docs/decisions/0001): declare its service identity here so
   # the grant is auditable and drift-checked -- never hand-grant bypass in the
@@ -118,6 +129,9 @@ ruleset:
   # Omit or leave empty for no extra actors -- the default AND the policy
   # default: generated data belongs on an unprotected results branch instead.
   # In fleet configs, a defaults-level entry is reserved for fleet-standard bots.
+  # A repo's `overrides:` array REPLACES the defaults' array (arrays are not
+  # merged), so `bypass_actors: []` there drops every fleet-standard element
+  # for that repo, as repo-settings' own element does.
   bypass_actors: []
 ```
 
@@ -450,7 +464,7 @@ defaults:
       require_extra_approval_for_unattributed_changes: false
     block_force_pushes: true
     block_deletions: true
-    admin_bypass: true
+    admin_bypass: always
 
 repos:
   # Inherits everything from defaults, incl. repo.allow_auto_merge.

@@ -475,6 +475,40 @@ def _bypass_entries(actors: list | None) -> list[dict]:
     return out
 
 
+# `ruleset.admin_bypass`: each accepted value and the `bypass_mode` it gives
+# the repository Admin role (None = no admin bypass entry). GitHub's enum for
+# bypass_actors[].bypass_mode is always | pull_request | exempt, default always
+# (https://docs.github.com/en/rest/repos/rules#create-a-repository-ruleset).
+# `pull_request` lets an admin merge a pull request past the rules but not push
+# directly. The key grants access, so it is required wherever a ruleset is
+# enabled and has no default here: omitting it must not widen access
+# (_agent-guidance docs/reference/settings-schema-design.md, rule 2).
+ADMIN_BYPASS_MODES: dict[str, str | None] = {
+    "always": "always",
+    "pull_request": "pull_request",
+    "none": None,
+}
+
+
+def admin_bypass_mode(cfg: dict) -> str | None:
+    """Validate `admin_bypass` in an enabled ruleset's effective config and
+    return the admin role's bypass_mode, or None for no admin entry."""
+    accepted = " | ".join(ADMIN_BYPASS_MODES)
+    if "admin_bypass" not in cfg:
+        raise SystemExit(
+            f"error: ruleset.admin_bypass is required when the ruleset is "
+            f"enabled (accepted values: {accepted})"
+        )
+    value = cfg["admin_bypass"]
+    # isinstance first: a YAML boolean, or an unhashable value, is never one
+    # of the string keys.
+    if not isinstance(value, str) or value not in ADMIN_BYPASS_MODES:
+        raise SystemExit(
+            f"error: ruleset.admin_bypass must be one of {accepted} (got {value!r})"
+        )
+    return ADMIN_BYPASS_MODES[value]
+
+
 def build_ruleset_body(cfg: dict) -> dict:
     """Build the POST/PUT body for a desired ruleset from config."""
     name = cfg.get("name", DEFAULT_RULESET_NAME)
@@ -555,12 +589,13 @@ def build_ruleset_body(cfg: dict) -> dict:
             }
         )
     bypass: list[dict] = []
-    if cfg.get("admin_bypass", True):
+    admin_mode = admin_bypass_mode(cfg)
+    if admin_mode is not None:
         bypass.append(
             {
                 "actor_id": ADMIN_ROLE_ID,
                 "actor_type": "RepositoryRole",
-                "bypass_mode": "always",
+                "bypass_mode": admin_mode,
             }
         )
     for entry in _bypass_entries(cfg.get("bypass_actors")):
@@ -760,9 +795,16 @@ def ruleset_doc(branch_rs: dict) -> dict:
         "block_force_pushes": "non_fast_forward" in norm["rule_types"],
         "block_deletions": "deletion" in norm["rule_types"],
         "required_status_checks": norm["checks"],
-        "admin_bypass": any(
-            t == "RepositoryRole" and i == ADMIN_ROLE_ID
-            for (t, i, _m) in norm["bypass"]
+        # The admin role's live bypass_mode, or "none". A mode outside
+        # ADMIN_BYPASS_MODES (GitHub's `exempt`) is emitted as read, so the
+        # generated config fails validation rather than silently changing it.
+        "admin_bypass": next(
+            (
+                m
+                for (t, i, m) in norm["bypass"]
+                if t == "RepositoryRole" and i == ADMIN_ROLE_ID
+            ),
+            "none",
         ),
     }
     extra = [
@@ -1402,6 +1444,9 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
     if ruleset_cfg.get("enabled"):
         name = ruleset_cfg.get("name", DEFAULT_RULESET_NAME)
         plan_ruleset(name, build_ruleset_body(ruleset_cfg), normalize_ruleset)
+    elif "admin_bypass" in ruleset_cfg:
+        # Not required while disabled, but a value that is given is checked.
+        admin_bypass_mode(ruleset_cfg)
 
     # Extra named rulesets: same by-name idempotence. Removing an entry from
     # config leaves its live ruleset alone (never touches undeclared rulesets).
