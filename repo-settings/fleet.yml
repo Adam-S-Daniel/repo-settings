@@ -584,11 +584,24 @@ repos:
   #     False -> True`), so the repo enforcing SHA pinning fleet-wide was not
   #     enforcing it on itself. And it now appears in the audit at all.
   #
-  #     Ruleset-safe either way (checked 2026-08-11): all three workflows here
-  #     have `contents: read` except dependabot-auto-merge.yml, and none runs
-  #     `git push` -- its merges go through `gh pr merge`, which a PR-required
-  #     ruleset permits. ---
+  #     Ruleset-safe either way (checked 2026-08-11, rechecked for issue #86):
+  #     all five workflows here have `contents: read` except
+  #     dependabot-auto-merge.yml, and none runs `git push` -- its merges go
+  #     through `gh pr merge`, which a PR-required ruleset permits. ---
   - name: Adam-S-Daniel/repo-settings
+    overrides:
+      ruleset:
+        # why: the fleet rule makes every CI job on pull requests a required
+        # check unless AGENTS.md documents why not, so `unit` (tests.yml, which
+        # always runs on PRs) joins the fleet default `agent-checks`; the other
+        # PR jobs' exceptions are under AGENTS.md's "Repo-specific additions".
+        # NOTHING here is enforced while the repo is private: rulesets 403
+        # ("Upgrade to GitHub Pro or make this repository public") and
+        # plan_ruleset records a skip. Declared anyway per
+        # docs/decisions/0002, so enforcement needs no further change if the
+        # repo goes public or the account moves to Pro.
+        # https://github.com/Adam-S-Daniel/repo-settings/issues/86
+        required_status_checks: [agent-checks, unit]
 
   # --- scratch/experimental: Actions hardening only, no ruleset ---
   - name: Adam-S-Daniel/scratch-jules-001

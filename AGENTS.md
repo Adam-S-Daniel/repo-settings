@@ -152,3 +152,28 @@ protected branches).
   protection by hand — enumerate its rulesets and delete the strays:
   `gh api repos/<owner>/<repo>/rulesets --jq '.[] | "\(.id) \(.name)"'`.
   Deletion stays manual and deliberate; the engine will not do it for you.
+
+### Workflows and required checks
+
+The fleet rule makes every CI job that runs on pull requests a required check
+unless this file says why not
+([issue #86](https://github.com/Adam-S-Daniel/repo-settings/issues/86)).
+`tests/test_required_checks.py` enforces that against `fleet.yml` and the
+workflows: each job id in the **Job** column below that is not required in
+`fleet.yml` must stay named here, in backticks, or the test fails.
+
+**Nothing is enforced while this repo is private:** rulesets answer 403
+("Upgrade to GitHub Pro or make this repository public") and the engine records
+a skip. The required checks are declared anyway, per
+[ADR 0002](docs/decisions/0002-declare-dependabot-security-settings-including-the-unenforceable-one.md),
+so enforcement needs no further change if the repo goes public or the account
+moves to Pro.
+
+| Workflow | Job | Triggers | Salient paths | Required | Why |
+|---|---|---|---|---|---|
+| agent-checks.yml | `agent-checks` | pull_request, push (main, master), workflow_dispatch | none (always runs) | yes | The fleet default check (_agent-guidance ADR 0021). |
+| tests.yml | `unit` | pull_request, push (main) | pull_request: none, always runs; push: scripts, tests, repo-settings, workflows, dependabot.yml, requirements.txt, AGENTS.md | yes | Always runs on PRs: a required check cannot use `on.paths`, since a skipped workflow never reports and blocks the merge. No gate step: the whole job takes about 10 s, and a gate would add a way to fail open plus a second path list. |
+| repo-settings.yml | `repo-settings` (checks `repo-settings (<owner>)`) | pull_request, push (main), schedule, workflow_dispatch | fleet.yml, scripts/repo_settings.py, its own workflow, requirements.txt | no | Red by design on every PR that changes settings, because a change not yet applied is drift. Also red on every Dependabot PR, which gets no secrets (and pip bumps now touch their paths through requirements.txt). They also share the workflow-level `concurrency: repo-settings` group with the scheduled and push apply runs, so a pending PR run can be cancelled. A PR-only job that diffs just the PR's changes was considered and rejected: it would still need the App secret, which Dependabot and fork PRs don't get. |
+| dependabot-auto-merge.yml | `auto-merge` | pull_request (opened, synchronize, reopened), schedule, workflow_dispatch | none | no | A check that only Dependabot PRs trigger. It verifies that every changed path is on the manifest allowlist and merges nothing. It is skipped for every other author, and a skipped job counts as success, so requiring it would add nothing for human PRs. The sweep checks the same allowlist again before any merge. |
+| dependabot-auto-merge.yml | `sweep` | schedule, workflow_dispatch (the file also triggers on pull_request) | none | no | Schedule and dispatch only. It shows as skipped on PRs only because the workflow file also triggers on pull_request. |
+| scheduled-run-health.yml | audit | schedule, workflow_dispatch | none | no | Does not run on pull requests. |
