@@ -604,10 +604,7 @@ class FleetConfigTests(unittest.TestCase):
     FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
 
     def setUp(self):
-        import yaml
-
-        with open(self.FLEET, encoding="utf-8") as fh:
-            self.cfg = yaml.safe_load(fh)
+        self.cfg = rs.load_config(str(self.FLEET))
 
     def test_defaults_declare_unattributed_approval_off(self):
         pr = self.cfg["defaults"]["ruleset"]["require_pull_request"]
@@ -702,15 +699,12 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
     DEFAULT = ["agent-checks"]
 
     def setUp(self):
-        import yaml
-
-        with open(self.FLEET, encoding="utf-8") as fh:
-            self.cfg = yaml.safe_load(fh)
+        self.cfg = rs.load_config(str(self.FLEET))
         self.targets = {t["repo"]: t for t in rs.resolve_targets(self.cfg, None)}
 
     def test_declared_repos_declare_exactly_the_named_contexts(self):
         for repo, checks in self.EXPECTED.items():
-            settings = self.targets[repo]["settings"]
+            settings = self.targets[repo]["declared"]
             self.assertEqual(
                 (settings.get("ruleset") or {}).get("required_status_checks"),
                 checks,
@@ -721,14 +715,14 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         allowed = dict(self.EXPECTED)
         allowed.update(self.PRE_EXISTING)
         for repo, target in self.targets.items():
-            if not target["manage"]:
+            if not rs.manages(target, "ruleset"):
                 continue
-            checks = (target["settings"].get("ruleset") or {}).get(
+            checks = (target["declared"].get("ruleset") or {}).get(
                 "required_status_checks"
             )
             if repo in allowed:
                 self.assertEqual(checks, allowed[repo], msg=repo)
-            elif (target["settings"].get("ruleset") or {}).get("enabled") is False:
+            elif (target["declared"].get("ruleset") or {}).get("enabled") is False:
                 continue
             else:
                 self.assertEqual(
@@ -741,16 +735,16 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         # deep_merge REPLACES lists, so an override that forgets to repeat
         # agent-checks silently drops it for that repo.
         for repo, target in self.targets.items():
-            if not target["manage"] or repo == "Adam-S-Daniel/GHA-bench":
+            if not rs.manages(target, "ruleset") or repo == "Adam-S-Daniel/GHA-bench":
                 continue
-            ruleset = target["settings"].get("ruleset") or {}
+            ruleset = target["declared"].get("ruleset") or {}
             if ruleset.get("enabled") is False:
                 continue
             self.assertIn("agent-checks", ruleset.get("required_status_checks") or [], msg=repo)
 
     def test_each_renders_a_required_status_checks_rule_with_exactly_those_contexts(self):
         for repo, checks in self.EXPECTED.items():
-            ruleset_cfg = self.targets[repo]["settings"]["ruleset"]
+            ruleset_cfg = self.targets[repo]["declared"]["ruleset"]
             body = rs.build_ruleset_body(ruleset_cfg)
             rsc = next(
                 r for r in body["rules"] if r["type"] == "required_status_checks"
@@ -771,7 +765,7 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         # in the rendered ruleset must still be the shared fleet default,
         # not something a careless override silently dropped or reset.
         for repo in self.EXPECTED:
-            ruleset_cfg = self.targets[repo]["settings"]["ruleset"]
+            ruleset_cfg = self.targets[repo]["declared"]["ruleset"]
             body = rs.build_ruleset_body(ruleset_cfg)
             pr_params = next(
                 r["parameters"] for r in body["rules"] if r["type"] == "pull_request"
@@ -1050,14 +1044,15 @@ class SingleRepoRepoBlockTests(unittest.TestCase):
         targets = rs.resolve_targets(cfg, None)
         self.assertEqual(len(targets), 1)
         self.assertEqual(targets[0]["repo"], "o/r")
-        self.assertNotIn("repo", targets[0]["settings"])
+        self.assertNotIn("repo", targets[0]["effective"])
+        self.assertEqual(targets[0]["manage"], ["actions"])
 
     def test_repo_mapping_requires_repo_arg_for_identifier(self):
         cfg = {"repo": {"allow_auto_merge": True}}
         targets = rs.resolve_targets(cfg, "o/r")
         self.assertEqual(len(targets), 1)
         self.assertEqual(targets[0]["repo"], "o/r")
-        self.assertEqual(targets[0]["settings"]["repo"], {"allow_auto_merge": True})
+        self.assertEqual(targets[0]["effective"]["repo"], {"allow_auto_merge": True})
 
     def test_repo_mapping_without_repo_arg_raises(self):
         cfg = {"repo": {"allow_auto_merge": True}}
@@ -1077,7 +1072,10 @@ class FaultIsolationTests(unittest.TestCase):
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".yml", delete=False
         ) as fh:
-            fh.write("repos:\n  - name: o/repo1\n  - name: o/repo2\n")
+            fh.write(
+                'repos:\n  - name: o/repo1\n    manage: ["all"]\n'
+                '  - name: o/repo2\n    manage: ["all"]\n'
+            )
             config_path = fh.name
         self.addCleanup(os.remove, config_path)
         ns = argparse.Namespace(config=config_path, repo=None, owner=None)
@@ -1198,7 +1196,8 @@ class ExtraRulesetValidationTests(unittest.TestCase):
         self.assertEqual(rs.build_extra_ruleset_bodies({}), [])
 
     def test_rejected_under_defaults(self):
-        cfg = {"defaults": {"extra_rulesets": [EXTRA_CFG]}, "repos": [{"name": "o/r"}]}
+        cfg = {"defaults": {"extra_rulesets": [EXTRA_CFG]},
+               "repos": [{"name": "o/r", "manage": ["all"]}]}
         with self.assertRaises(SystemExit) as cm:
             rs.resolve_targets(cfg, None)
         self.assertIn("extra_rulesets", str(cm.exception))
@@ -1206,10 +1205,11 @@ class ExtraRulesetValidationTests(unittest.TestCase):
     def test_per_repo_override_flows_to_settings(self):
         cfg = {
             "defaults": {},
-            "repos": [{"name": "o/r", "overrides": {"extra_rulesets": [EXTRA_CFG]}}],
+            "repos": [{"name": "o/r", "manage": ["all"],
+                       "overrides": {"extra_rulesets": [EXTRA_CFG]}}],
         }
         (t,) = rs.resolve_targets(cfg, None)
-        self.assertEqual(t["settings"]["extra_rulesets"], [EXTRA_CFG])
+        self.assertEqual(t["effective"]["extra_rulesets"], [EXTRA_CFG])
 
 
 class NormalizeExtraRulesetTests(unittest.TestCase):
@@ -1363,10 +1363,7 @@ class ExtraRulesetsFleetConfigTests(unittest.TestCase):
     FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
 
     def setUp(self):
-        import yaml
-
-        with open(self.FLEET, encoding="utf-8") as fh:
-            self.cfg = yaml.safe_load(fh)
+        self.cfg = rs.load_config(str(self.FLEET))
         self.targets = rs.resolve_targets(self.cfg, None)
 
     def test_defaults_declare_none(self):
@@ -1375,22 +1372,22 @@ class ExtraRulesetsFleetConfigTests(unittest.TestCase):
     def test_skills_evals_declares_the_roster_and_persistent_rulesets(self):
         (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/skills-evals"]
         self.assertEqual(
-            [r["name"] for r in t["settings"]["extra_rulesets"]],
+            [r["name"] for r in t["declared"]["extra_rulesets"]],
             [EXTRA_CFG["name"], "persistent branches"],
         )
-        self.assertEqual(t["settings"]["extra_rulesets"][0], EXTRA_CFG)
+        self.assertEqual(t["declared"]["extra_rulesets"][0], EXTRA_CFG)
 
     def test_skills_evals_declares_deletion_only_persistent_ruleset(self):
         # docs/decisions/0007: deletion blocked, no bypass actors.
         (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/skills-evals"]
-        bodies = {b["name"]: b for b in rs.build_extra_ruleset_bodies(t["settings"])}
+        bodies = {b["name"]: b for b in rs.build_extra_ruleset_bodies(t["declared"])}
         body = bodies["persistent branches"]
         self.assertEqual(body["conditions"]["ref_name"]["include"], ["refs/heads/persistent/**"])
         self.assertEqual(body["rules"], [{"type": "deletion"}])
         self.assertEqual(body["bypass_actors"], [])
 
     def test_only_known_repos_declare_extras(self):
-        repos = {t["repo"] for t in self.targets if t["settings"].get("extra_rulesets")}
+        repos = {t["repo"] for t in self.targets if t["declared"].get("extra_rulesets")}
         self.assertEqual(
             repos, {
                 "Adam-S-Daniel/skills-evals",
@@ -1402,7 +1399,7 @@ class ExtraRulesetsFleetConfigTests(unittest.TestCase):
     def test_agent_guidance_declares_deletion_only_persistent_ruleset(self):
         # docs/decisions/0007: deletion blocked, no bypass actors.
         (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/_agent-guidance"]
-        (body,) = rs.build_extra_ruleset_bodies(t["settings"])
+        (body,) = rs.build_extra_ruleset_bodies(t["declared"])
         self.assertEqual(body["name"], "persistent branches")
         self.assertEqual(body["conditions"]["ref_name"]["include"], ["refs/heads/persistent/**"])
         self.assertEqual(body["rules"], [{"type": "deletion"}])
@@ -1413,7 +1410,7 @@ class ExtraRulesetsFleetConfigTests(unittest.TestCase):
         # benchmark result branches persistent/benchmark-fable5 and
         # persistent/benchmark-sonnet5 are preserved results.
         (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/GHA-bench"]
-        (body,) = rs.build_extra_ruleset_bodies(t["settings"])
+        (body,) = rs.build_extra_ruleset_bodies(t["declared"])
         self.assertEqual(body["name"], "persistent branches")
         self.assertEqual(body["conditions"]["ref_name"]["include"], ["refs/heads/persistent/**"])
         self.assertEqual(body["rules"], [{"type": "deletion"}])
@@ -1421,13 +1418,13 @@ class ExtraRulesetsFleetConfigTests(unittest.TestCase):
 
     def test_every_declared_extra_builds(self):
         for t in self.targets:
-            rs.build_extra_ruleset_bodies(t["settings"])
+            rs.build_extra_ruleset_bodies(t["declared"])
 
     def test_no_extra_ruleset_bypass_beyond_the_roster_app_and_admin(self):
         # github-actions (Integration id 15368) is also the Dependabot job's
         # identity; it must never bypass the roster ruleset.
         for t in self.targets:
-            for body in rs.build_extra_ruleset_bodies(t["settings"]):
+            for body in rs.build_extra_ruleset_bodies(t["declared"]):
                 for a in body["bypass_actors"]:
                     if a["actor_type"] == "Integration":
                         self.assertEqual(a["actor_id"], ROSTER_APP_ID, msg=t["repo"])
@@ -1457,10 +1454,7 @@ class AdminBypassFleetConfigTests(unittest.TestCase):
     ]
 
     def setUp(self):
-        import yaml
-
-        with open(self.FLEET, encoding="utf-8") as fh:
-            self.cfg = yaml.safe_load(fh)
+        self.cfg = rs.load_config(str(self.FLEET))
         self.targets = {t["repo"]: t for t in rs.resolve_targets(self.cfg, None)}
 
     def test_defaults_declare_always(self):
@@ -1468,13 +1462,13 @@ class AdminBypassFleetConfigTests(unittest.TestCase):
 
     def test_every_enabled_ruleset_has_a_valid_admin_bypass(self):
         for repo, t in self.targets.items():
-            ruleset = t["settings"].get("ruleset") or {}
+            ruleset = t["declared"].get("ruleset") or {}
             if ruleset.get("enabled"):
                 with self.subTest(repo=repo):
                     self.assertIn(ruleset.get("admin_bypass"), rs.ADMIN_BYPASS_MODES)
 
     def test_repo_settings_has_no_always_bypass_of_any_kind(self):
-        settings = self.targets[self.SELF]["settings"]
+        settings = self.targets[self.SELF]["declared"]
         self.assertTrue(settings["ruleset"]["enabled"])
         bodies = [rs.build_ruleset_body(settings["ruleset"])]
         bodies += rs.build_extra_ruleset_bodies(settings)
@@ -1490,7 +1484,7 @@ class AdminBypassFleetConfigTests(unittest.TestCase):
     def test_other_repos_render_the_pre_migration_bypass(self):
         checked = 0
         for repo, t in self.targets.items():
-            ruleset = t["settings"].get("ruleset") or {}
+            ruleset = t["declared"].get("ruleset") or {}
             if repo == self.SELF or not ruleset.get("enabled"):
                 continue
             with self.subTest(repo=repo):
@@ -1615,7 +1609,8 @@ class BypassUnknownTests(unittest.TestCase):
                             return live
                         raise AssertionError(path)
 
-                    targets = [{"repo": "o/r", "manage": True, "settings": settings}]
+                    targets = [{"repo": "o/r", "manage": ["all"],
+                                "declared": settings, "effective": settings}]
                     args = argparse.Namespace(config="unused", repo=None, owner=None,
                                               dry_run=dry_run)
                     out = io.StringIO()
@@ -1691,10 +1686,7 @@ class BypassModeFleetMigrationTests(unittest.TestCase):
                 yield from self._bypass_lists(value, f"{path}[{i}]")
 
     def test_every_bypass_actor_in_fleet_yml_sets_a_valid_mode(self):
-        import yaml
-
-        with open(self.FLEET, encoding="utf-8") as fh:
-            cfg = yaml.safe_load(fh)
+        cfg = rs.load_config(str(self.FLEET))
         elements = 0
         for path, actors in self._bypass_lists(cfg):
             self.assertIsInstance(actors, list, path)
@@ -1715,7 +1707,7 @@ class CoverageTests(unittest.TestCase):
     """`coverage` answers a question no other command asks: which repos this
     credential can administer that the config never mentions.
 
-    Declared, not managed. A repo carrying `manage: false` is a decision
+    Declared, not managed. A repo carrying `manage: []` is a decision
     somebody wrote down; a repo absent from the file is a decision nobody has
     made, and from the outside those looked identical.
     """
@@ -1723,8 +1715,8 @@ class CoverageTests(unittest.TestCase):
     CFG = {
         "defaults": {},
         "repos": [
-            {"name": "acme/declared-managed"},
-            {"name": "acme/declared-unmanaged", "manage": False},
+            {"name": "acme/declared-managed", "manage": ["all"]},
+            {"name": "acme/declared-unmanaged", "manage": []},
         ],
     }
 
@@ -1745,6 +1737,7 @@ class CoverageTests(unittest.TestCase):
         rc, out = self._run(["acme/declared-managed", "acme/declared-unmanaged"])
         self.assertEqual(rc, 0)
         self.assertNotIn("UNDECLARED", out)
+        self.assertIn("OK          acme/declared-managed: declared, managed: all", out)
         self.assertIn("2 reachable, 2 declared, 0 undeclared", out)
 
     def test_an_undeclared_repo_is_reported_and_exits_one(self):
@@ -1755,13 +1748,13 @@ class CoverageTests(unittest.TestCase):
         self.assertIn("UNDECLARED  acme/brand-new", out)
         self.assertIn("3 reachable, 2 declared, 1 undeclared", out)
 
-    def test_manage_false_is_declared_not_undeclared(self):
+    def test_manage_empty_is_declared_not_undeclared(self):
         """The whole distinction. A repo deliberately left unmanaged has been
         decided about, and reporting it would train the reader to ignore the
         report -- which is how a nudge stops being a nudge."""
         rc, out = self._run(["acme/declared-unmanaged"])
         self.assertEqual(rc, 0)
-        self.assertIn("declared, manage: false", out)
+        self.assertIn("OK          acme/declared-unmanaged: declared, excluded (manage: [])", out)
         self.assertNotIn("UNDECLARED", out)
 
     def test_an_empty_enumeration_refuses_rather_than_certifying(self):
@@ -2251,10 +2244,7 @@ class SecurityFleetConfigTests(unittest.TestCase):
     FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
 
     def setUp(self):
-        import yaml
-
-        with open(self.FLEET, encoding="utf-8") as fh:
-            self.cfg = yaml.safe_load(fh)
+        self.cfg = rs.load_config(str(self.FLEET))
 
     def test_defaults_declare_all_three_security_settings_true(self):
         security = self.cfg["defaults"]["security"]
@@ -2269,9 +2259,9 @@ class SecurityFleetConfigTests(unittest.TestCase):
         # MANAGED repo carries all three, not just that defaults: declares
         # them once at the top of the file.
         for target in rs.resolve_targets(self.cfg, None):
-            if not target["manage"]:
+            if not rs.manages(target, "security"):
                 continue
-            security = target["settings"].get("security") or {}
+            security = target["effective"].get("security") or {}
             self.assertIn("vulnerability_alerts", security, msg=target["repo"])
             self.assertIn("automated_security_fixes", security, msg=target["repo"])
             self.assertIn("grouped_security_updates", security, msg=target["repo"])
@@ -2476,11 +2466,10 @@ class WorkflowPermissionsFleetConfigTests(unittest.TestCase):
     MAY_APPROVE = {"Adam-S-Daniel/skills-evals"}
 
     def setUp(self):
-        import yaml
-
-        with open(self.FLEET, encoding="utf-8") as fh:
-            self.cfg = yaml.safe_load(fh)
-        self.targets = [t for t in rs.resolve_targets(self.cfg, None) if t["manage"]]
+        self.cfg = rs.load_config(str(self.FLEET))
+        self.targets = [
+            t for t in rs.resolve_targets(self.cfg, None) if rs.manages(t, "actions")
+        ]
 
     def test_approving_repos_require_no_approving_reviews(self):
         # With can_approve_pull_request_reviews true, GITHUB_TOKEN can submit an
@@ -2488,17 +2477,17 @@ class WorkflowPermissionsFleetConfigTests(unittest.TestCase):
         # approvals; raising the count (or requiring approval for unattributed
         # changes) must revisit the setting first (ADR 0008).
         for t in self.targets:
-            if t["settings"]["actions"]["can_approve_pull_request_reviews"] is not True:
+            if t["effective"]["actions"]["can_approve_pull_request_reviews"] is not True:
                 continue
-            pr = t["settings"]["ruleset"]["require_pull_request"]
+            pr = t["effective"]["ruleset"]["require_pull_request"]
             self.assertEqual(pr["required_approving_review_count"], 0, msg=t["repo"])
             self.assertIs(pr["require_extra_approval_for_unattributed_changes"], False,
                           msg=t["repo"])
 
     def test_skills_evals_override_keeps_the_other_workflow_permission_default(self):
         (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/skills-evals"]
-        self.assertEqual(t["settings"]["actions"]["default_workflow_permissions"], "read")
-        self.assertIs(t["settings"]["actions"]["can_approve_pull_request_reviews"], True)
+        self.assertEqual(t["effective"]["actions"]["default_workflow_permissions"], "read")
+        self.assertIs(t["effective"]["actions"]["can_approve_pull_request_reviews"], True)
 
     def test_defaults_declare_read_and_no_pr_approval(self):
         actions = self.cfg["defaults"]["actions"]
@@ -2508,13 +2497,13 @@ class WorkflowPermissionsFleetConfigTests(unittest.TestCase):
     def test_no_managed_repo_may_approve(self):
         allowed = {
             t["repo"] for t in self.targets
-            if t["settings"]["actions"]["can_approve_pull_request_reviews"] is True
+            if t["effective"]["actions"]["can_approve_pull_request_reviews"] is True
         }
         self.assertEqual(allowed, self.MAY_APPROVE)
 
     def test_every_managed_repo_declares_both_fields(self):
         for t in self.targets:
-            actions = t["settings"]["actions"]
+            actions = t["effective"]["actions"]
             self.assertIn(actions.get("default_workflow_permissions"), ("read", "write"),
                           msg=t["repo"])
             self.assertIsInstance(actions.get("can_approve_pull_request_reviews"), bool,
@@ -2565,37 +2554,41 @@ class LabelSpecTests(unittest.TestCase):
     DEFAULT = {"name": "agent-authored", "color": "D4C5F9"}
 
     def test_default_labels_reach_a_repo_with_none_of_its_own(self):
-        cfg = {"defaults": {"labels": [self.DEFAULT]}, "repos": [{"name": "o/r"}, "o/s"]}
+        cfg = {"defaults": {"labels": [self.DEFAULT]},
+               "repos": [{"name": "o/r", "manage": ["all"]},
+                         {"name": "o/s", "manage": ["labels"]}]}
         for t in rs.resolve_targets(cfg, None):
-            self.assertEqual(t["settings"]["labels"], [self.DEFAULT])
+            self.assertEqual(t["effective"]["labels"], [self.DEFAULT])
 
     def test_default_labels_merge_with_repo_labels(self):
         cfg = {"defaults": {"labels": [self.DEFAULT]},
-               "repos": [{"name": "o/r", "overrides": {"labels": [self.CFG]}}]}
+               "repos": [{"name": "o/r", "manage": ["all"], "overrides": {"labels": [self.CFG]}}]}
         (t,) = rs.resolve_targets(cfg, None)
-        self.assertEqual(t["settings"]["labels"], [self.DEFAULT, self.CFG])
+        self.assertEqual(t["effective"]["labels"], [self.DEFAULT, self.CFG])
 
     def test_repo_label_wins_a_name_clash_case_insensitively(self):
         mine = {"name": "Agent-Authored", "color": "000000"}
         cfg = {"defaults": {"labels": [self.DEFAULT]},
-               "repos": [{"name": "o/r", "overrides": {"labels": [mine]}}]}
+               "repos": [{"name": "o/r", "manage": ["all"], "overrides": {"labels": [mine]}}]}
         (t,) = rs.resolve_targets(cfg, None)
-        self.assertEqual(t["settings"]["labels"], [mine])
+        self.assertEqual(t["effective"]["labels"], [mine])
 
     def test_merging_does_not_mutate_the_defaults(self):
         cfg = {"defaults": {"labels": [self.DEFAULT]},
-               "repos": [{"name": "o/r", "overrides": {"labels": [self.CFG]}}]}
+               "repos": [{"name": "o/r", "manage": ["all"], "overrides": {"labels": [self.CFG]}}]}
         rs.resolve_targets(cfg, None)
         self.assertEqual(cfg["defaults"]["labels"], [self.DEFAULT])
 
     def test_a_repo_override_carries_labels(self):
-        cfg = {"defaults": {}, "repos": [{"name": "o/r", "overrides": {"labels": [self.CFG]}}]}
+        cfg = {"defaults": {}, "repos": [{"name": "o/r", "manage": ["all"],
+                                          "overrides": {"labels": [self.CFG]}}]}
         (t,) = rs.resolve_targets(cfg, None)
-        self.assertEqual(t["settings"]["labels"], [self.CFG])
+        self.assertEqual(t["effective"]["labels"], [self.CFG])
 
     def test_single_repo_shape_carries_labels(self):
         (t,) = rs.resolve_targets({"repo": "o/r", "labels": [self.CFG]}, None)
-        self.assertEqual(t["settings"]["labels"], [self.CFG])
+        self.assertEqual(t["effective"]["labels"], [self.CFG])
+        self.assertEqual(t["manage"], ["labels"])
 
 
 class LabelPlanTests(unittest.TestCase):
@@ -2698,7 +2691,7 @@ class LabelPlanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             cfg = Path(d) / "c.yml"
             cfg.write_text(
-                "defaults: {}\nrepos:\n  - name: o/r\n    overrides:\n      labels:\n"
+                'defaults: {}\nrepos:\n  - name: o/r\n    manage: ["all"]\n    overrides:\n      labels:\n'
                 "        - {name: eval-scaffold, color: C5DEF5}\n",
                 encoding="utf-8",
             )
@@ -2723,10 +2716,7 @@ class LabelsFleetConfigTests(unittest.TestCase):
     FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
 
     def setUp(self):
-        import yaml
-
-        with open(self.FLEET, encoding="utf-8") as fh:
-            self.cfg = yaml.safe_load(fh)
+        self.cfg = rs.load_config(str(self.FLEET))
         self.targets = rs.resolve_targets(self.cfg, None)
 
     AGENT = {"name": "agent-authored", "color": "d4c5f9",
@@ -2736,8 +2726,20 @@ class LabelsFleetConfigTests(unittest.TestCase):
         self.assertEqual(rs.build_label_specs(self.cfg["defaults"]), [self.AGENT])
 
     def test_every_managed_repo_gets_the_agent_authored_label(self):
-        for t in self.targets:
-            self.assertIn(self.AGENT, rs.build_label_specs(t["settings"]), msg=t["repo"])
+        managed = [t for t in self.targets if rs.manages(t, "labels")]
+        self.assertTrue(managed)
+        for t in managed:
+            self.assertIn(self.AGENT, rs.build_label_specs(t["effective"]), msg=t["repo"])
+
+    def test_an_excluded_repo_is_given_no_labels(self):
+        # Behavior, not shape: a `manage: []` repo plans nothing, so the
+        # fleet-wide label must not reach its effective settings.
+        excluded = [
+            t for t in self.targets if not any(rs.manages(t, x) for x in rs.SURFACES)
+        ]
+        self.assertTrue(excluded)
+        for t in excluded:
+            self.assertEqual(rs.build_label_specs(t["effective"]), [], msg=t["repo"])
 
     def test_only_skills_evals_declares_its_own_labels(self):
         own = {e["name"] for e in self.cfg["repos"]
@@ -2747,7 +2749,7 @@ class LabelsFleetConfigTests(unittest.TestCase):
     def test_skills_evals_declares_the_scaffold_label(self):
         (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/skills-evals"]
         self.assertEqual(
-            rs.build_label_specs(t["settings"]),
+            rs.build_label_specs(t["effective"]),
             [self.AGENT,
              {"name": "eval-scaffold", "color": "c5def5",
               "description": "Draft real-work fixture opened by the scaffold gate"}],
@@ -3141,7 +3143,8 @@ class ActionsPolicyApplyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             cfg = Path(d) / "c.yml"
             cfg.write_text(
-                "defaults: {}\nrepos:\n  - name: o/r\n    overrides:\n      actions_policies:\n"
+                'defaults: {}\nrepos:\n  - name: o/r\n    manage: ["all"]\n'
+                "    overrides:\n      actions_policies:\n"
                 "        - name: p\n          workflow_paths: {include: [a.yml]}\n"
                 "          allowed_events: [pull_request_target]\n",
                 encoding="utf-8",
@@ -3252,23 +3255,20 @@ class ActionsPoliciesFleetConfigTests(unittest.TestCase):
     FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
 
     def setUp(self):
-        import yaml
-
-        with open(self.FLEET, encoding="utf-8") as fh:
-            self.cfg = yaml.safe_load(fh)
+        self.cfg = rs.load_config(str(self.FLEET))
         self.targets = rs.resolve_targets(self.cfg, None)
 
     def test_defaults_declare_none(self):
         self.assertNotIn("actions_policies", self.cfg["defaults"])
 
     def test_only_adam_agentskills_declares_policies(self):
-        repos = {t["repo"] for t in self.targets if t["settings"].get("actions_policies")}
+        repos = {t["repo"] for t in self.targets if t["declared"].get("actions_policies")}
         self.assertEqual(repos, {"Adam-S-Daniel/adam-agentskills"})
 
     def test_adam_agentskills_allows_only_pull_request_target_on_its_review_workflow(self):
         (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/adam-agentskills"]
         self.assertEqual(
-            rs.build_actions_policy_bodies(t["settings"]),
+            rs.build_actions_policy_bodies(t["declared"]),
             [{"name": "plugin-runtime-review: allow pull_request_target",
               "enforcement": "active",
               "conditions": {"workflow_path": {
@@ -3281,13 +3281,14 @@ class ActionsPoliciesFleetConfigTests(unittest.TestCase):
         # `allowed_events` is an allowlist for every workflow a policy covers: a
         # ~ALL policy would block each event it does not list, repo-wide.
         for t in self.targets:
-            for body in rs.build_actions_policy_bodies(t["settings"]):
+            for body in rs.build_actions_policy_bodies(t["declared"]):
                 self.assertNotIn("~ALL", body["conditions"]["workflow_path"]["include"])
 
 
 class ActionsPoliciesDefaultsTests(unittest.TestCase):
     def test_defaults_level_actions_policies_is_refused(self):
-        cfg = {"defaults": {"actions_policies": [POLICY_CFG]}, "repos": [{"name": "o/r"}]}
+        cfg = {"defaults": {"actions_policies": [POLICY_CFG]},
+               "repos": [{"name": "o/r", "manage": ["all"]}]}
         with self.assertRaises(SystemExit) as cm:
             rs.resolve_targets(cfg, None)
         self.assertIn("per-repo only", str(cm.exception))
@@ -3295,4 +3296,569 @@ class ActionsPoliciesDefaultsTests(unittest.TestCase):
     def test_single_repo_config_carries_the_key(self):
         cfg = {"repo": "o/r", "actions_policies": [POLICY_CFG]}
         (t,) = rs.resolve_targets(cfg, None)
-        self.assertEqual(t["settings"]["actions_policies"], [POLICY_CFG])
+        self.assertEqual(t["effective"]["actions_policies"], [POLICY_CFG])
+
+
+# --------------------------------------------------------------------------- #
+# `manage`: a required array of surfaces (issue #83, docs/decisions/0011)
+# --------------------------------------------------------------------------- #
+def _fleet(*elements, defaults=None, **top):
+    cfg = {"defaults": {} if defaults is None else defaults, "repos": list(elements)}
+    cfg.update(top)
+    return cfg
+
+
+def _element(name="o/r", **keys):
+    element = {"name": name}
+    element.update(keys)
+    return element
+
+
+def _write_yaml(test, text):
+    """Write `text` to a temporary config file and return its path."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False,
+                                     encoding="utf-8") as fh:
+        fh.write(text)
+    test.addCleanup(os.remove, fh.name)
+    return fh.name
+
+
+class SurfaceConstantTests(unittest.TestCase):
+    def test_there_are_exactly_seven_surfaces_in_alphabetical_order(self):
+        # Alphabetical is the canonical order a `manage` array must use.
+        self.assertEqual(
+            rs.SURFACES,
+            ("actions", "actions_policies", "extra_rulesets", "labels", "repo",
+             "ruleset", "security"),
+        )
+        self.assertEqual(list(rs.SURFACES), sorted(rs.SURFACES))
+
+    def test_every_surface_has_an_accepted_key_list(self):
+        self.assertEqual(sorted(rs.SURFACE_KEYS), list(rs.SURFACES))
+        self.assertTrue(set(rs.MAP_SURFACES) <= set(rs.SURFACES))
+
+    def test_the_accepted_values_message_is_built_from_the_constant(self):
+        for surface in rs.SURFACES:
+            self.assertIn(surface, rs.MANAGE_ACCEPTED)
+        self.assertIn('["all"]', rs.MANAGE_ACCEPTED)
+        self.assertIn("[]", rs.MANAGE_ACCEPTED)
+
+
+class ManageValidationTests(unittest.TestCase):
+    def _refused(self, manage, *needles):
+        with self.assertRaises(rs.ConfigError) as cm:
+            rs.resolve_targets(_fleet(_element(manage=manage)), None)
+        message = str(cm.exception.code)
+        for needle in needles:
+            self.assertIn(needle, message)
+        # Every refusal names the accepted values.
+        self.assertIn(rs.MANAGE_ACCEPTED, message)
+        return message
+
+    def test_accepted_values(self):
+        for manage in (["all"], [], ["labels"], ["labels", "security"],
+                       ["actions", "repo", "ruleset", "security"]):
+            with self.subTest(manage=manage):
+                (t,) = rs.resolve_targets(_fleet(_element(manage=manage)), None)
+                self.assertEqual(t["manage"], manage)
+
+    def test_omitted_is_refused(self):
+        with self.assertRaises(rs.ConfigError) as cm:
+            rs.resolve_targets(_fleet(_element()), None)
+        self.assertIn("`manage` is required", str(cm.exception.code))
+        self.assertIn(rs.MANAGE_ACCEPTED, str(cm.exception.code))
+
+    def test_booleans_are_refused(self):
+        for manage in (True, False):
+            with self.subTest(manage=manage):
+                self._refused(manage, "must be an array")
+
+    def test_null_is_refused(self):
+        self._refused(None, "must be an array, not null")
+
+    def test_a_bare_string_is_refused(self):
+        self._refused("all", "must be an array")
+
+    def test_a_non_string_element_is_refused(self):
+        for manage in ([False], [1], [None], [["labels"]]):
+            with self.subTest(manage=manage):
+                self._refused(manage, "is not a string")
+
+    def test_pyyaml_no_is_refused_as_a_boolean_element(self):
+        # PyYAML loads an unquoted `no` as False: `manage: [no]` is [False].
+        path = _write_yaml(self, "repos:\n  - name: o/r\n    manage: [no]\n")
+        cfg = rs.load_config(path)
+        self.assertEqual(cfg["repos"][0]["manage"], [False])
+        with self.assertRaises(rs.ConfigError) as cm:
+            rs.resolve_targets(cfg, None)
+        self.assertIn("element false is not a string", str(cm.exception.code))
+
+    def test_the_empty_string_is_an_unknown_surface(self):
+        self._refused([""], 'unknown surface(s) [""]')
+
+    def test_unknown_surfaces_are_refused(self):
+        for manage in (["none"], ["Labels"], ["ALL"], ["actions.sha_pinning_required"]):
+            with self.subTest(manage=manage):
+                self._refused(manage, "unknown surface")
+
+    def test_all_alongside_another_element_is_refused(self):
+        for manage in (["all", "labels"], ["labels", "all"], ["all", "all"]):
+            with self.subTest(manage=manage):
+                self._refused(manage, '"all" must stand alone')
+
+    def test_a_duplicate_element_is_refused(self):
+        self._refused(["labels", "labels"], "names a surface twice")
+
+    def test_out_of_canonical_order_is_refused_naming_the_canonical_form(self):
+        self._refused(["security", "labels"], 'write ["labels", "security"]')
+
+    def test_naming_every_surface_is_refused_in_favor_of_all(self):
+        self._refused(list(rs.SURFACES), 'names every surface; write ["all"]')
+
+    def test_a_string_element_of_repos_is_refused(self):
+        with self.assertRaises(rs.ConfigError) as cm:
+            rs.resolve_targets(_fleet("o/r"), None)
+        self.assertIn("repos[0] must be a map", str(cm.exception.code))
+
+    def test_a_name_that_is_not_owner_slash_repo_is_refused(self):
+        for name in (None, "", "o", "o/r/x", "/r", 5):
+            with self.subTest(name=name):
+                with self.assertRaises(rs.ConfigError):
+                    rs.resolve_targets(_fleet(_element(name=name, manage=["all"])), None)
+
+    def test_duplicate_repo_names_are_refused_case_insensitively(self):
+        for second in ("o/r", "O/R", "o/R"):
+            with self.subTest(second=second):
+                with self.assertRaises(rs.ConfigError) as cm:
+                    rs.resolve_targets(
+                        _fleet(_element("o/r", manage=["all"]), _element(second, manage=[])),
+                        None,
+                    )
+                self.assertIn("declared twice", str(cm.exception.code))
+
+
+class UnknownKeyTests(unittest.TestCase):
+    def _refused(self, cfg, *needles):
+        with self.assertRaises(rs.ConfigError) as cm:
+            rs.resolve_targets(cfg, None)
+        message = str(cm.exception.code)
+        for needle in needles:
+            self.assertIn(needle, message)
+        return message
+
+    def test_top_level_accepts_only_defaults_and_repos(self):
+        self._refused(_fleet(_element(manage=["all"]), defualts={}),
+                      "top level: unknown key(s) 'defualts'", "accepted: defaults, repos")
+
+    def test_a_repos_element_accepts_only_name_manage_and_overrides(self):
+        for key in ("overides", "mange"):
+            with self.subTest(key=key):
+                element = _element(manage=["all"], **{key: {}})
+                self._refused(_fleet(element), f"repos[o/r]: unknown key(s) '{key}'",
+                              "accepted: name, manage, overrides")
+
+    def test_defaults_accept_only_surfaces(self):
+        self._refused(_fleet(_element(manage=["all"]), defaults={"rulesetz": {}}),
+                      "defaults: unknown key(s) 'rulesetz'", ", ".join(rs.SURFACES))
+
+    def test_overrides_accept_only_surfaces(self):
+        element = _element(manage=["all"], overrides={"rulesetz": {}})
+        self._refused(_fleet(element), "repos[o/r].overrides: unknown key(s) 'rulesetz'",
+                      ", ".join(rs.SURFACES))
+
+    def test_inside_each_surface_only_the_keys_its_planner_reads(self):
+        for surface in rs.SURFACES:
+            if surface in rs.MAP_SURFACES:
+                value = {"bogus_key": True}
+                where = f"repos[o/r].overrides.{surface}:"
+            else:
+                value = [{"name": "x", "bogus_key": True}]
+                where = f"repos[o/r].overrides.{surface}[0]:"
+            with self.subTest(surface=surface):
+                element = _element(manage=["all"], overrides={surface: value})
+                self._refused(_fleet(element), where, "'bogus_key'",
+                              ", ".join(rs.SURFACE_KEYS[surface]))
+
+    def test_inside_a_defaults_surface_too(self):
+        self._refused(_fleet(_element(manage=["all"]),
+                             defaults={"actions": {"sha_pining_required": True}}),
+                      "defaults.actions: unknown key(s) 'sha_pining_required'")
+
+    def test_a_surface_of_the_wrong_shape_is_refused(self):
+        self._refused(_fleet(_element(manage=["all"], overrides={"ruleset": None})),
+                      "repos[o/r].overrides.ruleset must be a map")
+        self._refused(_fleet(_element(manage=["all"], overrides={"labels": {}})),
+                      "repos[o/r].overrides.labels must be an array")
+
+    def test_admin_bypass_is_accepted_and_its_value_is_not_validated_here(self):
+        # The key's values are owned by the ruleset builder (#93), not by the
+        # unknown-key check.
+        element = _element(manage=["all"],
+                           overrides={"ruleset": {"enabled": True, "admin_bypass": "pull_request"}})
+        (t,) = rs.resolve_targets(_fleet(element), None)
+        self.assertEqual(t["declared"]["ruleset"]["admin_bypass"], "pull_request")
+
+    def test_the_single_repo_top_level_accepts_only_surfaces(self):
+        with self.assertRaises(rs.ConfigError) as cm:
+            rs.resolve_targets({"repo": "o/r", "manage": ["all"], "actions": {}}, None)
+        self.assertIn("top level: unknown key(s) 'manage'", str(cm.exception.code))
+        with self.assertRaises(rs.ConfigError):
+            rs.resolve_targets({"repo": "o/r", "ruleset": {"enabeld": True}}, None)
+
+    def test_generate_output_is_accepted(self):
+        # `generate` emits a single-repo config; every key it writes must be
+        # one the validation accepts, or the round trip breaks.
+        doc = {
+            "repo": "o/r",
+            "actions": {"sha_pinning_required": True, "fork_pr_approval": "x",
+                        "default_workflow_permissions": "read",
+                        "can_approve_pull_request_reviews": False},
+            "ruleset": rs.ruleset_doc(
+                rs.build_ruleset_body({"enabled": True, "admin_bypass": "always"})),
+        }
+        (t,) = rs.resolve_targets(doc, None)
+        self.assertEqual(t["manage"], ["actions", "ruleset"])
+
+    def test_every_key_fleet_yml_uses_is_accepted(self):
+        cfg = rs.load_config(str(FleetConfigTests.FLEET))
+        blocks = [("defaults", cfg["defaults"])] + [
+            (e["name"], e.get("overrides") or {}) for e in cfg["repos"]
+        ]
+        for where, block in blocks:
+            for surface, value in block.items():
+                self.assertIn(surface, rs.SURFACES, msg=where)
+                elements = [value] if surface in rs.MAP_SURFACES else value
+                for element in elements:
+                    for key in element:
+                        self.assertIn(key, rs.SURFACE_KEYS[surface],
+                                      msg=f"{where}.{surface}.{key}")
+
+
+class DuplicateKeyLoaderTests(unittest.TestCase):
+    def _refused(self, text, *needles):
+        path = _write_yaml(self, text)
+        with self.assertRaises(rs.ConfigError) as cm:
+            rs.load_config(path)
+        message = str(cm.exception.code)
+        for needle in needles:
+            self.assertIn(needle, message)
+
+    def test_a_duplicate_top_level_key_is_refused(self):
+        self._refused("repos: []\nrepos: []\n", "duplicate key 'repos' at line 2",
+                      "first at line 1")
+
+    def test_a_duplicate_key_in_a_repos_element_is_refused(self):
+        self._refused(
+            'repos:\n  - name: o/r\n    manage: ["all"]\n    manage: []\n',
+            "duplicate key 'manage' at line 4",
+        )
+
+    def test_a_duplicate_key_in_a_nested_map_is_refused(self):
+        self._refused(
+            "defaults:\n  ruleset:\n    enabled: true\n    enabled: false\nrepos: []\n",
+            "duplicate key 'enabled'",
+        )
+
+    def test_a_flow_map_duplicate_is_refused(self):
+        self._refused("repos: []\ndefaults: {repo: {}, repo: {}}\n", "duplicate key 'repo'")
+
+    def test_distinct_keys_and_merge_keys_still_load(self):
+        path = _write_yaml(
+            self,
+            "base: &b {enabled: true}\nother:\n  <<: *b\n  name: x\n",
+        )
+        self.assertEqual(rs.load_config(path)["other"], {"enabled": True, "name": "x"})
+
+    def test_invalid_yaml_and_a_non_map_top_level_are_config_errors(self):
+        self._refused("repos: [\n", "is not valid YAML")
+        self._refused("- a\n- b\n", "the top level must be a map")
+
+    def test_the_shipped_fleet_yml_loads_with_it(self):
+        cfg = rs.load_config(str(FleetConfigTests.FLEET))
+        self.assertIn("repos", cfg)
+
+
+class ConfigErrorExitCodeTests(unittest.TestCase):
+    """A refused config exits 2 -- 1 means drift (diff) or undeclared repos
+    (coverage) -- and is refused before any API call."""
+
+    def _main(self, argv):
+        err = io.StringIO()
+        with patch.object(sys, "argv", ["repo_settings.py", *argv]), \
+                patch.object(rs, "gh_api") as api, \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            rc = rs.main()
+        api.assert_not_called()
+        return rc, err.getvalue()
+
+    def test_each_subcommand_exits_2_on_a_refused_config(self):
+        path = _write_yaml(self, "repos:\n  - name: o/r\n")  # no manage
+        for argv in (["diff", "--config", path],
+                     ["apply", "--config", path],
+                     ["apply", "--config", path, "--dry-run"],
+                     ["coverage", "--config", path]):
+            with self.subTest(argv=argv[0]):
+                rc, err = self._main(argv)
+                self.assertEqual(rc, 2)
+                self.assertIn("`manage` is required", err)
+
+    def test_a_duplicate_key_exits_2(self):
+        path = _write_yaml(self, "repos: []\nrepos: []\n")
+        rc, err = self._main(["diff", "--config", path])
+        self.assertEqual(rc, 2)
+        self.assertIn("duplicate key", err)
+
+    def test_a_build_helper_refusal_exits_2_too(self):
+        # The older `SystemExit("error: ...")` refusals map to 2 as well.
+        path = _write_yaml(
+            self,
+            'repos:\n  - name: o/r\n    manage: ["all"]\n    overrides:\n'
+            "      labels: [{name: x, color: '#000000'}]\n",
+        )
+        rc, err = self._main(["diff", "--config", path])
+        self.assertEqual(rc, 2)
+        self.assertIn("labels[x]", err)
+        self.assertIn("(in repos[o/r])", err)
+
+    def test_validation_runs_before_filtering(self):
+        # The bad element is under another owner and manages nothing, and is
+        # still refused: validation covers the whole config before --owner
+        # or `manage` filters anything.
+        path = _write_yaml(
+            self,
+            'repos:\n  - name: a/good\n    manage: ["all"]\n'
+            "  - name: b/bad\n    manage: []\n    overrides: {rulesetz: {}}\n",
+        )
+        rc, err = self._main(["diff", "--config", path, "--owner", "a"])
+        self.assertEqual(rc, 2)
+        self.assertIn("rulesetz", err)
+
+    def test_an_unmanaged_surface_is_still_validated(self):
+        path = _write_yaml(
+            self,
+            'repos:\n  - name: o/r\n    manage: ["labels"]\n'
+            "    overrides: {ruleset: {enabeld: true}}\n",
+        )
+        rc, err = self._main(["diff", "--config", path])
+        self.assertEqual(rc, 2)
+        self.assertIn("enabeld", err)
+
+
+class ManageFilteringTests(unittest.TestCase):
+    DEFAULTS = {
+        "actions": {"sha_pinning_required": True},
+        "security": {"vulnerability_alerts": True},
+        "labels": [{"name": "agent-authored", "color": "D4C5F9"}],
+    }
+
+    def _target(self, manage, overrides=None):
+        element = _element(manage=manage)
+        if overrides:
+            element["overrides"] = overrides
+        (t,) = rs.resolve_targets(_fleet(element, defaults=self.DEFAULTS), None)
+        return t
+
+    def test_all_keeps_every_surface(self):
+        t = self._target(["all"])
+        self.assertEqual(t["effective"], t["declared"])
+        self.assertTrue(all(rs.manages(t, s) for s in rs.SURFACES))
+
+    def test_a_list_keeps_only_the_listed_surfaces(self):
+        t = self._target(["labels"], overrides={"ruleset": {"enabled": True, "admin_bypass": "none"}})
+        self.assertEqual(set(t["declared"]), {"actions", "security", "labels", "ruleset"})
+        self.assertEqual(set(t["effective"]), {"labels"})
+        self.assertEqual(t["effective"]["labels"], self.DEFAULTS["labels"])
+        self.assertTrue(rs.manages(t, "labels"))
+        self.assertFalse(rs.manages(t, "security"))
+
+    def test_empty_keeps_nothing(self):
+        t = self._target([])
+        self.assertEqual(t["effective"], {})
+        self.assertFalse(any(rs.manages(t, s) for s in rs.SURFACES))
+
+    def test_filtering_does_not_mutate_the_declared_settings(self):
+        t = self._target(["labels"])
+        t["effective"]["labels"].append("x")
+        self.assertEqual(len(t["declared"]["labels"]), 1)
+
+    def test_manages_refuses_an_unknown_surface(self):
+        with self.assertRaises(ValueError):
+            rs.manages(self._target(["all"]), "rulesets")
+
+    def test_labels(self):
+        self.assertEqual(rs.manage_label({"manage": ["all"]}), "managed: all")
+        self.assertEqual(rs.manage_label({"manage": ["labels", "security"]}),
+                         "managed: labels, security")
+        self.assertEqual(rs.manage_label({"manage": []}), "excluded (manage: [])")
+
+    def _diff(self, text):
+        path = _write_yaml(self, text)
+        calls = []
+
+        def fake(path, method="GET", body=None, api_version=None):
+            calls.append((method, path))
+            if path.endswith("/vulnerability-alerts"):
+                return None
+            if "/labels/" in path:
+                return {"name": "agent-authored", "color": "d4c5f9", "description": ""}
+            return {"private": False, "sha_pinning_required": True}
+
+        args = argparse.Namespace(config=path, repo=None, owner=None)
+        with patch.object(rs, "gh_api", side_effect=fake), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = rs.cmd_diff(args)
+        return rc, out.getvalue(), calls
+
+    def test_diff_prints_the_scope_and_plans_only_the_listed_surfaces(self):
+        rc, out, calls = self._diff(
+            "defaults:\n  actions: {sha_pinning_required: true}\n"
+            "  security: {vulnerability_alerts: true}\n"
+            "  labels: [{name: agent-authored, color: D4C5F9}]\n"
+            "repos:\n"
+            '  - name: o/every\n    manage: ["all"]\n'
+            '  - name: o/some\n    manage: ["labels", "security"]\n'
+            "  - name: o/none\n    manage: []\n"
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("o/every\n  \x1b[2mmanaged: all\x1b[0m\n", out)
+        self.assertIn("o/some\n  \x1b[2mmanaged: labels, security\x1b[0m\n", out)
+        self.assertIn("o/none\n  \x1b[2mexcluded (manage: [])\x1b[0m\n", out)
+        self.assertIn(("GET", "repos/o/every/actions/permissions"), calls)
+        self.assertNotIn(("GET", "repos/o/some/actions/permissions"), calls)
+        self.assertIn(("GET", "repos/o/some/vulnerability-alerts"), calls)
+        self.assertFalse([c for c in calls if "/o/none" in c[1]])
+        self.assertEqual({m for m, _ in calls}, {"GET"})
+
+
+class SingleRepoSecurityRegressionTests(unittest.TestCase):
+    """The single-repo shape's own surface list omitted `security`, so a
+    single-repo `security:` block was silently dropped (issue #83)."""
+
+    def test_a_security_block_is_kept(self):
+        (t,) = rs.resolve_targets(
+            {"repo": "o/r", "security": {"vulnerability_alerts": True}}, None
+        )
+        self.assertEqual(t["effective"]["security"], {"vulnerability_alerts": True})
+        self.assertTrue(rs.manages(t, "security"))
+
+    def test_it_is_planned(self):
+        path = _write_yaml(self, "repo: o/r\nsecurity:\n  vulnerability_alerts: true\n")
+        calls = []
+
+        def fake(path, method="GET", body=None, api_version=None):
+            calls.append((method, path))
+            raise rs.GhError(404, "Not Found")  # alerts off
+
+        args = argparse.Namespace(config=path, repo=None, owner=None)
+        with patch.object(rs, "gh_api", side_effect=fake), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = rs.cmd_diff(args)
+        self.assertEqual(rc, 1)
+        self.assertIn("security.vulnerability_alerts", out.getvalue())
+        self.assertEqual(calls, [("GET", "repos/o/r/vulnerability-alerts")])
+
+    def test_every_surface_block_is_kept(self):
+        cfg = {"repo": {"allow_auto_merge": True}, "actions": {}, "security": {},
+               "ruleset": {}, "extra_rulesets": [], "actions_policies": [], "labels": []}
+        (t,) = rs.resolve_targets(cfg, "o/r")
+        self.assertEqual(set(t["effective"]), set(rs.SURFACES))
+
+
+class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
+    """PR A changes no repo's managed surfaces (issue #83): the migrated
+    fleet.yml must plan exactly what the boolean `manage` planned. The legacy
+    run is rebuilt in-process from the same file, `manage: ["all"]` read as
+    the old omitted key and `manage: []` as the old `manage: false`, through
+    the old resolution (deep_merge plus merge_labels) and the old diff loop."""
+
+    FLEET = FleetConfigTests.FLEET
+    # The seven elements that carried `manage: false` before the migration.
+    WERE_FALSE = {
+        "Adam-S-Daniel/agentskills", "Adam-S-Daniel/GHA-bench",
+        "Adam-S-Daniel/OctopusDeploy-Api", "Adam-S-Daniel/SonosAmpJuicePi",
+        "Adam-S-Daniel/cms-platform", "Adam-S-Daniel/adamdaniel.ai",
+        "jodidaniel/jodidaniel.com",
+    }
+
+    @staticmethod
+    def fake_gh(calls):
+        repo_fields = {
+            "private": False, "allow_auto_merge": True, "delete_branch_on_merge": False,
+            "allow_merge_commit": True, "allow_squash_merge": True,
+            "allow_rebase_merge": False, "merge_commit_title": "PR_TITLE",
+            "merge_commit_message": "PR_BODY",
+        }
+
+        def fake(path, method="GET", body=None, api_version=None):
+            calls.append((method, path))
+            tail = path.split("/", 3)[3] if path.count("/") >= 3 else ""
+            if tail == "":
+                return dict(repo_fields)
+            if tail == "actions/permissions":
+                return {"enabled": True, "allowed_actions": "all", "sha_pinning_required": False}
+            if tail == "actions/permissions/fork-pr-contributor-approval":
+                return {"approval_policy": "first_time_contributors"}
+            if tail == "actions/permissions/workflow":
+                return {"default_workflow_permissions": "write",
+                        "can_approve_pull_request_reviews": False}
+            if tail == "vulnerability-alerts":
+                return None
+            if tail == "automated-security-fixes":
+                return {"enabled": False, "paused": False}
+            if tail == "rulesets":
+                return []
+            if tail.startswith("actions/policies"):
+                return {"total_count": 0, "policies": []}
+            raise rs.GhError(404, "Not Found")  # labels: missing
+
+        return fake
+
+    def _legacy_targets(self, cfg):
+        defaults = cfg.get("defaults", {})
+        targets = []
+        for entry in cfg["repos"]:
+            settings = rs.deep_merge(defaults, entry.get("overrides", {}))
+            if "labels" in defaults:
+                settings["labels"] = rs.merge_labels(
+                    defaults["labels"], (entry.get("overrides") or {}).get("labels"))
+            targets.append({"repo": entry["name"], "settings": settings,
+                            "manage": entry["manage"] != []})
+        return targets
+
+    def _legacy_diff(self, cfg):
+        for t in self._legacy_targets(cfg):
+            if not t["manage"]:
+                print(f"\n{t['repo']}\n  {rs.DIM}excluded (manage: false){rs.RESET}")
+                continue
+            rs.render_records(t["repo"], rs.plan_repo_records(t["repo"], t["settings"]))
+
+    def test_the_mapping_is_one_for_one(self):
+        cfg = rs.load_config(str(self.FLEET))
+        by_value = {}
+        for entry in cfg["repos"]:
+            by_value.setdefault(tuple(entry["manage"]), set()).add(entry["name"])
+        self.assertEqual(set(by_value), {("all",), ()})
+        self.assertEqual(by_value[()], self.WERE_FALSE)
+        self.assertEqual(len(by_value[("all",)]), 16)
+
+    def test_diff_output_is_unchanged_apart_from_the_scope_strings(self):
+        cfg = rs.load_config(str(self.FLEET))
+        legacy_calls, new_calls = [], []
+        with patch.object(rs, "gh_api", side_effect=self.fake_gh(legacy_calls)), \
+                contextlib.redirect_stdout(io.StringIO()) as legacy:
+            self._legacy_diff(cfg)
+        args = argparse.Namespace(config=str(self.FLEET), repo=None, owner=None)
+        with patch.object(rs, "gh_api", side_effect=self.fake_gh(new_calls)), \
+                contextlib.redirect_stdout(io.StringIO()) as new:
+            rc = rs.cmd_diff(args)
+        self.assertEqual(rc, 1)  # the stub drifts on purpose, so plans are non-trivial
+        expected = (
+            legacy.getvalue()
+            .replace("excluded (manage: false)", "excluded (manage: [])")
+        )
+        actual = new.getvalue().replace(f"\n  {rs.DIM}managed: all{rs.RESET}", "")
+        self.assertEqual(actual, expected)
+        self.assertEqual(new_calls, legacy_calls)
+        self.assertEqual({m for m, _ in new_calls}, {"GET"})
+        self.assertIn("[\x1b[33mDRIFT\x1b[0m]", actual)

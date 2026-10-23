@@ -117,8 +117,9 @@ protected branches).
   whole fleet run down over one repo's payload. Never "fix" it by promoting an
   absent key to drift.
 - Consequence for CI: while the fan-out App is scoped Administration + Actions +
-  Metadata (README, "CI fan-out" step 1), the scheduled run cannot audit or
-  reconcile the merge-method policy — those records come back as skips, and
+  Issues + Metadata, with no Contents (README, "CI fan-out" step 1), the
+  scheduled run cannot audit or reconcile the merge-method policy — those
+  records come back as skips, and
   merge-method drift is caught only by an operator `apply` under ambient
   `gh auth`. Accept that gap knowingly, or widen the App and **verify** the keys
   actually appear before trusting the audit again.
