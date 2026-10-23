@@ -3,8 +3,9 @@
 The fleet rule makes every CI job that runs on pull requests a required check
 unless this repo's AGENTS.md says why not (issue #86). These tests hold that in
 place: they parse the workflows with `yaml` (never a regex over the YAML) and
-read the required checks through the engine's own `resolve_targets`, so a
-change to fleet.yml, a workflow or AGENTS.md that breaks the rule turns red
+read the required checks through the engine's own `resolve_targets`, and
+read only the table under "Workflows and required checks" in AGENTS.md, so a
+change to fleet.yml, a workflow or that table that breaks the rule turns red
 here. They fail closed: a trigger, ruleset or section they cannot find is a
 failure, not a skip.
 
@@ -19,6 +20,11 @@ from pathlib import Path
 
 import yaml
 
+try:
+    from markdown_it import MarkdownIt
+except ImportError:  # reported by workflow_table_rows, never skipped
+    MarkdownIt = None
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
@@ -28,7 +34,6 @@ WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 FLEET = REPO_ROOT / "repo-settings" / "fleet.yml"
 AGENTS_MD = REPO_ROOT / "AGENTS.md"
 THIS_REPO = "Adam-S-Daniel/repo-settings"
-SECTION_HEADING = "## Repo-specific additions"
 
 
 def load_workflow(path):
@@ -86,22 +91,112 @@ def required_checks():
     return checks
 
 
-def documented_job_ids():
-    """Every backticked token in AGENTS.md's "Repo-specific additions"
-    section. The managed section above it is overwritten by a sync, so an
-    exception written there would not survive."""
-    text = AGENTS_MD.read_text(encoding="utf-8")
-    lines = text.splitlines()
-    try:
-        start = lines.index(SECTION_HEADING)
-    except ValueError:
-        raise AssertionError(f"AGENTS.md has no {SECTION_HEADING!r} line") from None
-    section = []
-    for line in lines[start + 1:]:
-        if line.startswith("## "):
+TABLE_HEADING = "Workflows and required checks"
+JOB_ID = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _inline_text(token):
+    return "".join(
+        child.content for child in (token.children or []) if child.type != "softbreak"
+    )
+
+
+def workflow_table_rows():
+    """[{column name: inline token}] for each data row of the first
+    table under the TABLE_HEADING h3 in AGENTS.md. AGENTS.md is parsed with
+    markdown-it-py (CommonMark plus tables) and only that table is read, so a
+    stray mention elsewhere in the file cannot stand in for a deleted row.
+    Markdown drops cells past the header's width, so only a short row is
+    reported as the wrong cell count."""
+    if MarkdownIt is None:
+        raise AssertionError(
+            "markdown-it-py is not installed; run "
+            "`python3 -m pip install -r requirements-dev.txt`"
+        )
+    tokens = MarkdownIt("commonmark").enable("table").parse(
+        AGENTS_MD.read_text(encoding="utf-8")
+    )
+    start = None
+    for i, tok in enumerate(tokens):
+        if (
+            tok.type == "heading_open"
+            and tok.tag == "h3"
+            and _inline_text(tokens[i + 1]) == TABLE_HEADING
+        ):
+            start = i + 1
             break
-        section.append(line)
-    return set(re.findall(r"`([^`\n]+)`", "\n".join(section)))
+    if start is None:
+        raise AssertionError(f"AGENTS.md has no '### {TABLE_HEADING}' heading")
+    table = None
+    for i in range(start, len(tokens)):
+        if tokens[i].type == "heading_open":
+            break
+        if tokens[i].type == "table_open":
+            table = i
+            break
+    if table is None:
+        raise AssertionError(f"no table under '### {TABLE_HEADING}'")
+    header, rows, current, in_head = [], [], None, False
+    for tok in tokens[table:]:
+        if tok.type == "table_close":
+            break
+        if tok.type == "thead_open":
+            in_head = True
+        elif tok.type == "thead_close":
+            in_head = False
+        elif tok.type == "tr_open":
+            current = []
+        elif tok.type == "tr_close":
+            if not in_head:
+                rows.append(current)
+        elif tok.type == "inline":
+            if in_head:
+                header.append(_inline_text(tok).strip())
+            else:
+                current.append(tok)
+    for column in ("Workflow", "Job", "Required"):
+        if header.count(column) != 1:
+            raise AssertionError(
+                f"table under '### {TABLE_HEADING}' needs exactly one "
+                f"{column!r} column; header is {header}"
+            )
+    result = []
+    for cells in rows:
+        if len(cells) != len(header):
+            raise AssertionError(
+                f"row has {len(cells)} cells, header has {len(header)}: "
+                f"{[_inline_text(c) for c in cells]}"
+            )
+        result.append(dict(zip(header, cells)))
+    return result
+
+
+def job_id_of(cell):
+    """The first code span in a Job cell, else its plain text if that is a
+    bare identifier."""
+    for child in cell.children or []:
+        if child.type == "code_inline":
+            token = child.content
+            break
+    else:
+        token = _inline_text(cell).strip()
+    if not JOB_ID.fullmatch(token):
+        raise AssertionError(
+            f"cannot read a job id from the Job cell {_inline_text(cell)!r}"
+        )
+    return token
+
+
+def table_entries():
+    """[(workflow file, job id, Required cell)] from the AGENTS.md table."""
+    return [
+        (
+            _inline_text(row["Workflow"]).strip(),
+            job_id_of(row["Job"]),
+            _inline_text(row["Required"]).strip(),
+        )
+        for row in workflow_table_rows()
+    ]
 
 
 class RequiredChecksTests(unittest.TestCase):
@@ -157,17 +252,46 @@ class RequiredChecksTests(unittest.TestCase):
                 f"{path.name}:{job_id} is a matrix job; check {check!r}",
             )
 
-    def test_every_pull_request_job_is_required_or_documented(self):
+    def test_every_pull_request_job_has_one_agreeing_table_row(self):
         required = set(required_checks())
-        documented = documented_job_ids()
+        entries = table_entries()
         for path, job_id, _job in pull_request_jobs():
-            self.assertTrue(
-                job_id in required or job_id in documented,
+            rows = [e for e in entries if e[0] == path.name and e[1] == job_id]
+            self.assertEqual(
+                len(rows),
+                1,
                 msg=(
-                    f"{path.name}:{job_id} runs on pull requests but is neither "
-                    f"required in fleet.yml nor named in backticks under "
-                    f"AGENTS.md's {SECTION_HEADING!r}"
+                    f"{path.name}:{job_id} runs on pull requests and needs exactly "
+                    f"one row in the AGENTS.md table under '### {TABLE_HEADING}'; "
+                    f"found {len(rows)}"
                 ),
+            )
+            expected = "yes" if job_id in required else "no"
+            self.assertEqual(
+                rows[0][2],
+                expected,
+                msg=(
+                    f"{path.name}:{job_id}: the table's Required cell is "
+                    f"{rows[0][2]!r} but fleet.yml makes it {expected!r}"
+                ),
+            )
+
+    def test_every_table_row_names_a_real_workflow_and_job(self):
+        for workflow, job_id, required in table_entries():
+            path = WORKFLOWS_DIR / workflow
+            self.assertTrue(
+                path.is_file(),
+                msg=f"table row names {workflow!r}, which is not under .github/workflows/",
+            )
+            jobs = load_workflow(path).get("jobs") or {}
+            self.assertTrue(
+                job_id in jobs,
+                msg=f"table row {workflow}:{job_id} names a job that workflow lacks",
+            )
+            self.assertIn(
+                required,
+                ("yes", "no"),
+                msg=f"{workflow}:{job_id}: Required must be 'yes' or 'no', got {required!r}",
             )
 
 
