@@ -1,0 +1,14 @@
+# The Python packages this repo's CI installs. This file is the only place a
+# version is written: .github/workflows/ install it with
+# `python3 -m pip install -r requirements.txt`, and
+# tests/test_workflow_dependency_pins.py fails if a workflow installs anything
+# any other way.
+#
+# Pins are exact. A by-hand bump takes the newest release that is more than 7
+# days old (`curl -s https://pypi.org/pypi/PyYAML/json`) per the account's
+# dependency cooling-off rule; Dependabot's `pip` entry in
+# .github/dependabot.yml proposes bumps weekly under the same cooldown.
+
+# scripts/repo_settings.py and the tests parse YAML with it. 6.0.3 was uploaded
+# 2025-09-25.
+PyYAML==6.0.3

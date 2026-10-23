@@ -55,11 +55,13 @@ on:
       - "repo-settings/fleet.yml"
       - "scripts/repo_settings.py"
       - ".github/workflows/repo-settings.yml"
+      - "requirements.txt"
   pull_request:
     paths:
       - "repo-settings/fleet.yml"
       - "scripts/repo_settings.py"
       - ".github/workflows/repo-settings.yml"
+      - "requirements.txt"
 
 permissions:
   contents: read
@@ -89,7 +91,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install PyYAML
-        run: pip install pyyaml
+        run: python3 -m pip install -r requirements.txt
 
       - name: Mint GitHub App token for ${{ matrix.owner }}
         id: token
