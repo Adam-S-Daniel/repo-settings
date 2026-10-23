@@ -99,3 +99,4 @@ Optional sections for high-impact decisions:
 | [0007](0007-persistent-branches-use-the-persistent-prefix-and-a-deletion-ruleset.md) | Name persistent branches `persistent/<purpose>` and protect them from deletion with a ruleset | Accepted |
 | [0008](0008-let-skills-evals-open-draft-scaffold-prs-with-github-token.md) | Let skills-evals' scaffold gate open draft PRs with GITHUB_TOKEN | Accepted |
 | [0009](0009-allow-pull-request-target-with-a-workflow-scoped-policy-owned-by-name.md) | Allow pull_request_target with a workflow-scoped Actions event policy the engine owns by name | Accepted |
+| [0010](0010-labels-may-be-declared-fleet-wide-and-merge-by-name.md) | Labels may be declared fleet-wide and merge with per-repo labels by name | Accepted |

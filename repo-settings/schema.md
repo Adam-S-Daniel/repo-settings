@@ -157,7 +157,7 @@ extra_rulesets:
 - `generate` does not emit `extra_rulesets`; it identifies the default ruleset
   by its name.
 
-### `labels:` -- repo labels (per-repo only)
+### `labels:` -- repo labels (fleet-wide defaults plus per-repo)
 
 A sibling of `extra_rulesets:` (a top-level key in single-repo configs; under a
 repo's `overrides:` in fleet configs) holding a LIST of labels the repo must
@@ -180,9 +180,12 @@ labels:
   the repo itself: if that fails, the record is an `error`, never a create.
 - **Removal does not delete.** Dropping an entry leaves the live label alone,
   consistent with "never touches other rulesets"; delete it by hand.
-- **Per-repo only.** `labels` under `defaults:` is rejected, for the same
-  list-replacement reason as `extra_rulesets`, and because a label belongs to
-  one repo's workflow.
+- **Defaults merge with per-repo labels.** `labels` under `defaults:` is
+  created in every managed repo (docs/decisions/0010). Because `deep_merge`
+  replaces lists, the engine merges this one key by name: a repo's own
+  `overrides.labels` entry replaces a default of the same name
+  (case-insensitive), and the rest of both lists apply. A repo that declares
+  no labels simply gets the defaults.
 - **Not visibility-gated.** Labels exist on every plan.
 - **Needs a permission the fan-out App may not hold.** Creating or editing a
   label needs the credential's **Issues** (or Pull requests) **write**

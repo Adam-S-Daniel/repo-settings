@@ -2138,11 +2138,31 @@ class LabelSpecTests(unittest.TestCase):
             rs.build_label_specs({"labels": [
                 {"name": "Eval", "color": "000000"}, {"name": "eval", "color": "111111"}]})
 
-    def test_labels_are_per_repo_only(self):
-        cfg = {"defaults": {"labels": [self.CFG]}, "repos": [{"name": "o/r"}]}
-        with self.assertRaises(SystemExit) as cm:
-            rs.resolve_targets(cfg, None)
-        self.assertIn("labels", str(cm.exception))
+    DEFAULT = {"name": "agent-authored", "color": "D4C5F9"}
+
+    def test_default_labels_reach_a_repo_with_none_of_its_own(self):
+        cfg = {"defaults": {"labels": [self.DEFAULT]}, "repos": [{"name": "o/r"}, "o/s"]}
+        for t in rs.resolve_targets(cfg, None):
+            self.assertEqual(t["settings"]["labels"], [self.DEFAULT])
+
+    def test_default_labels_merge_with_repo_labels(self):
+        cfg = {"defaults": {"labels": [self.DEFAULT]},
+               "repos": [{"name": "o/r", "overrides": {"labels": [self.CFG]}}]}
+        (t,) = rs.resolve_targets(cfg, None)
+        self.assertEqual(t["settings"]["labels"], [self.DEFAULT, self.CFG])
+
+    def test_repo_label_wins_a_name_clash_case_insensitively(self):
+        mine = {"name": "Agent-Authored", "color": "000000"}
+        cfg = {"defaults": {"labels": [self.DEFAULT]},
+               "repos": [{"name": "o/r", "overrides": {"labels": [mine]}}]}
+        (t,) = rs.resolve_targets(cfg, None)
+        self.assertEqual(t["settings"]["labels"], [mine])
+
+    def test_merging_does_not_mutate_the_defaults(self):
+        cfg = {"defaults": {"labels": [self.DEFAULT]},
+               "repos": [{"name": "o/r", "overrides": {"labels": [self.CFG]}}]}
+        rs.resolve_targets(cfg, None)
+        self.assertEqual(cfg["defaults"]["labels"], [self.DEFAULT])
 
     def test_a_repo_override_carries_labels(self):
         cfg = {"defaults": {}, "repos": [{"name": "o/r", "overrides": {"labels": [self.CFG]}}]}
@@ -2285,18 +2305,27 @@ class LabelsFleetConfigTests(unittest.TestCase):
             self.cfg = yaml.safe_load(fh)
         self.targets = rs.resolve_targets(self.cfg, None)
 
-    def test_defaults_declare_none(self):
-        self.assertNotIn("labels", self.cfg["defaults"])
+    AGENT = {"name": "agent-authored", "color": "d4c5f9",
+             "description": "Opened by an AI agent on the owner's behalf"}
 
-    def test_only_skills_evals_declares_labels(self):
-        repos = {t["repo"] for t in self.targets if t["settings"].get("labels")}
-        self.assertEqual(repos, {"Adam-S-Daniel/skills-evals"})
+    def test_defaults_declare_the_agent_authored_label(self):
+        self.assertEqual(rs.build_label_specs(self.cfg["defaults"]), [self.AGENT])
+
+    def test_every_managed_repo_gets_the_agent_authored_label(self):
+        for t in self.targets:
+            self.assertIn(self.AGENT, rs.build_label_specs(t["settings"]), msg=t["repo"])
+
+    def test_only_skills_evals_declares_its_own_labels(self):
+        own = {e["name"] for e in self.cfg["repos"]
+               if isinstance(e, dict) and (e.get("overrides") or {}).get("labels")}
+        self.assertEqual(own, {"Adam-S-Daniel/skills-evals"})
 
     def test_skills_evals_declares_the_scaffold_label(self):
         (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/skills-evals"]
         self.assertEqual(
             rs.build_label_specs(t["settings"]),
-            [{"name": "eval-scaffold", "color": "c5def5",
+            [self.AGENT,
+             {"name": "eval-scaffold", "color": "c5def5",
               "description": "Draft real-work fixture opened by the scaffold gate"}],
         )
 

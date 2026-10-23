@@ -1,4 +1,14 @@
 defaults:
+  # why: the label marks PRs and issues an AI agent opens on the owner's behalf,
+  # so a reader can tell agent work from the owner's at a glance (see
+  # _agent-guidance ADR 0023, in progress). It must exist in EVERY managed repo
+  # (both owners) or an agent's attempt to apply it fails, hence a fleet-wide
+  # default, merged with per-repo labels by name (docs/decisions/0010).
+  # Removing this entry does not delete the live labels.
+  labels:
+    - name: agent-authored
+      color: D4C5F9
+      description: Opened by an AI agent on the owner's behalf
   # Prerequisite for the Dependabot unattended-merge path being rolled out
   # fleet-wide: GitHub's native auto-merge cannot be armed at all unless the
   # repo's "Allow auto-merge" setting is on. A plain repo setting (not

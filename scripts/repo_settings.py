@@ -42,7 +42,7 @@ Managed settings:
                                                vulnerability_alerts -- apply
                                                order is dependency-aware, see
                                                plan_repo)
-  * labels (per-repo only)                 -> repos/{repo}/labels/{name}  (GET, then
+  * labels (defaults + per-repo)           -> repos/{repo}/labels/{name}  (GET, then
                                                POST when absent or PATCH on
                                                drift; idempotent BY NAME, never
                                                deletes a label)
@@ -1072,6 +1072,24 @@ def deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
+def merge_labels(default_labels, repo_labels) -> list:
+    """Fleet-wide `defaults.labels` plus a repo's own `labels`; the repo's
+    entry replaces a default of the same name. Shape errors are left for
+    build_label_specs to refuse, so a non-list passes through untouched."""
+    if repo_labels is None:
+        return copy.deepcopy(default_labels)
+    if not isinstance(default_labels, list) or not isinstance(repo_labels, list):
+        return copy.deepcopy(repo_labels)
+    own = {
+        str(c.get("name")).lower() for c in repo_labels if isinstance(c, dict)
+    }
+    kept = [
+        c for c in default_labels
+        if not (isinstance(c, dict) and str(c.get("name")).lower() in own)
+    ]
+    return copy.deepcopy(kept + repo_labels)
+
+
 def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as fh:
         return yaml.safe_load(fh) or {}
@@ -1088,13 +1106,6 @@ def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
                 "error: extra_rulesets is per-repo only -- declare it under a "
                 "repo's `overrides:`, not `defaults:`"
             )
-        # Same list-replacement hazard, and a label is a per-repo fixture of one
-        # workflow: a defaults-level label would be created in every repo.
-        if "labels" in defaults:
-            raise SystemExit(
-                "error: labels is per-repo only -- declare it under a "
-                "repo's `overrides:`, not `defaults:`"
-            )
         # Same list-replacement hazard, and a policy names one repo's workflow
         # files: a defaults-level policy would point at files other repos lack.
         if "actions_policies" in defaults:
@@ -1106,10 +1117,18 @@ def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
         for entry in cfg["repos"]:
             if isinstance(entry, str):
                 entry = {"name": entry}
+            settings = deep_merge(defaults, entry.get("overrides", {}))
+            if "labels" in defaults:
+                # deep_merge REPLACES lists, so merge labels here instead: the
+                # fleet-wide labels plus the repo's own, a repo entry winning a
+                # name clash (names compare case-insensitively, as on GitHub).
+                settings["labels"] = merge_labels(
+                    defaults["labels"], (entry.get("overrides") or {}).get("labels")
+                )
             targets.append(
                 {
                     "repo": entry["name"],
-                    "settings": deep_merge(defaults, entry.get("overrides", {})),
+                    "settings": settings,
                     "manage": entry.get("manage", True),
                 }
             )
