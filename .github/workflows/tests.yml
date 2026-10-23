@@ -27,8 +27,9 @@ on:
       # validates that file only after it reaches main, so a config-only
       # change must still run the suite on its PR.
       - ".github/dependabot.yml"
-      # The workflow installs this file, so a bump must run the suite on its PR.
+      # The workflow installs these files, so a bump must run the suite on its PR.
       - "requirements.txt"
+      - "requirements-dev.txt"
       # tests/test_required_checks.py reads its exception list.
       - "AGENTS.md"
 
@@ -46,6 +47,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: python3 -m pip install -r requirements.txt
+        run: python3 -m pip install -r requirements-dev.txt
       - name: Run tests
         run: python3 -m unittest discover -s tests -v

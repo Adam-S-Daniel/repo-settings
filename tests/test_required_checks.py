@@ -20,6 +20,11 @@ from pathlib import Path
 
 import yaml
 
+try:
+    from markdown_it import MarkdownIt
+except ImportError:  # reported by workflow_table_rows, never skipped
+    MarkdownIt = None
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
@@ -86,73 +91,110 @@ def required_checks():
     return checks
 
 
-TABLE_HEADING = "### Workflows and required checks"
+TABLE_HEADING = "Workflows and required checks"
 JOB_ID = re.compile(r"[A-Za-z0-9_-]+")
 
 
-def split_row(line):
-    """The cells of one pipe-table row: split on unescaped `|`, drop the
-    outer pipes, strip whitespace."""
-    cells = re.split(r"(?<!\\)\|", line.strip())
-    if len(cells) < 2 or cells[0] != "" or cells[-1] != "":
-        raise AssertionError(f"not a pipe-table row: {line!r}")
-    return [c.strip() for c in cells[1:-1]]
+def _inline_text(token):
+    return "".join(
+        child.content for child in (token.children or []) if child.type != "softbreak"
+    )
 
 
 def workflow_table_rows():
-    """[{column name: cell}] for each data row of the first pipe table under
-    TABLE_HEADING in AGENTS.md. Only that table is read, so a stray mention
-    elsewhere in the file cannot stand in for a deleted row."""
-    lines = AGENTS_MD.read_text(encoding="utf-8").splitlines()
-    try:
-        start = lines.index(TABLE_HEADING)
-    except ValueError:
-        raise AssertionError(f"AGENTS.md has no {TABLE_HEADING!r} line") from None
-    table = []
-    for line in lines[start + 1:]:
-        if line.startswith("#"):
-            break
-        if line.lstrip().startswith("|"):
-            table.append(line)
-        elif table:
-            break
-    if len(table) < 3:
+    """[{column name: inline token}] for each data row of the first
+    table under the TABLE_HEADING h3 in AGENTS.md. AGENTS.md is parsed with
+    markdown-it-py (CommonMark plus tables) and only that table is read, so a
+    stray mention elsewhere in the file cannot stand in for a deleted row.
+    Markdown drops cells past the header's width, so only a short row is
+    reported as the wrong cell count."""
+    if MarkdownIt is None:
         raise AssertionError(
-            f"no pipe table (header, delimiter, rows) under {TABLE_HEADING!r}"
+            "markdown-it-py is not installed; run "
+            "`python3 -m pip install -r requirements-dev.txt`"
         )
-    header = split_row(table[0])
+    tokens = MarkdownIt("commonmark").enable("table").parse(
+        AGENTS_MD.read_text(encoding="utf-8")
+    )
+    start = None
+    for i, tok in enumerate(tokens):
+        if (
+            tok.type == "heading_open"
+            and tok.tag == "h3"
+            and _inline_text(tokens[i + 1]) == TABLE_HEADING
+        ):
+            start = i + 1
+            break
+    if start is None:
+        raise AssertionError(f"AGENTS.md has no '### {TABLE_HEADING}' heading")
+    table = None
+    for i in range(start, len(tokens)):
+        if tokens[i].type == "heading_open":
+            break
+        if tokens[i].type == "table_open":
+            table = i
+            break
+    if table is None:
+        raise AssertionError(f"no table under '### {TABLE_HEADING}'")
+    header, rows, current, in_head = [], [], None, False
+    for tok in tokens[table:]:
+        if tok.type == "table_close":
+            break
+        if tok.type == "thead_open":
+            in_head = True
+        elif tok.type == "thead_close":
+            in_head = False
+        elif tok.type == "tr_open":
+            current = []
+        elif tok.type == "tr_close":
+            if not in_head:
+                rows.append(current)
+        elif tok.type == "inline":
+            if in_head:
+                header.append(_inline_text(tok).strip())
+            else:
+                current.append(tok)
     for column in ("Workflow", "Job", "Required"):
         if header.count(column) != 1:
             raise AssertionError(
-                f"table under {TABLE_HEADING!r} needs exactly one {column!r} "
-                f"column; header is {header}"
+                f"table under '### {TABLE_HEADING}' needs exactly one "
+                f"{column!r} column; header is {header}"
             )
-    if not all(re.fullmatch(r":?-+:?", c) for c in split_row(table[1])):
-        raise AssertionError(f"second table line is not a delimiter row: {table[1]!r}")
-    rows = []
-    for line in table[2:]:
-        cells = split_row(line)
+    result = []
+    for cells in rows:
         if len(cells) != len(header):
             raise AssertionError(
-                f"row has {len(cells)} cells, header has {len(header)}: {line!r}"
+                f"row has {len(cells)} cells, header has {len(header)}: "
+                f"{[_inline_text(c) for c in cells]}"
             )
-        rows.append(dict(zip(header, cells)))
-    return rows
+        result.append(dict(zip(header, cells)))
+    return result
 
 
 def job_id_of(cell):
-    """The first backticked token in a Job cell, else the plain identifier."""
-    match = re.search(r"`([^`\n]+)`", cell)
-    token = match.group(1) if match else cell
+    """The first code span in a Job cell, else its plain text if that is a
+    bare identifier."""
+    for child in cell.children or []:
+        if child.type == "code_inline":
+            token = child.content
+            break
+    else:
+        token = _inline_text(cell).strip()
     if not JOB_ID.fullmatch(token):
-        raise AssertionError(f"cannot read a job id from the Job cell {cell!r}")
+        raise AssertionError(
+            f"cannot read a job id from the Job cell {_inline_text(cell)!r}"
+        )
     return token
 
 
 def table_entries():
     """[(workflow file, job id, Required cell)] from the AGENTS.md table."""
     return [
-        (row["Workflow"], job_id_of(row["Job"]), row["Required"])
+        (
+            _inline_text(row["Workflow"]).strip(),
+            job_id_of(row["Job"]),
+            _inline_text(row["Required"]).strip(),
+        )
         for row in workflow_table_rows()
     ]
 
@@ -220,7 +262,7 @@ class RequiredChecksTests(unittest.TestCase):
                 1,
                 msg=(
                     f"{path.name}:{job_id} runs on pull requests and needs exactly "
-                    f"one row in the AGENTS.md table under {TABLE_HEADING!r}; "
+                    f"one row in the AGENTS.md table under '### {TABLE_HEADING}'; "
                     f"found {len(rows)}"
                 ),
             )
