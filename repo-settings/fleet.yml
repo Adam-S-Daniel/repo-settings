@@ -244,7 +244,14 @@ defaults:
       require_extra_approval_for_unattributed_changes: false
     block_force_pushes: true
     block_deletions: true
-    required_status_checks: []
+    # why: _agent-guidance ADR 0021 -- the sync delivers agent-checks.yml (or,
+    # in adam-agentskills, a ci.yml job with the same id) to every fleet repo.
+    # It runs .githooks/agent-checks over every commit a PR adds: the check a
+    # local `--no-verify` skips. Job id `agent-checks`, no `name:`, no matrix,
+    # no `concurrency:`, no `timeout-minutes`, no path filter, so it reports on
+    # every pull request (the cms-platform#437 preconditions). A per-repo
+    # override REPLACES this list, so each override below repeats it.
+    required_status_checks: [agent-checks]
     admin_bypass: true
     # Fleet-standard bot writers only (each with a justifying comment) -- the
     # narrow exception to "declare bypass actors per-repo": these bots write
@@ -349,7 +356,7 @@ repos:
   - name: Adam-S-Daniel/adam-agentskills
     overrides:
       ruleset:
-        required_status_checks: [privacy, pytest, pytest-windows, plugin-runtime-approval]
+        required_status_checks: [privacy, pytest, pytest-windows, plugin-runtime-approval, agent-checks]
       actions_policies:
         - name: "plugin-runtime-review: allow pull_request_target"
           enforcement: active
@@ -406,7 +413,7 @@ repos:
   - name: Adam-S-Daniel/skills-evals
     overrides:
       ruleset:
-        required_status_checks: [test]
+        required_status_checks: [test, agent-checks]
       # why: skills-evals' scaffold gate opens DRAFT fixture PRs with the
       # workflow GITHUB_TOKEN, which GitHub allows only while "Allow GitHub
       # Actions to create and approve pull requests" is on. The same switch
@@ -456,7 +463,7 @@ repos:
   - name: Adam-S-Daniel/claude-memory-map
     overrides:
       ruleset:
-        required_status_checks: [test]
+        required_status_checks: [test, agent-checks]
   - name: jodidaniel/squarespacetemp
   # --- onboarded 2026-07-21 after the same audit: all workflows contents:read,
   #     no pushes to the default branch, every action SHA-pinned. wsl-automation
@@ -469,7 +476,7 @@ repos:
   - name: Adam-S-Daniel/fastmail-actions
     overrides:
       ruleset:
-        required_status_checks: [pester]
+        required_status_checks: [pester, agent-checks]
   # ai-usage-dashboard: public, onboarded 2026-10-03. Audit 2026-10-04 after
   # [PR #5](https://github.com/Adam-S-Daniel/ai-usage-dashboard/pull/5) and
   # [PR #6](https://github.com/Adam-S-Daniel/ai-usage-dashboard/pull/6)
@@ -495,7 +502,7 @@ repos:
   - name: Adam-S-Daniel/ai-usage-dashboard
     overrides:
       ruleset:
-        required_status_checks: [node-test, pester]
+        required_status_checks: [node-test, pester, agent-checks]
 
   # --- GHA-bench: migrated from classic branch protection to a ruleset (the
   #     fleet standard). Now managed like the other public repos. ---
@@ -530,7 +537,7 @@ repos:
   - name: Adam-S-Daniel/_agent-guidance
     overrides:
       ruleset:
-        required_status_checks: [test]
+        required_status_checks: [test, agent-checks]
       # why: the changelog routine accumulates on `persistent/vendor-changelog`
       # across PRs. Only deletion is blocked, with no bypass actors: bots and
       # humans still push, and delete_branch_on_merge silently skips the
