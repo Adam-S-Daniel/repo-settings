@@ -498,6 +498,40 @@ def _bypass_entries(actors: list | None) -> list[dict]:
     return out
 
 
+# `ruleset.admin_bypass`: each accepted value and the `bypass_mode` it gives
+# the repository Admin role (None = no admin bypass entry). GitHub's enum for
+# bypass_actors[].bypass_mode is always | pull_request | exempt, default always
+# (https://docs.github.com/en/rest/repos/rules#create-a-repository-ruleset).
+# `pull_request` lets an admin merge a pull request past the rules but not push
+# directly. The key grants access, so it is required wherever a ruleset is
+# enabled and has no default here: omitting it must not widen access
+# (_agent-guidance docs/reference/settings-schema-design.md, rule 2).
+ADMIN_BYPASS_MODES: dict[str, str | None] = {
+    "always": "always",
+    "pull_request": "pull_request",
+    "none": None,
+}
+
+
+def admin_bypass_mode(cfg: dict) -> str | None:
+    """Validate `admin_bypass` in an enabled ruleset's effective config and
+    return the admin role's bypass_mode, or None for no admin entry."""
+    accepted = " | ".join(ADMIN_BYPASS_MODES)
+    if "admin_bypass" not in cfg:
+        raise SystemExit(
+            f"error: ruleset.admin_bypass is required when the ruleset is "
+            f"enabled (accepted values: {accepted})"
+        )
+    value = cfg["admin_bypass"]
+    # isinstance first: a YAML boolean, or an unhashable value, is never one
+    # of the string keys.
+    if not isinstance(value, str) or value not in ADMIN_BYPASS_MODES:
+        raise SystemExit(
+            f"error: ruleset.admin_bypass must be one of {accepted} (got {value!r})"
+        )
+    return ADMIN_BYPASS_MODES[value]
+
+
 def build_ruleset_body(cfg: dict) -> dict:
     """Build the POST/PUT body for a desired ruleset from config."""
     name = cfg.get("name", DEFAULT_RULESET_NAME)
@@ -578,12 +612,13 @@ def build_ruleset_body(cfg: dict) -> dict:
             }
         )
     bypass: list[dict] = []
-    if cfg.get("admin_bypass", True):
+    admin_mode = admin_bypass_mode(cfg)
+    if admin_mode is not None:
         bypass.append(
             {
                 "actor_id": ADMIN_ROLE_ID,
                 "actor_type": "RepositoryRole",
-                "bypass_mode": "always",
+                "bypass_mode": admin_mode,
             }
         )
     for entry in _bypass_entries(cfg.get("bypass_actors")):
@@ -783,9 +818,16 @@ def ruleset_doc(branch_rs: dict) -> dict:
         "block_force_pushes": "non_fast_forward" in norm["rule_types"],
         "block_deletions": "deletion" in norm["rule_types"],
         "required_status_checks": norm["checks"],
-        "admin_bypass": any(
-            t == "RepositoryRole" and i == ADMIN_ROLE_ID
-            for (t, i, _m) in norm["bypass"]
+        # The admin role's live bypass_mode, or "none". A mode outside
+        # ADMIN_BYPASS_MODES (GitHub's `exempt`) is emitted as read, so the
+        # generated config fails validation rather than silently changing it.
+        "admin_bypass": next(
+            (
+                m
+                for (t, i, m) in norm["bypass"]
+                if t == "RepositoryRole" and i == ADMIN_ROLE_ID
+            ),
+            "none",
         ),
     }
     extra = [
@@ -1711,6 +1753,9 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
     if ruleset_cfg.get("enabled"):
         name = ruleset_cfg.get("name", DEFAULT_RULESET_NAME)
         plan_ruleset(name, build_ruleset_body(ruleset_cfg), normalize_ruleset)
+    elif "admin_bypass" in ruleset_cfg:
+        # Not required while disabled, but a value that is given is checked.
+        admin_bypass_mode(ruleset_cfg)
 
     # Extra named rulesets: same by-name idempotence. Removing an entry from
     # config leaves its live ruleset alone (never touches undeclared rulesets).
@@ -2264,7 +2309,15 @@ def _filter_owner(targets: list[dict], owner: str | None) -> list[dict]:
 
 
 def installation_repos(owner: str | None) -> list[str]:
-    """Every repository this credential can administer, as `owner/name`.
+    """Every repository this credential can administer, as `owner/name`."""
+    return sorted(installation_repo_visibility(owner))
+
+
+def installation_repo_visibility(owner: str | None) -> dict[str, bool]:
+    """Every repository this credential can administer, as `owner/name` mapped
+    to whether it is private. A response missing `private` counts as private:
+    withholding a name wrongly costs a local re-run, publishing one cannot be
+    undone.
 
     `/installation/repositories` rather than `/users/{o}/repos` or
     `/orgs/{o}/repos`, for three reasons and the third is the one that matters:
@@ -2275,7 +2328,7 @@ def installation_repos(owner: str | None) -> list[str]:
     and reporting those as "undeclared" would be reporting a gap nothing in
     this repo could close.
     """
-    repos: list[str] = []
+    repos: dict[str, bool] = {}
     page = 1
     while True:
         # `gh api` follows no pagination of its own here because the response
@@ -2284,14 +2337,15 @@ def installation_repos(owner: str | None) -> list[str]:
         chunk = (payload or {}).get("repositories") or []
         if not chunk:
             break
-        repos.extend(r["full_name"] for r in chunk)
+        for r in chunk:
+            repos[r["full_name"]] = bool(r.get("private", True))
         if len(chunk) < 100:
             break
         page += 1
     if owner:
         o = owner.lower()
-        repos = [r for r in repos if r.split("/", 1)[0].lower() == o]
-    return sorted(repos)
+        repos = {n: v for n, v in repos.items() if n.split("/", 1)[0].lower() == o}
+    return repos
 
 
 def cmd_coverage(args) -> int:
@@ -2311,6 +2365,13 @@ def cmd_coverage(args) -> int:
     failed, because a clean line over zero repos reads exactly like a clean
     line over all of them. A refused config is also 2 (ConfigError, raised
     before any API call).
+
+    The output goes to a public CI log and into an auto-filed issue, so the
+    name of an undeclared PRIVATE repo is withheld (a count is printed) unless
+    `--show-private` is passed, which is for local use only. Declared private
+    repos are still named: `fleet.yml` is in this repo and already names them,
+    so printing them adds no exposure. Only undeclared private names are new
+    information.
     """
     cfg = load_config(args.config)
     if "repos" not in cfg:
@@ -2321,7 +2382,9 @@ def cmd_coverage(args) -> int:
         return 2
 
     declared = {t["repo"].lower(): t for t in resolve_targets(cfg, None)}
-    reachable = installation_repos(getattr(args, "owner", None))
+    visibility = installation_repo_visibility(getattr(args, "owner", None))
+    reachable = sorted(visibility)
+    show_private = getattr(args, "show_private", False)
     if not reachable:
         sys.stderr.write(
             "coverage: the installation reported no repositories -- refusing to "
@@ -2330,12 +2393,21 @@ def cmd_coverage(args) -> int:
         return 2
 
     undeclared = [r for r in reachable if r.lower() not in declared]
+    withheld = 0
     for repo in reachable:
         t = declared.get(repo.lower())
-        if t is None:
+        if t is None and visibility[repo] and not show_private:
+            withheld += 1
+        elif t is None:
             print(f"UNDECLARED  {repo}: reachable by this credential, absent from the config")
         else:
             print(f"OK          {repo}: declared, {manage_label(t)}")
+
+    if withheld:
+        print(
+            f"UNDECLARED (private)  {withheld} undeclared private repo(s); "
+            "names withheld because this log is public"
+        )
 
     print(
         f"\n{len(reachable)} reachable, {len(reachable) - len(undeclared)} declared, "
@@ -2414,6 +2486,12 @@ def main() -> int:
     )
     c.add_argument("--config", required=True)
     c.add_argument("--owner", help="only consider repos under this owner (account)")
+    c.add_argument(
+        "--show-private",
+        action="store_true",
+        help="name undeclared PRIVATE repos too; local use only, never in CI "
+        "(the log and the nudge issue are public)",
+    )
     c.set_defaults(func=cmd_coverage)
 
     args = p.parse_args()
