@@ -12,7 +12,7 @@ label then in use belonged to a single repo's workflow. The engine refused
 `labels` under `defaults:`.
 
 The `agent-authored` label marks PRs and issues an AI agent opens on the
-owner's behalf (_agent-guidance ADR 0021, in progress). It must exist in every
+owner's behalf (_agent-guidance ADR 0023, in progress). It must exist in every
 managed repo of both owners, which is the opposite case.
 
 ## Decision
