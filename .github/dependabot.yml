@@ -53,3 +53,15 @@ updates:
       # that one bump land without the third-party wait
       # (https://github.com/Adam-S-Daniel/cms-platform/issues/424).
       exclude: ["Adam-S-Daniel/cms-platform/*"]
+  # requirements.txt pins what the workflows install (PyYAML). Before this
+  # entry the workflows ran an unpinned `pip install pyyaml`, which no bump
+  # path could reach. Unlike github-actions, the pip ecosystem DOES support
+  # per-SemVer-tier cooldown, so majors wait 30 days here. Minor and patch
+  # tiers are left undefined and fall back to `default-days`.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 30

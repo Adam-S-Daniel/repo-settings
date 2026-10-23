@@ -6,10 +6,46 @@ protection is expressed as a **GitHub repository ruleset** (the modern
 replacement for classic branch protection, and the same primitive the
 cms-platform-managed repos use). Two document shapes are accepted.
 
+## Terms
+
+This document uses GitHub's YAML terms: a **key** names a setting, a **map**
+is a collection of keys and values, an **array** is an ordered list, an
+**element** is one item of an array, and a key is **omitted** when it is not
+written at all.
+
+A **surface** is one top-level key of a repo's resolved settings, which the
+engine plans independently. There are exactly seven, listed in canonical
+(alphabetical) order, the order of `SURFACES` in `scripts/repo_settings.py`:
+
+| Surface | Value | Section |
+|---|---|---|
+| `actions` | map | the single-repo example below, "Workflow permissions" |
+| `actions_policies` | array of maps, per-repo only | "`actions_policies:`" |
+| `extra_rulesets` | array of maps, per-repo only | "`extra_rulesets:`" |
+| `labels` | array of maps | "`labels:`" |
+| `repo` | map | "`repo:`" |
+| `ruleset` | map | the single-repo example below |
+| `security` | map | "`security:`" |
+
+Surfaces are top-level only: there is no way to manage part of `actions`.
+
+**Unknown keys are refused.** The engine accepts only the keys documented
+here, at every level: the fleet file's top level (`defaults`, `repos`), a
+`repos` element (`name`, `manage`, `overrides`), `defaults` and `overrides`
+(the seven surfaces), and the keys inside each surface (for an array surface,
+inside each element). A misspelling such as `overides:` or `rulesetz:` fails
+with an error that names the accepted keys, rather than being silently
+ignored. So does a map that names the same key twice: PyYAML would keep the
+last one, and the engine's loader refuses it instead.
+
+**A refused config exits 2**, before any API call, for every subcommand. 1
+already means drift for `diff` and undeclared repos for `coverage`.
+
 ## Single-repo shape
 
 Lives in a repo as `.github/repo-settings.yml`, or anywhere when passing
-`--repo`.
+`--repo`. The surfaces it manages are exactly the blocks present: an omitted
+block is not managed. There is no `manage` key in this shape.
 
 ```yaml
 # Optional. If omitted, pass --repo owner/name on the command line.
@@ -78,7 +114,7 @@ ruleset:
   #   target_branches: [main, release]
 
   # null / omit -> the "require a pull request before merging" rule is left off.
-  # a mapping   -> the rule is enabled.
+  # a map       -> the rule is enabled.
   require_pull_request:
     required_approving_review_count: 0   # 0 = PR required, self-merge allowed
     dismiss_stale_reviews: false
@@ -101,23 +137,37 @@ ruleset:
   # (recommended unless you have stable, always-present check names).
   required_status_checks: []
 
-  # true  = the repo Admin role bypasses the ruleset ("always") -- the human
-  #         owner can still push directly; only non-admins (incl. the Actions
-  #         bot) are forced through PRs.
-  # false = nobody bypasses (stricter; matches the cms-platform `main` ruleset).
-  admin_bypass: true
+  # The repository Admin role's bypass. REQUIRED wherever the ruleset is
+  # enabled, after `defaults:` and a repo's `overrides:` are merged: the key
+  # grants access, so the engine has no default for it and refuses a ruleset
+  # that omits it. Exactly one of these string values:
+  #   always       = admins bypass every rule, including by pushing directly
+  #                  to the branch; only non-admins (incl. the Actions bot)
+  #                  are forced through PRs. GitHub's bypass_mode "always".
+  #   pull_request = admins can merge a PR past the rules but cannot push
+  #                  directly. GitHub's bypass_mode "pull_request".
+  #   none         = no admin bypass element is rendered; nobody bypasses
+  #                  (matches the cms-platform `main` ruleset).
+  # Any other value is refused, booleans included (`true`/`false`, and YAML
+  # 1.1's yes/no/on/off, which PyYAML loads as booleans). Under a disabled
+  # ruleset the key may be omitted; a value that is given is still checked.
+  # GitHub's own enum also has `exempt`, which this key does not accept.
+  admin_bypass: always
 
-  # Extra bypass actors beyond the Admin-role toggle above. This is the
+  # Extra bypass actors beyond the Admin-role setting above. This is the
   # sanctioned path for the RARE bot that genuinely must write to the protected
   # default branch (docs/decisions/0001): declare its service identity here so
   # the grant is auditable and drift-checked -- never hand-grant bypass in the
-  # GitHub UI (the drift report will flag it). Each entry:
+  # GitHub UI (the drift report will flag it). Each element:
   #   actor_type:  Integration | Team | RepositoryRole | OrganizationAdmin | DeployKey
   #   actor_id:    numeric id (for Integration, the GitHub App's id)
   #   bypass_mode: always | pull_request   (default: always)
   # Omit or leave empty for no extra actors -- the default AND the policy
   # default: generated data belongs on an unprotected results branch instead.
-  # In fleet configs, a defaults-level entry is reserved for fleet-standard bots.
+  # In fleet configs, a defaults-level element is reserved for fleet-standard bots.
+  # A repo's `overrides:` array REPLACES the defaults' array (arrays are not
+  # merged), so `bypass_actors: []` there drops every fleet-standard element
+  # for that repo, as repo-settings' own element does.
   bypass_actors: []
 ```
 
@@ -134,7 +184,7 @@ extra_rulesets:
     target_branches: [roster/proposal]  # required; each -> refs/heads/<b>; patterns allowed
     rules: [creation, update, deletion, non_fast_forward]   # required; only these four
     enforcement: active                 # optional; active | evaluate | disabled
-    bypass_actors:                      # same entry shape/validation as `ruleset.bypass_actors`
+    bypass_actors:                      # same element shape/validation as `ruleset.bypass_actors`
       - {actor_type: Integration, actor_id: 5116415, bypass_mode: always}
       - {actor_type: RepositoryRole, actor_id: 5, bypass_mode: always}
 ```
@@ -148,7 +198,7 @@ extra_rulesets:
 - **By name, like `ruleset:`.** apply POSTs when the name is absent, PUTs when
   present; `diff` reports `MISSING`/`DRIFT`. Private repos without Pro are
   skipped as for `ruleset:`.
-- **Removal does not delete.** Dropping an entry leaves the live ruleset alone,
+- **Removal does not delete.** Dropping an element leaves the live ruleset alone,
   consistent with "never touches other rulesets"; delete it by hand.
 - **Per-repo only.** `extra_rulesets` under `defaults:` is rejected: list
   values are replaced (not merged) by an override, so a fleet default would be
@@ -157,7 +207,7 @@ extra_rulesets:
 - `generate` does not emit `extra_rulesets`; it identifies the default ruleset
   by its name.
 
-### `labels:` -- repo labels (per-repo only)
+### `labels:` -- repo labels (fleet-wide defaults plus per-repo)
 
 A sibling of `extra_rulesets:` (a top-level key in single-repo configs; under a
 repo's `overrides:` in fleet configs) holding a LIST of labels the repo must
@@ -173,24 +223,28 @@ labels:
 - **By name, like `ruleset:`.** The plan reads `GET repos/{repo}/labels/{name}`:
   a match is `ok`; a 404 is `DRIFT` (apply POSTs `repos/{repo}/labels`); a
   different color, description or name casing is `DRIFT` (apply PATCHes the
-  label in place). Names compare case-insensitively on GitHub, so two entries
+  label in place). Names compare case-insensitively on GitHub, so two elements
   differing only in case are refused; color compares case-insensitively.
 - **A bare 404 is probed, not trusted.** A 404 reads the same whether the label
   is missing or the repo is invisible to the credential, so the plan then reads
   the repo itself: if that fails, the record is an `error`, never a create.
-- **Removal does not delete.** Dropping an entry leaves the live label alone,
+- **Removal does not delete.** Dropping an element leaves the live label alone,
   consistent with "never touches other rulesets"; delete it by hand.
-- **Per-repo only.** `labels` under `defaults:` is rejected, for the same
-  list-replacement reason as `extra_rulesets`, and because a label belongs to
-  one repo's workflow.
+- **Defaults merge with per-repo labels.** `labels` under `defaults:` is
+  created in every managed repo (docs/decisions/0010). Because `deep_merge`
+  replaces lists, the engine merges this one key by name: a repo's own
+  `overrides.labels` element replaces a default of the same name
+  (case-insensitive), and the rest of both lists apply. A repo that declares
+  no labels simply gets the defaults.
 - **Not visibility-gated.** Labels exist on every plan.
-- **Needs a permission the fan-out App may not hold.** Creating or editing a
-  label needs the credential's **Issues** (or Pull requests) **write**
-  permission, which is not part of the documented Administration + Actions +
-  Metadata grant. A write the credential cannot make comes back as an `error`
-  record naming the HTTP failure, never a silent skip. Verify the App's grant
-  (or apply from ambient `gh auth`) before relying on the scheduled run to
-  create a label.
+- **Needs Issues write.** Creating or editing a label needs the credential's
+  **Issues** (or Pull requests) **write** permission. The fan-out App holds
+  Issues: Read & write alongside Administration and Actions (README, "CI
+  fan-out"): the jodidaniel installation's permissions were read directly,
+  and the Adam-S-Daniel one is inferred from the
+  [2026-10-23 apply run](https://github.com/Adam-S-Daniel/repo-settings/actions/runs/39945750183)'s
+  label writes. A credential without it gets an `error` record naming the
+  HTTP failure for each write, never a silent skip.
 - `generate` does not emit `labels`.
 
 ### `actions_policies:` -- repository Actions event policies (per-repo only)
@@ -228,9 +282,9 @@ actions_policies:
   policies (`source_type` other than `Repository`) even when the name matches.
   Two live policies with a declared name is an `error`: the engine will not
   guess which one to converge; delete the extras by hand.
-- **Removal does not delete.** Dropping an entry leaves the live policy alone.
+- **Removal does not delete.** Dropping an element leaves the live policy alone.
   To retire one, set `enforcement: disabled`, let it apply, delete the policy by
-  hand, then drop the entry. For adam-agentskills' policy, dropping it
+  hand, then drop the element. For adam-agentskills' policy, dropping it
   re-exposes `plugin-runtime-review.yml` to the default block.
 - **Compared fields:** enforcement, `include` and `exclude` (as sets) and the
   rules (as a set of type and parameters, `allowed_events` as a set). Server
@@ -301,12 +355,12 @@ repo:
 **Collision with the single-repo shape's identifier field:** the single-repo
 shape already uses the top-level key `repo:` for the identifier string shown
 above (`repo: Adam-S-Daniel/agentskills`) -- the same key can't be both a
-string and a mapping in one document. If you want to manage
+string and a map in one document. If you want to manage
 `repo.allow_auto_merge` from a single-repo config file, pass the identifier as
 `--repo owner/name` on the command line instead of embedding it in the file,
-and put the mapping form (above) in the file's `repo:` key. This collision
+and put the map form (above) in the file's `repo:` key. This collision
 does not exist in the fleet/fan-out shape below, where the identifier always
-comes from each entry's `name:` and `repo:` is free to be a settings mapping.
+comes from each element's `name:` and `repo:` is free to be a settings map.
 
 ### `security:` -- Dependabot alerts and security updates
 
@@ -419,9 +473,47 @@ for the full reasoning.
 
 ## Fleet / fan-out shape
 
-One document describing many repos. `defaults:` is the baseline every repo
-inherits; each entry may add `overrides:` (deep-merged over the defaults) or set
-`manage: false` to exclude the repo (reported as excluded, not touched).
+One document describing many repos. The top level is a map with two keys:
+`defaults`, an optional map of surfaces that every repo inherits, and `repos`,
+an array with one element per repo. Each element is a map with these keys:
+
+| Key | Required | Value |
+|---|---|---|
+| `name` | yes | `owner/repo`; two elements may not name the same repo (compared case-insensitively) |
+| `manage` | yes | an array of surfaces; see below |
+| `overrides` | no | a map of surfaces, deep-merged over `defaults` (`labels` merges by name) |
+
+An element must be a map: a bare string (`- owner/repo`) cannot carry
+`manage` and is refused.
+
+### `manage`
+
+`manage` selects the surfaces the engine plans for that repo. It is required,
+because it selects what the tool acts on and no default would select nothing
+(docs/decisions/0011). Its value is an array of strings:
+
+| Value | Meaning |
+|---|---|
+| `["all"]` | every surface, **including any added to the engine later** |
+| `["labels"]`, `["labels", "security"]`, ... | only those surfaces |
+| `[]` | declared, nothing managed: reported as excluded, never planned |
+
+Every other value is refused, with an error that names the accepted ones:
+`manage` omitted; any value that is not an array, booleans and null included;
+an element that is not a string (an unquoted `[no]` is one, because PyYAML
+loads `no`, `yes`, `on` and `off` as booleans); an unknown surface name,
+including `"none"`, `""` and case variants such as `"Labels"`; `"all"`
+alongside other elements; a surface listed twice; surfaces out of canonical
+(alphabetical) order, since `["security", "labels"]` and `["labels",
+"security"]` would be two values with one meaning; and all seven surfaces
+listed out, which is `["all"]`.
+
+The engine validates the whole file first, including `[]` elements and the
+surfaces a `manage` array leaves out, and only then keeps the listed surfaces
+of each repo, after `defaults`, `overrides` and the label merge are applied. A
+surface reaches the planner only when `manage` names it, so the filter fails
+closed. `diff`, `apply` and `coverage` print each repo's scope as `managed:
+all`, `managed: labels, security` or `excluded (manage: [])`.
 
 ```yaml
 defaults:
@@ -447,28 +539,36 @@ defaults:
       require_extra_approval_for_unattributed_changes: false
     block_force_pushes: true
     block_deletions: true
-    admin_bypass: true
+    admin_bypass: always
 
 repos:
   # Inherits everything from defaults, incl. repo.allow_auto_merge.
-  - name: Adam-S-Daniel/agentskills
+  - name: Adam-S-Daniel/adam-agentskills
+    manage: ["all"]
 
   # Private repo: the engine auto-skips fork_pr_approval and the ruleset, but
   # repo.allow_auto_merge still applies (it's not visibility-gated) unless
   # overridden here.
   - name: Adam-S-Daniel/rss-inator
+    manage: ["all"]
     overrides:
       ruleset: { enabled: false }
 
   # Scratch/experimental repo: keep the harmless Actions hardening, skip the
   # workflow-changing ruleset.
   - name: Adam-S-Daniel/scratch-jules-001
+    manage: ["all"]
     overrides:
       ruleset: { enabled: false }
 
-  # Excluded entirely (e.g. a fork, or a repo owned by another settings system).
+  # Labels only: every other surface is owned elsewhere.
+  - name: Adam-S-Daniel/example-site
+    manage: ["labels"]
+
+  # Declared and excluded entirely (e.g. a fork, or a repo owned by another
+  # settings system).
   - name: Adam-S-Daniel/OctopusDeploy-Api
-    manage: false
+    manage: []
 ```
 
 ## Downgrade behavior (why one baseline works everywhere)

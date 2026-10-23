@@ -1,0 +1,15 @@
+# TEST-ONLY packages, on top of the runtime pins in requirements.txt. Only
+# .github/workflows/tests.yml installs this file. repo-settings.yml holds the
+# App private key and must keep installing requirements.txt alone, so
+# test-only packages never run beside that secret;
+# tests/test_workflow_dependency_pins.py enforces the split.
+#
+# Pins are exact, including the transitive dependency. Same 7-day rule as
+# requirements.txt.
+-r requirements.txt
+
+# tests/test_required_checks.py parses AGENTS.md with it. 4.2.0 was uploaded
+# 2026-05-07.
+markdown-it-py==4.2.0
+# markdown-it-py's only dependency. 0.1.2 was uploaded 2022-08-14.
+mdurl==0.1.2

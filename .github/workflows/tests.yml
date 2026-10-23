@@ -2,22 +2,14 @@
 name: tests
 
 on:
+  # `unit` is a REQUIRED check (repo-settings/fleet.yml, issue #86), so the
+  # pull_request trigger has no `paths`: a path filter that skips the workflow
+  # leaves the required context unreported and blocks the merge. No early
+  # "salient paths" gate step either: the whole job takes about 10 s, and a
+  # gate would add a way to fail open (the default shallow merge checkout has
+  # no base.sha to diff against) plus a second path list to keep in sync. No
+  # `concurrency` group: a required check must not have one.
   pull_request:
-    paths:
-      - "scripts/**"
-      - "tests/**"
-      - "repo-settings/**"
-      # Any workflow change runs the suite. Narrower than this ("just
-      # tests.yml") left a Dependabot action-SHA bump to a DIFFERENT workflow
-      # file producing zero check-runs on its PR, which the unattended-merge
-      # sweep in dependabot-auto-merge.yml refuses to merge on (it requires at
-      # least one concluded green check, never zero signal) — so the PR would
-      # sit open forever.
-      - ".github/workflows/**"
-      # dependabot.yml is locked by tests/test_dependabot_config.py. GitHub
-      # validates that file only after it reaches main, so a config-only
-      # change must still run the suite on its PR.
-      - ".github/dependabot.yml"
   push:
     branches: [main]
     paths:
@@ -35,6 +27,11 @@ on:
       # validates that file only after it reaches main, so a config-only
       # change must still run the suite on its PR.
       - ".github/dependabot.yml"
+      # The workflow installs these files, so a bump must run the suite on its PR.
+      - "requirements.txt"
+      - "requirements-dev.txt"
+      # tests/test_required_checks.py reads its exception list.
+      - "AGENTS.md"
 
 permissions:
   contents: read
@@ -50,6 +47,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install pyyaml
+        run: python3 -m pip install -r requirements-dev.txt
       - name: Run tests
         run: python3 -m unittest discover -s tests -v
