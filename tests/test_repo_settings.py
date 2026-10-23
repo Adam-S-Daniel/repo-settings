@@ -602,13 +602,13 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
     FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
 
     EXPECTED = {
-        "Adam-S-Daniel/claude-memory-map": ["test"],
-        "Adam-S-Daniel/skills-evals": ["test"],
-        "Adam-S-Daniel/fastmail-actions": ["pester"],
+        "Adam-S-Daniel/claude-memory-map": ["test", "agent-checks"],
+        "Adam-S-Daniel/skills-evals": ["test", "agent-checks"],
+        "Adam-S-Daniel/fastmail-actions": ["pester", "agent-checks"],
         "Adam-S-Daniel/GHA-bench": ["test"],
-        "Adam-S-Daniel/_agent-guidance": ["test"],
-        "Adam-S-Daniel/ai-usage-dashboard": ["node-test", "pester"],
-        "Adam-S-Daniel/wsl-automation": ["shell", "test", "test-linux"],
+        "Adam-S-Daniel/_agent-guidance": ["test", "agent-checks"],
+        "Adam-S-Daniel/ai-usage-dashboard": ["node-test", "pester", "agent-checks"],
+        "Adam-S-Daniel/wsl-automation": ["shell", "test", "test-linux", "agent-checks"],
     }
     PRE_EXISTING = {
         "Adam-S-Daniel/agentskills": ["pytest-windows"],
@@ -618,8 +618,11 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         # this "allowed but not asserted exactly by the other tests" bucket
         # rather than EXPECTED. `plugin-runtime-approval` (2026-10-08) is its
         # owner-approval gate for plugin runtime changes (its ADR 0016/0017).
-        "Adam-S-Daniel/adam-agentskills": ["privacy", "pytest", "pytest-windows", "plugin-runtime-approval"],
+        "Adam-S-Daniel/adam-agentskills": ["privacy", "pytest", "pytest-windows", "plugin-runtime-approval", "agent-checks"],
     }
+    # The fleet default (_agent-guidance ADR 0021): every other managed repo
+    # with a ruleset requires the delivered agent-checks job and nothing else.
+    DEFAULT = ["agent-checks"]
 
     def setUp(self):
         import yaml
@@ -648,11 +651,25 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
             )
             if repo in allowed:
                 self.assertEqual(checks, allowed[repo], msg=repo)
+            elif (target["settings"].get("ruleset") or {}).get("enabled") is False:
+                continue
             else:
-                self.assertFalse(
+                self.assertEqual(
                     checks,
-                    msg=f"{repo} unexpectedly declares required_status_checks: {checks!r}",
+                    self.DEFAULT,
+                    msg=f"{repo} declares required_status_checks {checks!r}, not the fleet default",
                 )
+
+    def test_every_override_keeps_the_fleet_default_check(self):
+        # deep_merge REPLACES lists, so an override that forgets to repeat
+        # agent-checks silently drops it for that repo.
+        for repo, target in self.targets.items():
+            if not target["manage"] or repo == "Adam-S-Daniel/GHA-bench":
+                continue
+            ruleset = target["settings"].get("ruleset") or {}
+            if ruleset.get("enabled") is False:
+                continue
+            self.assertIn("agent-checks", ruleset.get("required_status_checks") or [], msg=repo)
 
     def test_each_renders_a_required_status_checks_rule_with_exactly_those_contexts(self):
         for repo, checks in self.EXPECTED.items():
