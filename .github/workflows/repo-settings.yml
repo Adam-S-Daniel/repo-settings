@@ -35,7 +35,8 @@
 # Use that same two-step if the credential is ever rotated again.
 #
 # Behavior:
-#   * pull_request touching config/script -> drift report only (fails on drift)
+#   * pull_request touching config/script -> drift report only (fails on drift),
+#     under a read-only token (issue #91)
 #   * push to main / weekly schedule / manual dispatch -> apply
 
 name: repo-settings
@@ -93,8 +94,29 @@ jobs:
       - name: Install PyYAML
         run: python3 -m pip install -r requirements.txt
 
+      # Two mint steps, exactly one of which runs. The pull_request leg runs the
+      # PR branch's OWN engine, so anyone who can push a branch here would get
+      # the App's full grant (Administration, Actions and Issues write on every
+      # repo in both accounts) before review. It gets a read-only token instead
+      # (issue #91). Reads that need write -- the Actions policies endpoints,
+      # GET included -- come back as informational skips, never drift.
+      # tests/test_repo_settings_workflow_token.py locks this shape.
+      - name: Mint read-only GitHub App token for ${{ matrix.owner }} (pull request)
+        id: token_ro
+        if: github.event_name == 'pull_request'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REPO_SETTINGS_APP_PRIVATE_KEY }}
+          owner: ${{ matrix.owner }}
+          permission-administration: read
+          permission-actions: read
+          permission-issues: read
+          permission-metadata: read
+
       - name: Mint GitHub App token for ${{ matrix.owner }}
         id: token
+        if: github.event_name != 'pull_request'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         with:
           client-id: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID }}
@@ -104,7 +126,7 @@ jobs:
       - name: Drift report (pull request)
         if: github.event_name == 'pull_request'
         env:
-          GH_TOKEN: ${{ steps.token.outputs.token }}
+          GH_TOKEN: ${{ steps.token_ro.outputs.token }}
         run: python scripts/repo_settings.py diff --config repo-settings/fleet.yml --owner ${{ matrix.owner }}
 
       - name: Apply (dry run)
