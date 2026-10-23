@@ -52,7 +52,7 @@ Per repo, according to `fleet.yml`:
 Private repos get SHA pinning + `repo.allow_auto_merge` — the API rejects
 fork-PR approval (422) and rulesets (403, needs GitHub Pro); the engine logs an
 explicit skip for those two only. `cms-platform` + its consumer sites are
-excluded (`manage: false`) — they own their settings via the platform's own
+excluded (`manage: []`) — they own their settings via the platform's own
 manifest, and two ruleset controllers on one repo would fight (GitHub enforces
 the union).
 
@@ -93,24 +93,31 @@ configured, the workflow **skips itself** (guarded on
 
 1. **Create a GitHub App** (github.com → Settings → Developer settings → GitHub
    Apps → New). Repository permissions: **Administration: Read & write**,
-   **Actions: Read & write**, **Metadata: Read-only**. No webhook.
+   **Actions: Read & write**, **Issues: Read & write** (the `labels` surface
+   creates and edits labels), **Metadata: Read-only**. No webhook. The
+   jodidaniel installation's permissions were read directly; the
+   Adam-S-Daniel one is inferred from the
+   [2026-10-23 apply run](https://github.com/Adam-S-Daniel/repo-settings/actions/runs/39945750183)'s
+   label writes.
 2. **Generate a private key** (downloads a `.pem`).
 3. **Install the App** on both `Adam-S-Daniel` and the `jodidaniel` org. You can
    grant access to just the repos in `fleet.yml` or choose "All repositories" --
    but know which, because the two differ in blast radius. **Both installations
    are currently on "All repositories"** (owner, 2026-08-29), so the App's
-   Administration + Actions **write** reach is every repo in both accounts.
-   `fleet.yml` declares 21 repos (the engine manages 16 of them -- five carry
-   `manage: false`), and declared-vs-in-account is equal today: 21 and 21, no
-   difference either way (verified 2026-08-29). So the exposure was prospective --
-   the next repo created in either account would be the first to sit inside the
-   App's reach while appearing in no registry.
+   Administration, Actions and Issues **write** reach is every repo in both
+   accounts. `fleet.yml` declares repos, and each element's required `manage`
+   array says which surfaces the engine manages there (`["all"]`, a list, or
+   `[]` for none; see [`repo-settings/schema.md`](repo-settings/schema.md),
+   "`manage`"). Declared-vs-in-account was equal when last verified
+   (2026-08-29). So the exposure is prospective -- the next repo created in
+   either account would be the first to sit inside the App's reach while
+   appearing in no registry.
    **That is now audited.** `repo_settings.py coverage` asks
    `/installation/repositories` what the credential can actually administer and
    reports anything `fleet.yml` does not DECLARE; the weekly workflow runs it
    per owner and files a `ci`-labelled issue naming the repos, closing it when
    the file catches up. Declared is the test, not managed: a repo carrying
-   `manage: false` has been decided about and is not reported -- which is what
+   `manage: []` has been decided about and is not reported -- which is what
    the two forks carry. Absence is the finding, because absence and a
    deliberate omission looked identical from outside the file.
    Three things it deliberately does NOT do: fail the weekly apply (a repo
