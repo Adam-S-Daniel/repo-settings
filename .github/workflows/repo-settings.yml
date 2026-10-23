@@ -147,10 +147,12 @@ jobs:
         run: |
           set -uo pipefail
           # No --show-private here: this log is public. See cmd_coverage.
+          # GitHub runs this under `bash -e`; `|| rc=$?` keeps a nonzero exit
+          # from killing the script before rc is recorded and the report shown.
+          rc=0
           python scripts/repo_settings.py coverage \
             --config repo-settings/fleet.yml --owner "$OWNER" \
-            > "coverage-$OWNER.txt" 2>&1
-          rc=$?
+            > "coverage-$OWNER.txt" 2>&1 || rc=$?
           # Three-valued, and the middle one is the whole point: 0 complete,
           # 1 something undeclared, 2 the question could not be asked. A `2`
           # must never reach the issue step as "nothing undeclared".
