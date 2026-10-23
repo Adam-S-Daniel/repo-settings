@@ -252,7 +252,13 @@ defaults:
     # every pull request (the cms-platform#437 preconditions). A per-repo
     # override REPLACES this list, so each override below repeats it.
     required_status_checks: [agent-checks]
-    admin_bypass: true
+    # The repository Admin role's bypass: always | pull_request | none
+    # (schema.md). The key is required wherever a ruleset is enabled and has
+    # no default in the engine, so it is set here for every repo that inherits
+    # the defaults. `always` lets an admin push directly to the default
+    # branch; it was `true` before issue #93 and renders the same ruleset.
+    # repo-settings overrides it to `pull_request` (see its element below).
+    admin_bypass: always
     # Fleet-standard bot writers only (each with a justifying comment) -- the
     # narrow exception to "declare bypass actors per-repo": these bots write
     # the same managed file(s) to every fleet repo, so the grant IS the fleet
@@ -602,6 +608,19 @@ repos:
         # repo goes public or the account moves to Pro.
         # https://github.com/Adam-S-Daniel/repo-settings/issues/86
         required_status_checks: [agent-checks, unit]
+        # why: no `always` bypass of any kind on this repo (issue #93). A
+        # direct push to main that touches fleet.yml or the engine runs the
+        # fleet-wide admin apply with no PR and no checks, and any session
+        # holding the owner's token is an admin. `pull_request` still lets an
+        # admin merge a PR past the rules.
+        # https://github.com/Adam-S-Daniel/repo-settings/issues/93
+        admin_bypass: pull_request
+        # why: this element's array replaces the defaults' array (deep_merge
+        # replaces arrays), dropping agents-md-sync's `always` bypass here. It
+        # needs no bypass: _agent-guidance's scripts/sync.sh falls back to
+        # opening a PR with auto-merge armed when the direct push is rejected,
+        # so the managed AGENTS.md still lands, through this repo's checks.
+        bypass_actors: []
 
   # --- scratch/experimental: Actions hardening only, no ruleset ---
   - name: Adam-S-Daniel/scratch-jules-001

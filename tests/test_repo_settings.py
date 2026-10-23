@@ -18,26 +18,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import repo_settings as rs
 
 
+ADMIN = {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
+
+
 class BuildRulesetBodyTests(unittest.TestCase):
-    def test_default_config_admin_only_bypass(self):
-        body = rs.build_ruleset_body({})
-        self.assertEqual(
-            body["bypass_actors"],
-            [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}],
-        )
-
-    def test_admin_bypass_false_yields_empty_bypass_actors(self):
-        body = rs.build_ruleset_body({"admin_bypass": False})
-        self.assertEqual(body["bypass_actors"], [])
-
     def test_bypass_actors_entry_coerces_string_id_and_defaults_mode(self):
         body = rs.build_ruleset_body(
-            {"bypass_actors": [{"actor_type": "Integration", "actor_id": "123456"}]}
+            {
+                "admin_bypass": "always",
+                "bypass_actors": [{"actor_type": "Integration", "actor_id": "123456"}],
+            }
         )
-        self.assertIn(
-            {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"},
-            body["bypass_actors"],
-        )
+        self.assertIn(ADMIN, body["bypass_actors"])
         self.assertIn(
             {"actor_id": 123456, "actor_type": "Integration", "bypass_mode": "always"},
             body["bypass_actors"],
@@ -46,13 +38,14 @@ class BuildRulesetBodyTests(unittest.TestCase):
     def test_explicit_bypass_mode_preserved(self):
         body = rs.build_ruleset_body(
             {
+                "admin_bypass": "always",
                 "bypass_actors": [
                     {
                         "actor_type": "Integration",
                         "actor_id": "123456",
                         "bypass_mode": "pull_request",
                     }
-                ]
+                ],
             }
         )
         self.assertIn(
@@ -67,7 +60,7 @@ class BuildRulesetBodyTests(unittest.TestCase):
     def test_bypass_actors_entry_duplicating_admin_appears_once(self):
         body = rs.build_ruleset_body(
             {
-                "admin_bypass": True,
+                "admin_bypass": "always",
                 "bypass_actors": [
                     {
                         "actor_type": "RepositoryRole",
@@ -77,67 +70,137 @@ class BuildRulesetBodyTests(unittest.TestCase):
                 ],
             }
         )
-        self.assertEqual(
-            body["bypass_actors"],
-            [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}],
-        )
+        self.assertEqual(body["bypass_actors"], [ADMIN])
 
     def test_invalid_actor_type_raises_system_exit(self):
         with self.assertRaises(SystemExit):
             rs.build_ruleset_body(
-                {"bypass_actors": [{"actor_type": "Bogus", "actor_id": 1}]}
+                {
+                    "admin_bypass": "always",
+                    "bypass_actors": [{"actor_type": "Bogus", "actor_id": 1}],
+                }
             )
 
     def test_non_mapping_bypass_actor_raises_system_exit(self):
         with self.assertRaises(SystemExit):
-            rs.build_ruleset_body({"bypass_actors": ["Integration"]})
+            rs.build_ruleset_body(
+                {"admin_bypass": "always", "bypass_actors": ["Integration"]}
+            )
 
     def test_missing_actor_id_raises_system_exit(self):
         with self.assertRaises(SystemExit):
             rs.build_ruleset_body(
-                {"bypass_actors": [{"actor_type": "Integration"}]}
+                {
+                    "admin_bypass": "always",
+                    "bypass_actors": [{"actor_type": "Integration"}],
+                }
             )
 
     def test_normalize_ruleset_includes_integration_bypass_tuple(self):
         body = rs.build_ruleset_body(
-            {"bypass_actors": [{"actor_type": "Integration", "actor_id": "123456"}]}
+            {
+                "admin_bypass": "always",
+                "bypass_actors": [{"actor_type": "Integration", "actor_id": "123456"}],
+            }
         )
         norm = rs.normalize_ruleset(body)
         self.assertIn(("Integration", 123456, "always"), norm["bypass"])
 
 
+class AdminBypassTests(unittest.TestCase):
+    """`ruleset.admin_bypass: always | pull_request | none` (issue #93)."""
+
+    def test_each_value_renders_its_admin_entry(self):
+        expected = {
+            "always": [ADMIN],
+            "pull_request": [dict(ADMIN, bypass_mode="pull_request")],
+            "none": [],
+        }
+        self.assertEqual(set(expected), set(rs.ADMIN_BYPASS_MODES))
+        for value, actors in expected.items():
+            with self.subTest(value=value):
+                body = rs.build_ruleset_body({"admin_bypass": value})
+                self.assertEqual(body["bypass_actors"], actors)
+
+    def test_booleans_and_unknown_values_are_rejected(self):
+        # YAML 1.1 loads true/false/yes/no/on/off as booleans; none of them,
+        # and no near-miss string, may stand in for an accepted value.
+        for value in (True, False, None, 0, 1, "true", "false", "yes", "Always",
+                      "pull_requests", "exempt", "", ["always"], {"mode": "always"}):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit) as cm:
+                    rs.build_ruleset_body({"admin_bypass": value})
+                # The message is built from the accepted values.
+                self.assertIn("always | pull_request | none", str(cm.exception.code))
+
+    def test_required_when_the_ruleset_is_enabled(self):
+        with self.assertRaises(SystemExit) as cm:
+            rs.build_ruleset_body({"enabled": True})
+        self.assertIn("required", str(cm.exception.code))
+        self.assertIn("always | pull_request | none", str(cm.exception.code))
+        with patch.object(rs, "gh_api", side_effect=AssertionError("no API")), \
+                self.assertRaises(SystemExit):
+            rs.plan_repo("o/r", {"ruleset": {"enabled": True}})
+
+    def test_not_required_when_the_ruleset_is_disabled(self):
+        with patch.object(rs, "gh_api", side_effect=AssertionError("no API")):
+            self.assertEqual(rs.plan_repo("o/r", {"ruleset": {"enabled": False}}), [])
+
+    def test_a_value_under_a_disabled_ruleset_is_still_checked(self):
+        with patch.object(rs, "gh_api", side_effect=AssertionError("no API")), \
+                self.assertRaises(SystemExit):
+            rs.plan_repo("o/r", {"ruleset": {"enabled": False, "admin_bypass": True}})
+
+    def test_live_pull_request_bypass_is_not_drift(self):
+        desired = rs.build_ruleset_body({"admin_bypass": "pull_request"})
+        live = dict(copy.deepcopy(desired), id=7)
+        self.assertEqual(rs.normalize_ruleset(live), rs.normalize_ruleset(desired))
+        always = rs.build_ruleset_body({"admin_bypass": "always"})
+        self.assertNotEqual(rs.normalize_ruleset(always), rs.normalize_ruleset(desired))
+
+
 class RulesetDocTests(unittest.TestCase):
     def test_admin_only_body_has_no_bypass_actors_key(self):
-        body = rs.build_ruleset_body({"name": "default branch protection"})
+        body = rs.build_ruleset_body(
+            {"name": "default branch protection", "admin_bypass": "always"}
+        )
         doc = rs.ruleset_doc(body)
-        self.assertTrue(doc["admin_bypass"])
+        self.assertEqual(doc["admin_bypass"], "always")
         self.assertNotIn("bypass_actors", doc)
 
     def test_admin_plus_integration_body_round_trips_extra_actor(self):
         body = rs.build_ruleset_body(
             {
                 "name": "default branch protection",
+                "admin_bypass": "always",
                 "bypass_actors": [{"actor_type": "Integration", "actor_id": "123456"}],
             }
         )
         doc = rs.ruleset_doc(body)
-        self.assertTrue(doc["admin_bypass"])
+        self.assertEqual(doc["admin_bypass"], "always")
         self.assertEqual(
             doc["bypass_actors"],
             [{"actor_type": "Integration", "actor_id": 123456, "bypass_mode": "always"}],
         )
 
-    def test_round_trip_through_generate_and_apply(self):
-        cfg = {
-            "name": "default branch protection",
-            "bypass_actors": [{"actor_type": "Integration", "actor_id": "123456"}],
-        }
-        body = rs.build_ruleset_body(cfg)
-        doc = rs.ruleset_doc(body)
-        round_tripped = rs.build_ruleset_body(doc)
-        self.assertEqual(
-            rs.normalize_ruleset(round_tripped), rs.normalize_ruleset(body)
-        )
+    def test_each_admin_bypass_value_round_trips_through_generate(self):
+        for value in rs.ADMIN_BYPASS_MODES:
+            with self.subTest(value=value):
+                body = rs.build_ruleset_body(
+                    {
+                        "name": "default branch protection",
+                        "admin_bypass": value,
+                        "bypass_actors": [
+                            {"actor_type": "Integration", "actor_id": "123456"}
+                        ],
+                    }
+                )
+                doc = rs.ruleset_doc(body)
+                self.assertEqual(doc["admin_bypass"], value)
+                self.assertEqual(
+                    rs.normalize_ruleset(rs.build_ruleset_body(doc)),
+                    rs.normalize_ruleset(body),
+                )
 
 
 class DeleteBranchOnMergeTests(unittest.TestCase):
@@ -331,6 +394,7 @@ class RulesetMergeMethodTests(unittest.TestCase):
     MERGE_ONLY_CFG = {
         "enabled": True,
         "name": "default branch protection",
+        "admin_bypass": "always",
         "require_pull_request": {
             "required_approving_review_count": 0,
             "allowed_merge_methods": ["merge"],
@@ -344,7 +408,7 @@ class RulesetMergeMethodTests(unittest.TestCase):
         # An existing config that never mentioned merge methods must render
         # exactly the ruleset it rendered before.
         body = rs.build_ruleset_body(
-            {"enabled": True, "name": "n", "require_pull_request": {}}
+            {"enabled": True, "name": "n", "admin_bypass": "always", "require_pull_request": {}}
         )
         self.assertEqual(
             self._pr_params(body)["allowed_merge_methods"],
@@ -427,6 +491,7 @@ class RulesetUnattributedApprovalTests(unittest.TestCase):
     OFF_CFG = {
         "enabled": True,
         "name": "default branch protection",
+        "admin_bypass": "always",
         "require_pull_request": {
             "required_approving_review_count": 0,
             "allowed_merge_methods": ["merge"],
@@ -457,7 +522,7 @@ class RulesetUnattributedApprovalTests(unittest.TestCase):
         # write_ruleset PUTs the whole body, so a key that is only sometimes
         # emitted is a key GitHub re-defaults to true on the next apply.
         body = rs.build_ruleset_body(
-            {"enabled": True, "name": "n", "require_pull_request": {}}
+            {"enabled": True, "name": "n", "admin_bypass": "always", "require_pull_request": {}}
         )
         self.assertIn(self.KEY, self._pr_params(body))
 
@@ -465,7 +530,7 @@ class RulesetUnattributedApprovalTests(unittest.TestCase):
         # A config that never mentioned the key must render exactly the ruleset
         # it rendered before the engine learned the field.
         body = rs.build_ruleset_body(
-            {"enabled": True, "name": "n", "require_pull_request": {}}
+            {"enabled": True, "name": "n", "admin_bypass": "always", "require_pull_request": {}}
         )
         self.assertIs(self._pr_params(body)[self.KEY], True)
 
@@ -477,7 +542,7 @@ class RulesetUnattributedApprovalTests(unittest.TestCase):
         # Absent from normalize_ruleset the field was invisible to `diff`, so
         # the daily drift report could never report it.
         on = rs.build_ruleset_body(
-            {"enabled": True, "name": "n", "require_pull_request": {}}
+            {"enabled": True, "name": "n", "admin_bypass": "always", "require_pull_request": {}}
         )
         off = rs.build_ruleset_body(dict(self.OFF_CFG))
         self.assertNotEqual(rs.normalize_ruleset(on), rs.normalize_ruleset(off))
@@ -512,7 +577,7 @@ class RulesetUnattributedApprovalTests(unittest.TestCase):
 
     def test_a_ruleset_without_a_pull_request_rule_is_unaffected(self):
         body = rs.build_ruleset_body(
-            {"enabled": True, "name": "n", "require_pull_request": None}
+            {"enabled": True, "name": "n", "admin_bypass": "always", "require_pull_request": None}
         )
         self.assertNotIn(
             "pull_request", [r["type"] for r in body["rules"]]
@@ -707,6 +772,10 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
                 msg=repo,
             )
             self.assertEqual(pr_params["allowed_merge_methods"], ["merge"], msg=repo)
+            if repo == AdminBypassFleetConfigTests.SELF:
+                # Its override also drops every `always` bypass (issue #93);
+                # AdminBypassFleetConfigTests pins what it renders instead.
+                continue
             self.assertIn(
                 {
                     "actor_type": "Integration",
@@ -1257,7 +1326,7 @@ class ExtraRulesetPlanTests(unittest.TestCase):
 class GenerateDefaultRulesetByNameTests(unittest.TestCase):
     def test_extra_ruleset_is_not_misattributed_as_default(self):
         extra = dict(rs.build_extra_ruleset_body(EXTRA_CFG), id=1)
-        default_body = rs.build_ruleset_body({"enabled": True})
+        default_body = rs.build_ruleset_body({"enabled": True, "admin_bypass": "always"})
         default = dict(default_body, id=2)
         summaries = [
             {"id": 1, "name": extra["name"], "target": "branch"},
@@ -1359,10 +1428,72 @@ class ExtraRulesetsFleetConfigTests(unittest.TestCase):
                         )
 
     def test_roster_admin_role_matches_default_ruleset_encoding(self):
-        default = rs.build_ruleset_body({"enabled": True})
+        default = rs.build_ruleset_body({"enabled": True, "admin_bypass": "always"})
         admin = default["bypass_actors"][0]
         self.assertIn(admin, rs.build_extra_ruleset_body(EXTRA_CFG)["bypass_actors"])
 
+
+class AdminBypassFleetConfigTests(unittest.TestCase):
+    """fleet.yml after the admin_bypass migration (issue #93), resolved and
+    rendered through the engine's own resolve_targets/build_ruleset_body."""
+
+    FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
+    SELF = "Adam-S-Daniel/repo-settings"
+    # Every enabled default-branch ruleset rendered exactly this before the
+    # migration (admin_bypass: true plus the defaults' agents-md-sync grant).
+    PRE_MIGRATION_BYPASS = [
+        {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"},
+        {"actor_id": 4268639, "actor_type": "Integration", "bypass_mode": "always"},
+    ]
+
+    def setUp(self):
+        import yaml
+
+        with open(self.FLEET, encoding="utf-8") as fh:
+            self.cfg = yaml.safe_load(fh)
+        self.targets = {t["repo"]: t for t in rs.resolve_targets(self.cfg, None)}
+
+    def test_defaults_declare_always(self):
+        self.assertEqual(self.cfg["defaults"]["ruleset"]["admin_bypass"], "always")
+
+    def test_every_enabled_ruleset_has_a_valid_admin_bypass(self):
+        for repo, t in self.targets.items():
+            ruleset = t["settings"].get("ruleset") or {}
+            if ruleset.get("enabled"):
+                with self.subTest(repo=repo):
+                    self.assertIn(ruleset.get("admin_bypass"), rs.ADMIN_BYPASS_MODES)
+
+    def test_repo_settings_has_no_always_bypass_of_any_kind(self):
+        settings = self.targets[self.SELF]["settings"]
+        self.assertTrue(settings["ruleset"]["enabled"])
+        bodies = [rs.build_ruleset_body(settings["ruleset"])]
+        bodies += rs.build_extra_ruleset_bodies(settings)
+        for body in bodies:
+            for actor in body["bypass_actors"]:
+                with self.subTest(ruleset=body["name"], actor=actor):
+                    self.assertNotEqual(actor["bypass_mode"], "always")
+        self.assertEqual(
+            bodies[0]["bypass_actors"],
+            [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "pull_request"}],
+        )
+
+    def test_other_repos_render_the_pre_migration_bypass(self):
+        checked = 0
+        for repo, t in self.targets.items():
+            ruleset = t["settings"].get("ruleset") or {}
+            if repo == self.SELF or not ruleset.get("enabled"):
+                continue
+            with self.subTest(repo=repo):
+                body = rs.build_ruleset_body(ruleset)
+                self.assertEqual(body["bypass_actors"], self.PRE_MIGRATION_BYPASS)
+                # The key changes nothing else in the body.
+                none = rs.build_ruleset_body(dict(ruleset, admin_bypass="none"))
+                self.assertEqual(
+                    {k: v for k, v in body.items() if k != "bypass_actors"},
+                    {k: v for k, v in none.items() if k != "bypass_actors"},
+                )
+            checked += 1
+        self.assertEqual(checked, 19)
 
 if __name__ == "__main__":
     unittest.main()
