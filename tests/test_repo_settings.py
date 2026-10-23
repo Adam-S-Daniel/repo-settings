@@ -593,7 +593,9 @@ class FleetConfigTests(unittest.TestCase):
 
 class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
     """cms-platform#437's five repos plus ai-usage-dashboard declare checks
-    (agentskills already carried the fleet's original `pytest-windows` check).
+    (agentskills already carried the fleet's original `pytest-windows` check),
+    and this repo itself declares `unit` beside `agent-checks` (issue #86;
+    unenforced while it is private, declared per ADR 0002).
     Parsed from the shipped fleet.yml -- never regex-scanned -- and rendered
     through the engine's OWN resolve_targets/build_ruleset_body so a
     mismerge between an override and the shared defaults is a red here, not
@@ -608,6 +610,7 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         "Adam-S-Daniel/GHA-bench": ["test"],
         "Adam-S-Daniel/_agent-guidance": ["test", "agent-checks"],
         "Adam-S-Daniel/ai-usage-dashboard": ["node-test", "pester", "agent-checks"],
+        "Adam-S-Daniel/repo-settings": ["agent-checks", "unit"],
     }
     PRE_EXISTING = {
         "Adam-S-Daniel/agentskills": ["pytest-windows"],
