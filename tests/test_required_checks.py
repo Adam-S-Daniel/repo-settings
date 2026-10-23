@@ -3,8 +3,9 @@
 The fleet rule makes every CI job that runs on pull requests a required check
 unless this repo's AGENTS.md says why not (issue #86). These tests hold that in
 place: they parse the workflows with `yaml` (never a regex over the YAML) and
-read the required checks through the engine's own `resolve_targets`, so a
-change to fleet.yml, a workflow or AGENTS.md that breaks the rule turns red
+read the required checks through the engine's own `resolve_targets`, and
+read only the table under "Workflows and required checks" in AGENTS.md, so a
+change to fleet.yml, a workflow or that table that breaks the rule turns red
 here. They fail closed: a trigger, ruleset or section they cannot find is a
 failure, not a skip.
 
@@ -28,7 +29,6 @@ WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 FLEET = REPO_ROOT / "repo-settings" / "fleet.yml"
 AGENTS_MD = REPO_ROOT / "AGENTS.md"
 THIS_REPO = "Adam-S-Daniel/repo-settings"
-SECTION_HEADING = "## Repo-specific additions"
 
 
 def load_workflow(path):
@@ -86,22 +86,75 @@ def required_checks():
     return checks
 
 
-def documented_job_ids():
-    """Every backticked token in AGENTS.md's "Repo-specific additions"
-    section. The managed section above it is overwritten by a sync, so an
-    exception written there would not survive."""
-    text = AGENTS_MD.read_text(encoding="utf-8")
-    lines = text.splitlines()
+TABLE_HEADING = "### Workflows and required checks"
+JOB_ID = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def split_row(line):
+    """The cells of one pipe-table row: split on unescaped `|`, drop the
+    outer pipes, strip whitespace."""
+    cells = re.split(r"(?<!\\)\|", line.strip())
+    if len(cells) < 2 or cells[0] != "" or cells[-1] != "":
+        raise AssertionError(f"not a pipe-table row: {line!r}")
+    return [c.strip() for c in cells[1:-1]]
+
+
+def workflow_table_rows():
+    """[{column name: cell}] for each data row of the first pipe table under
+    TABLE_HEADING in AGENTS.md. Only that table is read, so a stray mention
+    elsewhere in the file cannot stand in for a deleted row."""
+    lines = AGENTS_MD.read_text(encoding="utf-8").splitlines()
     try:
-        start = lines.index(SECTION_HEADING)
+        start = lines.index(TABLE_HEADING)
     except ValueError:
-        raise AssertionError(f"AGENTS.md has no {SECTION_HEADING!r} line") from None
-    section = []
+        raise AssertionError(f"AGENTS.md has no {TABLE_HEADING!r} line") from None
+    table = []
     for line in lines[start + 1:]:
-        if line.startswith("## "):
+        if line.startswith("#"):
             break
-        section.append(line)
-    return set(re.findall(r"`([^`\n]+)`", "\n".join(section)))
+        if line.lstrip().startswith("|"):
+            table.append(line)
+        elif table:
+            break
+    if len(table) < 3:
+        raise AssertionError(
+            f"no pipe table (header, delimiter, rows) under {TABLE_HEADING!r}"
+        )
+    header = split_row(table[0])
+    for column in ("Workflow", "Job", "Required"):
+        if header.count(column) != 1:
+            raise AssertionError(
+                f"table under {TABLE_HEADING!r} needs exactly one {column!r} "
+                f"column; header is {header}"
+            )
+    if not all(re.fullmatch(r":?-+:?", c) for c in split_row(table[1])):
+        raise AssertionError(f"second table line is not a delimiter row: {table[1]!r}")
+    rows = []
+    for line in table[2:]:
+        cells = split_row(line)
+        if len(cells) != len(header):
+            raise AssertionError(
+                f"row has {len(cells)} cells, header has {len(header)}: {line!r}"
+            )
+        rows.append(dict(zip(header, cells)))
+    return rows
+
+
+def job_id_of(cell):
+    """The first backticked token in a Job cell, else the plain identifier."""
+    match = re.search(r"`([^`\n]+)`", cell)
+    token = match.group(1) if match else cell
+    if not JOB_ID.fullmatch(token):
+        raise AssertionError(f"cannot read a job id from the Job cell {cell!r}")
+    return token
+
+
+def table_entries():
+    """[(workflow file, job id, Required cell)] from the AGENTS.md table."""
+    return [
+        (row["Workflow"], job_id_of(row["Job"]), row["Required"])
+        for row in workflow_table_rows()
+    ]
 
 
 class RequiredChecksTests(unittest.TestCase):
@@ -157,17 +210,46 @@ class RequiredChecksTests(unittest.TestCase):
                 f"{path.name}:{job_id} is a matrix job; check {check!r}",
             )
 
-    def test_every_pull_request_job_is_required_or_documented(self):
+    def test_every_pull_request_job_has_one_agreeing_table_row(self):
         required = set(required_checks())
-        documented = documented_job_ids()
+        entries = table_entries()
         for path, job_id, _job in pull_request_jobs():
-            self.assertTrue(
-                job_id in required or job_id in documented,
+            rows = [e for e in entries if e[0] == path.name and e[1] == job_id]
+            self.assertEqual(
+                len(rows),
+                1,
                 msg=(
-                    f"{path.name}:{job_id} runs on pull requests but is neither "
-                    f"required in fleet.yml nor named in backticks under "
-                    f"AGENTS.md's {SECTION_HEADING!r}"
+                    f"{path.name}:{job_id} runs on pull requests and needs exactly "
+                    f"one row in the AGENTS.md table under {TABLE_HEADING!r}; "
+                    f"found {len(rows)}"
                 ),
+            )
+            expected = "yes" if job_id in required else "no"
+            self.assertEqual(
+                rows[0][2],
+                expected,
+                msg=(
+                    f"{path.name}:{job_id}: the table's Required cell is "
+                    f"{rows[0][2]!r} but fleet.yml makes it {expected!r}"
+                ),
+            )
+
+    def test_every_table_row_names_a_real_workflow_and_job(self):
+        for workflow, job_id, required in table_entries():
+            path = WORKFLOWS_DIR / workflow
+            self.assertTrue(
+                path.is_file(),
+                msg=f"table row names {workflow!r}, which is not under .github/workflows/",
+            )
+            jobs = load_workflow(path).get("jobs") or {}
+            self.assertTrue(
+                job_id in jobs,
+                msg=f"table row {workflow}:{job_id} names a job that workflow lacks",
+            )
+            self.assertIn(
+                required,
+                ("yes", "no"),
+                msg=f"{workflow}:{job_id}: Required must be 'yes' or 'no', got {required!r}",
             )
 
 

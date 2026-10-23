@@ -159,8 +159,10 @@ The fleet rule makes every CI job that runs on pull requests a required check
 unless this file says why not
 ([issue #86](https://github.com/Adam-S-Daniel/repo-settings/issues/86)).
 `tests/test_required_checks.py` enforces that against `fleet.yml` and the
-workflows: each job id in the **Job** column below that is not required in
-`fleet.yml` must stay named here, in backticks, or the test fails.
+workflows: every job that runs on pull requests needs exactly one row in the
+table below, and its **Required** column must say `yes` when `fleet.yml`
+requires the job and `no` when it does not. Every row must also name a workflow
+file and job that exist.
 
 **Nothing is enforced while this repo is private:** rulesets answer 403
 ("Upgrade to GitHub Pro or make this repository public") and the engine records
