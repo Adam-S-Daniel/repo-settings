@@ -144,6 +144,7 @@ jobs:
           OWNER: ${{ matrix.owner }}
         run: |
           set -uo pipefail
+          # No --show-private here: this log is public. See cmd_coverage.
           python scripts/repo_settings.py coverage \
             --config repo-settings/fleet.yml --owner "$OWNER" \
             > "coverage-$OWNER.txt" 2>&1
@@ -199,6 +200,8 @@ jobs:
             echo '```'
             grep '^UNDECLARED' "$report" || true
             echo '```'
+            echo
+            echo "Names of undeclared private repositories are withheld because this issue is public. To see them, run \`python3 scripts/repo_settings.py coverage --config repo-settings/fleet.yml --owner $OWNER --show-private\` locally."
             echo
             echo "Add each to \`repos:\` in \`repo-settings/fleet.yml\`, with \`manage: false\` if it should be left alone. This issue closes itself on the next weekly run."
           } > /tmp/coverage-body.md
