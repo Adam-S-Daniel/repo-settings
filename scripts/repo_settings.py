@@ -448,6 +448,13 @@ def find_ruleset(repo: str, name: str) -> dict | None:
     return get_ruleset(repo, summary["id"])
 
 
+# GitHub's enum for bypass_actors[].bypass_mode
+# (https://docs.github.com/en/rest/repos/rules#create-a-repository-ruleset).
+# Every `bypass_actors` config entry must name one. Kept apart from
+# ADMIN_BYPASS_MODES below: that key also accepts `none` and refuses `exempt`.
+BYPASS_MODES = ("always", "pull_request", "exempt")
+
+
 def _bypass_entries(actors: list | None) -> list[dict]:
     """Validate and render `bypass_actors` config entries (shared by the
     default ruleset and every `extra_rulesets` entry)."""
@@ -465,10 +472,20 @@ def _bypass_entries(actors: list | None) -> list[dict]:
                 f"{actor_type!r} (expected one of "
                 f"{', '.join(sorted(BYPASS_ACTOR_TYPES))})"
             )
+        # Required, with no default: a defaulted mode would grant `always`
+        # bypass to an entry that never asked for it (settings-schema-design
+        # rule 2). isinstance first: a YAML boolean, or an unhashable value,
+        # is never one of the string modes.
+        mode = actor.get("bypass_mode")
+        if not isinstance(mode, str) or mode not in BYPASS_MODES:
+            raise SystemExit(
+                f"error: bypass_actors entry {actor!r} needs a bypass_mode, one "
+                f"of {' | '.join(BYPASS_MODES)} (got {mode!r})"
+            )
         entry = {
             "actor_id": int(actor["actor_id"]),
             "actor_type": actor_type,
-            "bypass_mode": actor.get("bypass_mode", "always"),
+            "bypass_mode": mode,
         }
         if entry not in out:
             out.append(entry)
@@ -696,6 +713,26 @@ def _extra_rule_params(rule: dict) -> dict:
     return params
 
 
+# GitHub returns `bypass_actors` only to a caller that can edit the ruleset.
+# The "Get a repository ruleset" REST docs say: "To prevent leaking sensitive
+# information, the bypass_actors property is only returned if the user making
+# the API request has write access to the ruleset."
+# (https://docs.github.com/en/rest/repos/rules#get-a-repository-ruleset).
+# PR #95 measured it: a read-only token got no field, and 9 rulesets read as
+# `'bypass': []` drift. So an ABSENT field normalizes to BYPASS_UNKNOWN, never
+# to [], and plan_ruleset compares everything else; a present [] still compares.
+BYPASS_UNKNOWN = None
+
+
+def _normalize_bypass(rs_: dict) -> list | None:
+    if "bypass_actors" not in rs_:
+        return BYPASS_UNKNOWN
+    return sorted(
+        (b.get("actor_type"), b.get("actor_id"), b.get("bypass_mode"))
+        for b in rs_["bypass_actors"] or []
+    )
+
+
 def normalize_extra_ruleset(rs_: dict | None) -> dict | None:
     """Reduce an extra ruleset (live or desired) to comparable fields. Rules are
     compared as a set of (type, parameters); includes and bypass sorted."""
@@ -711,10 +748,7 @@ def normalize_extra_ruleset(rs_: dict | None) -> dict | None:
         "include": sorted(cond.get("include", [])),
         "exclude": sorted(cond.get("exclude", [])),
         "rules": rules,
-        "bypass": sorted(
-            (b.get("actor_type"), b.get("actor_id"), b.get("bypass_mode"))
-            for b in rs_.get("bypass_actors", [])
-        ),
+        "bypass": _normalize_bypass(rs_),
     }
 
 
@@ -736,10 +770,7 @@ def normalize_ruleset(rs: dict | None) -> dict | None:
     include = sorted(
         rs.get("conditions", {}).get("ref_name", {}).get("include", [])
     )
-    bypass = sorted(
-        (b.get("actor_type"), b.get("actor_id"), b.get("bypass_mode"))
-        for b in rs.get("bypass_actors", [])
-    )
+    bypass = _normalize_bypass(rs)
     return {
         "enforcement": rs.get("enforcement"),
         "include": include,
@@ -772,6 +803,14 @@ def ruleset_doc(branch_rs: dict) -> dict:
     """Reduce a live branch ruleset to the config-schema `ruleset:` block
     (the inverse of build_ruleset_body, for `generate`)."""
     norm = normalize_ruleset(branch_rs)
+    if norm["bypass"] is BYPASS_UNKNOWN:
+        # Emitting "none" here would write a config that strips every bypass
+        # actor on the next apply.
+        raise SystemExit(
+            f"error: ruleset {branch_rs.get('name')!r} was read without "
+            f"bypass_actors (this token cannot edit it); generate needs a token "
+            f"that can"
+        )
     doc = {
         "enabled": True,
         "name": branch_rs.get("name"),
@@ -817,7 +856,23 @@ def ruleset_doc(branch_rs: dict) -> dict:
     return doc
 
 
-def write_ruleset(repo: str, body: dict, existing_id: int | None) -> None:
+BYPASS_UNKNOWN_NOTE = (
+    "bypass actors not returned to this token (it cannot edit the ruleset) "
+    "-- bypass not compared"
+)
+BYPASS_UNKNOWN_REFUSAL = (
+    "refusing to write ruleset: the live read has no bypass_actors (this "
+    "token cannot edit the ruleset), so a PUT would overwrite bypass actors "
+    "it cannot see"
+)
+
+
+def write_ruleset(repo: str, body: dict, existing_id: int | None,
+                  bypass_unknown: bool = False) -> None:
+    if bypass_unknown:
+        # Never write blind: a PUT replaces bypass_actors wholesale, and this
+        # read could not see what it would overwrite.
+        raise GhError(None, BYPASS_UNKNOWN_REFUSAL)
     if existing_id is not None:
         gh_api(f"repos/{repo}/rulesets/{existing_id}", method="PUT", body=body)
     else:
@@ -1423,16 +1478,33 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
         try:
             existing = find_ruleset(repo, name)
             existing_id = existing["id"] if existing else None
-            same = normalize(existing) == normalize(body)
-            records.append(
-                {
-                    "setting": f"ruleset[{name}]",
-                    "status": "match" if same else "drift",
-                    "current": normalize(existing),
-                    "desired": normalize(body),
-                    "_writer": ("ruleset", body, existing_id),
-                }
-            )
+            current, desired = normalize(existing), normalize(body)
+            unknown = current is not None and current["bypass"] is BYPASS_UNKNOWN
+            if unknown:
+                # Compare all but the bypass list: the rest decides between
+                # an informational skip and drift on what does differ. Never
+                # `match` (the bypass is unverified), never drift BY the bypass.
+                current = dict(current, bypass="unknown")
+                rest_same = all(
+                    current[k] == desired[k] for k in desired if k != "bypass"
+                )
+                if rest_same:
+                    records.append(
+                        _skip(f"ruleset[{name}]", desired, BYPASS_UNKNOWN_NOTE)
+                    )
+                    return
+            same = current == desired
+            rec = {
+                "setting": f"ruleset[{name}]",
+                "status": "match" if same else "drift",
+                "current": current,
+                "desired": desired,
+                "_writer": ("ruleset", body, existing_id),
+            }
+            if unknown:
+                rec["note"] = BYPASS_UNKNOWN_NOTE
+                rec["bypass_unknown"] = True
+            records.append(rec)
         except GhError as e:
             if e.status in (402, 403) and is_private():
                 records.append(_skip(f"ruleset[{name}]", "enabled",
@@ -1851,7 +1923,7 @@ def apply_record(repo: str, rec: dict) -> None:
     elif kind == "workflow_permissions":
         write_workflow_permissions(repo, b)
     elif kind == "ruleset":
-        write_ruleset(repo, a, b)
+        write_ruleset(repo, a, b, rec.get("bypass_unknown", False))
     elif kind == "label":
         write_label(repo, a, b)
     elif kind == "actions_policy":
@@ -1898,6 +1970,8 @@ def render_records(repo: str, records: list[dict]) -> None:
         line = f"  [{_sym(r['status'])}] {r['setting']}"
         if r["status"] in ("drift", "would-change"):
             line += f"\n      from: {r['current']!r}\n      to:   {r['desired']!r}"
+            if r.get("note"):
+                line += f"\n      note: {r['note']}"
         elif r["status"] == "changed":
             line += f"  -> {r['desired']!r}"
         elif r["status"] in ("skipped", "error"):
@@ -2134,7 +2208,12 @@ def cmd_apply(args) -> int:
         records = plan_repo_records(t["repo"], t["settings"])
         for r in records:
             if r["status"] == "drift":
-                if args.dry_run:
+                if r.get("bypass_unknown"):
+                    # Refused in a dry run too, so it never promises a write
+                    # that apply would refuse.
+                    r["status"] = "error"
+                    r["note"] = BYPASS_UNKNOWN_REFUSAL
+                elif args.dry_run:
                     r["status"] = "would-change"
                 else:
                     try:

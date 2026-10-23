@@ -22,11 +22,13 @@ ADMIN = {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
 
 
 class BuildRulesetBodyTests(unittest.TestCase):
-    def test_bypass_actors_entry_coerces_string_id_and_defaults_mode(self):
+    def test_bypass_actors_entry_coerces_string_id(self):
         body = rs.build_ruleset_body(
             {
                 "admin_bypass": "always",
-                "bypass_actors": [{"actor_type": "Integration", "actor_id": "123456"}],
+                "bypass_actors": [
+                    {"actor_type": "Integration", "actor_id": "123456", "bypass_mode": "always"}
+                ],
             }
         )
         self.assertIn(ADMIN, body["bypass_actors"])
@@ -100,7 +102,9 @@ class BuildRulesetBodyTests(unittest.TestCase):
         body = rs.build_ruleset_body(
             {
                 "admin_bypass": "always",
-                "bypass_actors": [{"actor_type": "Integration", "actor_id": "123456"}],
+                "bypass_actors": [
+                    {"actor_type": "Integration", "actor_id": "123456", "bypass_mode": "always"}
+                ],
             }
         )
         norm = rs.normalize_ruleset(body)
@@ -173,7 +177,9 @@ class RulesetDocTests(unittest.TestCase):
             {
                 "name": "default branch protection",
                 "admin_bypass": "always",
-                "bypass_actors": [{"actor_type": "Integration", "actor_id": "123456"}],
+                "bypass_actors": [
+                    {"actor_type": "Integration", "actor_id": "123456", "bypass_mode": "always"}
+                ],
             }
         )
         doc = rs.ruleset_doc(body)
@@ -191,7 +197,11 @@ class RulesetDocTests(unittest.TestCase):
                         "name": "default branch protection",
                         "admin_bypass": value,
                         "bypass_actors": [
-                            {"actor_type": "Integration", "actor_id": "123456"}
+                            {
+                                "actor_type": "Integration",
+                                "actor_id": "123456",
+                                "bypass_mode": "always",
+                            }
                         ],
                     }
                 )
@@ -1494,6 +1504,208 @@ class AdminBypassFleetConfigTests(unittest.TestCase):
                 )
             checked += 1
         self.assertEqual(checked, 19)
+
+
+class BypassUnknownTests(unittest.TestCase):
+    """A ruleset read with no `bypass_actors` field (a token that cannot edit
+    the ruleset) is UNKNOWN, not empty (issue #91): never match, never drift
+    caused by the bypass, and apply never writes on the strength of it."""
+
+    DEFAULT_CFG = {
+        "enabled": True,
+        "admin_bypass": "always",
+        "bypass_actors": [
+            {"actor_type": "Integration", "actor_id": 4268639, "bypass_mode": "always"}
+        ],
+    }
+
+    def _live(self, body, **over):
+        live = dict(copy.deepcopy(body), id=42, **over)
+        live.pop("bypass_actors")
+        return live
+
+    def _plan(self, live, settings):
+        with patch.object(
+            rs, "list_rulesets",
+            return_value=[{"id": live["id"], "name": live["name"], "target": "branch"}],
+        ), patch.object(rs, "get_ruleset", return_value=live), patch.object(
+            rs, "get_repo", return_value={"private": False}
+        ):
+            return rs.plan_repo("o/r", settings)
+
+    def _cases(self):
+        """(label, settings, desired body) for the default and an extra ruleset."""
+        return [
+            ("default", {"ruleset": self.DEFAULT_CFG},
+             rs.build_ruleset_body(self.DEFAULT_CFG)),
+            ("extra", {"extra_rulesets": [EXTRA_CFG]},
+             rs.build_extra_ruleset_body(EXTRA_CFG)),
+        ]
+
+    def test_normalize_absent_is_unknown_and_present_empty_is_empty(self):
+        for label, _, body in self._cases():
+            normalize = (rs.normalize_ruleset if label == "default"
+                         else rs.normalize_extra_ruleset)
+            with self.subTest(ruleset=label):
+                absent = dict(body)
+                absent.pop("bypass_actors")
+                self.assertIs(normalize(absent)["bypass"], rs.BYPASS_UNKNOWN)
+                self.assertEqual(normalize(dict(body, bypass_actors=[]))["bypass"], [])
+
+    def test_absent_with_the_rest_matching_is_a_skip(self):
+        for label, settings, body in self._cases():
+            with self.subTest(ruleset=label):
+                (rec,) = self._plan(self._live(body), settings)
+                self.assertEqual(rec["status"], "skipped")
+                self.assertEqual(rec["note"], rs.BYPASS_UNKNOWN_NOTE)
+                self.assertNotIn("_writer", rec)
+
+    def test_absent_with_another_difference_is_drift_with_bypass_unknown(self):
+        for label, settings, body in self._cases():
+            with self.subTest(ruleset=label):
+                (rec,) = self._plan(self._live(body, enforcement="evaluate"), settings)
+                self.assertEqual(rec["status"], "drift")
+                self.assertEqual(rec["current"]["bypass"], "unknown")
+                self.assertEqual(rec["current"]["enforcement"], "evaluate")
+                self.assertEqual(rec["note"], rs.BYPASS_UNKNOWN_NOTE)
+                self.assertTrue(rec["bypass_unknown"])
+                # The bypass is the ONLY other field that differs: it is
+                # marked unknown, not compared as [].
+                diff = {k for k in rec["desired"]
+                        if rec["current"][k] != rec["desired"][k]}
+                self.assertEqual(diff, {"enforcement", "bypass"})
+
+    def test_present_empty_still_compares(self):
+        for label, settings, body in self._cases():
+            with self.subTest(ruleset=label):
+                live = dict(copy.deepcopy(body), id=42, bypass_actors=[])
+                (rec,) = self._plan(live, settings)
+                self.assertEqual(rec["status"], "drift")
+                self.assertEqual(rec["current"]["bypass"], [])
+                self.assertNotIn("bypass_unknown", rec)
+                self.assertNotIn("note", rec)
+                matching = dict(copy.deepcopy(body), id=42)
+                (rec,) = self._plan(matching, settings)
+                self.assertEqual(rec["status"], "match")
+
+    def test_write_ruleset_refuses_when_bypass_unknown(self):
+        body = rs.build_ruleset_body(self.DEFAULT_CFG)
+        with patch.object(rs, "gh_api", side_effect=AssertionError("no API")):
+            with self.assertRaises(rs.GhError) as cm:
+                rs.apply_record("o/r", {"_writer": ("ruleset", body, 42),
+                                        "bypass_unknown": True})
+        self.assertEqual(cm.exception.message, rs.BYPASS_UNKNOWN_REFUSAL)
+
+    def test_cmd_apply_refuses_with_an_error_record(self):
+        for dry_run in (False, True):
+            for label, settings, body in self._cases():
+                with self.subTest(ruleset=label, dry_run=dry_run):
+                    live = self._live(body, enforcement="evaluate")
+                    calls = []
+
+                    def fake(path, method="GET", body=None, api_version=None):
+                        calls.append((path, method))
+                        if method != "GET":
+                            raise AssertionError(f"write attempted: {method} {path}")
+                        if path == "repos/o/r":
+                            return {"private": False}
+                        if path == "repos/o/r/rulesets":
+                            return [{"id": 42, "name": live["name"], "target": "branch"}]
+                        if path == "repos/o/r/rulesets/42":
+                            return live
+                        raise AssertionError(path)
+
+                    targets = [{"repo": "o/r", "manage": True, "settings": settings}]
+                    args = argparse.Namespace(config="unused", repo=None, owner=None,
+                                              dry_run=dry_run)
+                    out = io.StringIO()
+                    with patch.object(rs, "load_config", return_value={}), \
+                            patch.object(rs, "resolve_targets", return_value=targets), \
+                            patch.object(rs, "gh_api", side_effect=fake), \
+                            contextlib.redirect_stdout(out):
+                        rc = rs.cmd_apply(args)
+                    self.assertEqual(rc, 2)
+                    self.assertTrue(all(m == "GET" for _, m in calls))
+                    self.assertIn("ERROR", out.getvalue())
+                    self.assertIn(rs.BYPASS_UNKNOWN_REFUSAL, out.getvalue())
+
+    def test_generate_refuses_a_ruleset_read_without_bypass_actors(self):
+        live = self._live(rs.build_ruleset_body(self.DEFAULT_CFG))
+        with self.assertRaises(SystemExit) as cm:
+            rs.ruleset_doc(live)
+        self.assertIn("bypass_actors", str(cm.exception.code))
+
+
+class BypassModeRequiredTests(unittest.TestCase):
+    """`bypass_mode` is required on every `bypass_actors` element, with no
+    default (issue #91)."""
+
+    def _build(self, mode=..., where="default"):
+        actor = {"actor_type": "Integration", "actor_id": 1}
+        if mode is not ...:
+            actor["bypass_mode"] = mode
+        if where == "default":
+            return rs.build_ruleset_body({"admin_bypass": "none", "bypass_actors": [actor]})
+        return rs.build_extra_ruleset_body(_extra(bypass_actors=[actor]))
+
+    def test_accepted_modes_are_githubs_enum(self):
+        self.assertEqual(rs.BYPASS_MODES, ("always", "pull_request", "exempt"))
+
+    def test_each_accepted_mode_renders_as_given(self):
+        for where in ("default", "extra"):
+            for mode in rs.BYPASS_MODES:
+                with self.subTest(where=where, mode=mode):
+                    body = self._build(mode, where)
+                    self.assertEqual(
+                        body["bypass_actors"],
+                        [{"actor_id": 1, "actor_type": "Integration", "bypass_mode": mode}],
+                    )
+
+    def test_omitted_or_invalid_mode_is_rejected_naming_the_accepted_values(self):
+        for where in ("default", "extra"):
+            for mode in (..., None, True, False, "", "Always", "none",
+                         "pull_requests", ["always"], {"m": "always"}):
+                with self.subTest(where=where, mode=mode):
+                    with self.assertRaises(SystemExit) as cm:
+                        self._build(mode, where)
+                    self.assertIn("always | pull_request | exempt",
+                                  str(cm.exception.code))
+                    self.assertIn("bypass_mode", str(cm.exception.code))
+
+
+class BypassModeFleetMigrationTests(unittest.TestCase):
+    """Migration proof for issue #91: every `bypass_actors` element anywhere in
+    fleet.yml (defaults and overrides, default and extra rulesets) already sets
+    a valid bypass_mode, so making it required changes no rendered ruleset."""
+
+    FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
+
+    def _bypass_lists(self, node, path="fleet.yml"):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "bypass_actors":
+                    yield f"{path}.{key}", value
+                yield from self._bypass_lists(value, f"{path}.{key}")
+        elif isinstance(node, list):
+            for i, value in enumerate(node):
+                yield from self._bypass_lists(value, f"{path}[{i}]")
+
+    def test_every_bypass_actor_in_fleet_yml_sets_a_valid_mode(self):
+        import yaml
+
+        with open(self.FLEET, encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh)
+        elements = 0
+        for path, actors in self._bypass_lists(cfg):
+            self.assertIsInstance(actors, list, path)
+            for actor in actors:
+                with self.subTest(path=path, actor=actor):
+                    self.assertIn(actor.get("bypass_mode"), rs.BYPASS_MODES)
+                elements += 1
+        # Guard against a walk that finds nothing: the defaults' agents-md-sync
+        # grant and the roster ruleset's two actors, at least.
+        self.assertGreaterEqual(elements, 3)
+
 
 if __name__ == "__main__":
     unittest.main()
