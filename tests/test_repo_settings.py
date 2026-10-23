@@ -682,6 +682,7 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         "Adam-S-Daniel/GHA-bench": ["test"],
         "Adam-S-Daniel/_agent-guidance": ["test", "agent-checks"],
         "Adam-S-Daniel/ai-usage-dashboard": ["node-test", "pester", "agent-checks"],
+        "Adam-S-Daniel/wsl-automation": ["shell", "test", "test-linux", "agent-checks"],
         "Adam-S-Daniel/repo-settings": ["agent-checks", "unit"],
     }
     PRE_EXISTING = {
