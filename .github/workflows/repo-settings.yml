@@ -81,10 +81,6 @@ permissions:
   contents: read
   issues: write                # files the undeclared-repo nudge (see below)
 
-concurrency:
-  group: repo-settings
-  cancel-in-progress: false
-
 jobs:
   repo-settings:
     runs-on: ubuntu-latest
@@ -98,6 +94,15 @@ jobs:
     # until a required reviewer approves, and serves the environment's secrets
     # only after that. A dry-run dispatch waits for approval too.
     environment: fleet-apply
+    # Serialize applies per owner, here and not at workflow level. A run waiting
+    # for approval holds its group, so a workflow-level group would make PR
+    # `drift` runs queue behind it or replace each other. The group carries the
+    # matrix owner: one fixed name would put both legs in one group, so they
+    # would run one after another (likely two approvals), and a newly queued
+    # run would cancel the waiting leg, applying to one owner only.
+    concurrency:
+      group: repo-settings-${{ matrix.owner }}
+      cancel-in-progress: false
     # Job-level permissions replace the workflow-level block, so restate it.
     # `actions: read` is what the environment self-check's two GETs need.
     permissions:

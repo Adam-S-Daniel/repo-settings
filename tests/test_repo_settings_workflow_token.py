@@ -162,6 +162,18 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertIn("vars.REPO_SETTINGS_APP_CLIENT_ID != ''",
                       top_level_conjuncts(self.apply.get("if", "")))
 
+    def test_concurrency_is_per_owner_on_the_apply_job_only(self):
+        # A run waiting for fleet-apply approval holds its group. At workflow
+        # level that would stall or cancel PR `drift` runs; with one fixed name
+        # on this matrix job the two owner legs would share a group, run one
+        # at a time, and a newly queued run would cancel the waiting leg.
+        self.assertNotIn("concurrency", self.doc, "no workflow-level concurrency")
+        self.assertEqual(
+            self.apply.get("concurrency"),
+            {"group": "repo-settings-${{ matrix.owner }}", "cancel-in-progress": False},
+        )
+        self.assertNotIn("concurrency", self.drift)
+
     def test_apply_job_may_read_the_environment(self):
         # Job-level permissions replace the workflow's block; the self-check
         # needs actions: read and the nudge step still needs issues: write.
