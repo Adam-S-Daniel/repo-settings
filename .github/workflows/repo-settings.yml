@@ -21,8 +21,9 @@
 #   2. Generate a private key; install the App on BOTH `Adam-S-Daniel` and the
 #      `jodidaniel` org, granting access to the repos in fleet.yml.
 #   3. In THIS repo, add: variable `REPO_SETTINGS_APP_CLIENT_ID` (the App's
-#      Client ID, `Iv23li...`, on its settings page), secret
-#      `REPO_SETTINGS_APP_PRIVATE_KEY`.
+#      Client ID, `Iv23li...`, on its settings page), and secret
+#      `REPO_SETTINGS_APP_PRIVATE_KEY` in the `fleet-apply` ENVIRONMENT
+#      (Settings > Environments), never as a repo-level secret.
 #
 # Use the App's CLIENT ID, not its numeric App ID: the action's `app-id` input
 # is deprecated in favour of `client-id`. The two are the same input under the
@@ -35,9 +36,21 @@
 # instead; REPO_SETTINGS_APP_ID has since been deleted, so the fallback is gone.
 # Use that same two-step if the credential is ever rotated again.
 #
+# The admin key lives behind the `fleet-apply` environment (issue #90, and
+# issue #13 property 4): a required reviewer (the owner) and a deployment-branch
+# policy of `main` only. Store `REPO_SETTINGS_APP_PRIVATE_KEY` as a secret of
+# that environment, not of the repo. An environment secret takes precedence over
+# a repo secret of the same name, so the job works before and after the move;
+# once the repo-level copy is deleted, no workflow on any other branch, and no
+# job outside the environment, can read the key.
+#
 # Behavior:
-#   * pull_request touching config/script -> drift report only (fails on drift)
-#   * push to main / weekly schedule / manual dispatch -> apply
+#   * push to main / weekly schedule / manual dispatch -> `repo-settings` job:
+#     waits for the owner's approval in `fleet-apply`, checks that the gate is
+#     still configured, then applies
+#   * pull_request touching config/script -> `drift` job: drift report only
+#     (fails on drift), under a token from a separate READ-ONLY App. Skipped
+#     until that App's `REPO_SETTINGS_READ_APP_CLIENT_ID` variable exists.
 
 name: repo-settings
 
@@ -68,21 +81,73 @@ permissions:
   contents: read
   issues: write                # files the undeclared-repo nudge (see below)
 
-concurrency:
-  group: repo-settings
-  cancel-in-progress: false
-
 jobs:
   repo-settings:
     runs-on: ubuntu-latest
     # Skip cleanly until the GitHub App is configured (avoids a failing run on a
-    # repo that is still awaiting its one-time credential setup).
-    if: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID != '' }}
+    # repo that is still awaiting its one-time credential setup). Never on
+    # pull_request: a PR branch controls its own copy of this file, so the job
+    # that holds the admin key must not run there at all; `drift` below covers
+    # PRs with a read-only App.
+    if: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID != '' && github.event_name != 'pull_request' }}
+    # The approval gate. GitHub pauses the job here, before its first step,
+    # until a required reviewer approves, and serves the environment's secrets
+    # only after that. A dry-run dispatch waits for approval too.
+    environment: fleet-apply
+    # Serialize applies per owner, here and not at workflow level. A run waiting
+    # for approval holds its group, so a workflow-level group would make PR
+    # `drift` runs queue behind it or replace each other. The group carries the
+    # matrix owner: one fixed name would put both legs in one group, so they
+    # would run one after another (likely two approvals), and a newly queued
+    # run would cancel the waiting leg, applying to one owner only.
+    concurrency:
+      group: repo-settings-${{ matrix.owner }}
+      cancel-in-progress: false
+    # Job-level permissions replace the workflow-level block, so restate it.
+    # `actions: read` is what the environment self-check's two GETs need.
+    permissions:
+      contents: read
+      issues: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
         owner: [Adam-S-Daniel, jodidaniel]
     steps:
+      # Naming an environment that does not exist does not fail: GitHub creates
+      # it with no protection rules, and the gate silently disappears (issue
+      # #13, property 4). So before anything applies, ask GitHub what
+      # `fleet-apply` actually enforces and refuse unless it has a required
+      # reviewer and deploys from `main` only. Fails closed: any API error or
+      # unreadable response fails the job. No `if:` and no
+      # `continue-on-error`, on purpose; tests/test_repo_settings_workflow_token.py
+      # holds it first and runs this script against fake responses.
+      - name: Check the fleet-apply environment still gates this job
+        id: environment_gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ENVIRONMENT: fleet-apply
+        run: |
+          set -euo pipefail
+          env_json=$(gh api "repos/$REPO/environments/$ENVIRONMENT")
+          policies_json=$(gh api "repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies")
+          if ! jq -e '[.protection_rules[]? | select(.type == "required_reviewers") | (.reviewers // []) | length] | any(. > 0)' \
+              <<<"$env_json" >/dev/null; then
+            echo "::error::Environment $ENVIRONMENT has no required reviewer, so nothing gates the admin key. Add one before applying."
+            exit 1
+          fi
+          if ! jq -e '.deployment_branch_policy.custom_branch_policies == true' <<<"$env_json" >/dev/null; then
+            echo "::error::Environment $ENVIRONMENT does not restrict deployments to selected branches. Allow only main."
+            exit 1
+          fi
+          if ! jq -e '.total_count == 1 and ([.branch_policies[]? | [.name, (.type // "branch")]] == [["main", "branch"]])' \
+              <<<"$policies_json" >/dev/null; then
+            echo "::error::Environment $ENVIRONMENT's deployment-branch policies are not exactly the branch main."
+            exit 1
+          fi
+          echo "Environment $ENVIRONMENT: a required reviewer is configured and only main may deploy."
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
@@ -101,12 +166,6 @@ jobs:
           client-id: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID }}
           private-key: ${{ secrets.REPO_SETTINGS_APP_PRIVATE_KEY }}
           owner: ${{ matrix.owner }}
-
-      - name: Drift report (pull request)
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ steps.token.outputs.token }}
-        run: python scripts/repo_settings.py diff --config repo-settings/fleet.yml --owner ${{ matrix.owner }}
 
       - name: Apply (dry run)
         if: github.event_name == 'workflow_dispatch' && inputs.dry_run
@@ -215,3 +274,54 @@ jobs:
           else
             gh issue create --title "$title" --label ci --body-file /tmp/coverage-body.md
           fi
+
+  # The pull_request drift report. It never touches the admin key: a PR branch
+  # controls its own copy of this workflow, so any job that can run on a PR
+  # could read whatever secret it names (closed PR #95). It mints from a
+  # SEPARATE App that holds only read permissions, so its key exposes reads
+  # if it ever leaks, and its token is narrowed to read again at mint time.
+  #
+  # SKIPPED until the owner creates that read-only App (issue #90) and sets the
+  # repo-level variable `REPO_SETTINGS_READ_APP_CLIENT_ID` and secret
+  # `REPO_SETTINGS_READ_APP_PRIVATE_KEY`. Reads that need write (the Actions
+  # policies endpoints, GET included) come back as informational skips, never
+  # drift (#97). Dependabot and fork PRs get no secrets, so it fails to mint
+  # there; it is advisory and not a required check (AGENTS.md).
+  drift:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'pull_request' && vars.REPO_SETTINGS_READ_APP_CLIENT_ID != '' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        owner: [Adam-S-Daniel, jodidaniel]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: python3 -m pip install -r requirements.txt
+
+      - name: Mint read-only GitHub App token for ${{ matrix.owner }}
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.REPO_SETTINGS_READ_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REPO_SETTINGS_READ_APP_PRIVATE_KEY }}
+          owner: ${{ matrix.owner }}
+          permission-administration: read
+          permission-actions: read
+          permission-issues: read
+          permission-metadata: read
+
+      - name: Drift report
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          OWNER: ${{ matrix.owner }}
+        run: python scripts/repo_settings.py diff --config repo-settings/fleet.yml --owner "$OWNER"
