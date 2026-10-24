@@ -16,6 +16,13 @@ Three subcommands:
              Prints per-setting CHANGED / ok / skipped. Use --dry-run to preview.
              Exits non-zero if any apply errored.
 
+  coverage   Report repos the credential can administer that a fleet config
+             does not declare. Exits 0 complete, 1 undeclared, 2 on error.
+
+Every subcommand that reads a config exits 2 when the config is refused (see
+ConfigError), the same code as "could not ask": 1 already means drift for
+`diff` and undeclared repos for `coverage`.
+
 Managed settings:
   * actions.sha_pinning_required           -> repos/{repo}/actions/permissions
   * actions.fork_pr_approval               -> .../actions/permissions/fork-pr-contributor-approval
@@ -42,7 +49,7 @@ Managed settings:
                                                vulnerability_alerts -- apply
                                                order is dependency-aware, see
                                                plan_repo)
-  * labels (per-repo only)                 -> repos/{repo}/labels/{name}  (GET, then
+  * labels (defaults + per-repo)           -> repos/{repo}/labels/{name}  (GET, then
                                                POST when absent or PATCH on
                                                drift; idempotent BY NAME, never
                                                deletes a label)
@@ -66,19 +73,27 @@ environment variable. Writing these settings requires repo-admin (a fine-grained
 PAT with "Administration: read and write", a classic PAT with `repo` scope, or a
 GitHub App token). The default Actions `GITHUB_TOKEN` cannot change repo settings.
 
-Config schema: see ../repo-settings/schema.md. Two shapes are accepted:
+Config schema: see ../repo-settings/schema.md. A SURFACE is one top-level key
+of a repo's resolved settings, which plan_repo plans independently: the seven
+names in SURFACES. Two shapes are accepted:
 
-  * Single-repo -- top-level `actions:` / `ruleset:` blocks, plus an optional
-    top-level `repo:` key that is EITHER the identifier string `owner/name`
-    (the existing convention; pass --repo to override it) OR a settings mapping
-    like `{allow_auto_merge: true}` -- the same top-level key can't be both at
-    once, so when `repo:` is a mapping the identifier must come from --repo.
+  * Single-repo -- top-level surface blocks (`actions:`, `ruleset:`, ...), plus
+    an optional top-level `repo:` key that is EITHER the identifier string
+    `owner/name` (the existing convention; pass --repo to override it) OR a
+    settings map like `{allow_auto_merge: true}` -- the same top-level key
+    can't be both at once, so when `repo:` is a map the identifier must come
+    from --repo. The surfaces managed are exactly the blocks present.
 
-  * Fleet / fan-out -- a top-level `repos:` list, with an optional `defaults:`
-    block that every repo inherits and per-repo `overrides:`. A repo entry with
-    `manage: false` is skipped (recorded as excluded). Here `repo:` is always a
-    settings mapping (the identifier comes from each entry's `name:`), so there
-    is no collision.
+  * Fleet / fan-out -- a top-level `repos:` array, with an optional `defaults:`
+    map that every repo inherits and per-repo `overrides:`. Each element of
+    `repos` must carry `manage`, an array of surfaces: `["all"]`, `[]`, or
+    surface names in canonical order (validate_manage). A `[]` element is
+    skipped (recorded as excluded). Here `repo:` is always a settings map (the
+    identifier comes from each element's `name:`), so there is no collision.
+
+Unknown keys are refused at every level -- the file's top level, a `repos`
+element, `defaults:` / `overrides:`, and inside each surface -- with an error
+naming the accepted keys, so a misspelling cannot silently drop a setting.
 
 The engine auto-detects repo visibility and downgrades gracefully: fork-PR
 approval (API 422), rulesets (API 403 "upgrade to Pro") and allow_auto_merge are
@@ -128,6 +143,14 @@ class GhError(Exception):
         self.status = status
         self.message = message
         super().__init__(f"HTTP {status}: {message}" if status else message)
+
+
+class ConfigError(SystemExit):
+    """A config the engine refuses. main() prints the message and exits 2.
+
+    A SystemExit subclass so it unwinds like the engine's older
+    `SystemExit("error: ...")` refusals, which main() also maps to exit 2:
+    every message-carrying SystemExit in this file is a config error."""
 
 
 def gh_api(path: str, method: str = "GET", body: dict | None = None,
@@ -448,6 +471,13 @@ def find_ruleset(repo: str, name: str) -> dict | None:
     return get_ruleset(repo, summary["id"])
 
 
+# GitHub's enum for bypass_actors[].bypass_mode
+# (https://docs.github.com/en/rest/repos/rules#create-a-repository-ruleset).
+# Every `bypass_actors` config entry must name one. Kept apart from
+# ADMIN_BYPASS_MODES below: that key also accepts `none` and refuses `exempt`.
+BYPASS_MODES = ("always", "pull_request", "exempt")
+
+
 def _bypass_entries(actors: list | None) -> list[dict]:
     """Validate and render `bypass_actors` config entries (shared by the
     default ruleset and every `extra_rulesets` entry)."""
@@ -465,14 +495,58 @@ def _bypass_entries(actors: list | None) -> list[dict]:
                 f"{actor_type!r} (expected one of "
                 f"{', '.join(sorted(BYPASS_ACTOR_TYPES))})"
             )
+        # Required, with no default: a defaulted mode would grant `always`
+        # bypass to an entry that never asked for it (settings-schema-design
+        # rule 2). isinstance first: a YAML boolean, or an unhashable value,
+        # is never one of the string modes.
+        mode = actor.get("bypass_mode")
+        if not isinstance(mode, str) or mode not in BYPASS_MODES:
+            raise SystemExit(
+                f"error: bypass_actors entry {actor!r} needs a bypass_mode, one "
+                f"of {' | '.join(BYPASS_MODES)} (got {mode!r})"
+            )
         entry = {
             "actor_id": int(actor["actor_id"]),
             "actor_type": actor_type,
-            "bypass_mode": actor.get("bypass_mode", "always"),
+            "bypass_mode": mode,
         }
         if entry not in out:
             out.append(entry)
     return out
+
+
+# `ruleset.admin_bypass`: each accepted value and the `bypass_mode` it gives
+# the repository Admin role (None = no admin bypass entry). GitHub's enum for
+# bypass_actors[].bypass_mode is always | pull_request | exempt, default always
+# (https://docs.github.com/en/rest/repos/rules#create-a-repository-ruleset).
+# `pull_request` lets an admin merge a pull request past the rules but not push
+# directly. The key grants access, so it is required wherever a ruleset is
+# enabled and has no default here: omitting it must not widen access
+# (_agent-guidance docs/reference/settings-schema-design.md, rule 2).
+ADMIN_BYPASS_MODES: dict[str, str | None] = {
+    "always": "always",
+    "pull_request": "pull_request",
+    "none": None,
+}
+
+
+def admin_bypass_mode(cfg: dict) -> str | None:
+    """Validate `admin_bypass` in an enabled ruleset's effective config and
+    return the admin role's bypass_mode, or None for no admin entry."""
+    accepted = " | ".join(ADMIN_BYPASS_MODES)
+    if "admin_bypass" not in cfg:
+        raise SystemExit(
+            f"error: ruleset.admin_bypass is required when the ruleset is "
+            f"enabled (accepted values: {accepted})"
+        )
+    value = cfg["admin_bypass"]
+    # isinstance first: a YAML boolean, or an unhashable value, is never one
+    # of the string keys.
+    if not isinstance(value, str) or value not in ADMIN_BYPASS_MODES:
+        raise SystemExit(
+            f"error: ruleset.admin_bypass must be one of {accepted} (got {value!r})"
+        )
+    return ADMIN_BYPASS_MODES[value]
 
 
 def build_ruleset_body(cfg: dict) -> dict:
@@ -555,12 +629,13 @@ def build_ruleset_body(cfg: dict) -> dict:
             }
         )
     bypass: list[dict] = []
-    if cfg.get("admin_bypass", True):
+    admin_mode = admin_bypass_mode(cfg)
+    if admin_mode is not None:
         bypass.append(
             {
                 "actor_id": ADMIN_ROLE_ID,
                 "actor_type": "RepositoryRole",
-                "bypass_mode": "always",
+                "bypass_mode": admin_mode,
             }
         )
     for entry in _bypass_entries(cfg.get("bypass_actors")):
@@ -661,6 +736,26 @@ def _extra_rule_params(rule: dict) -> dict:
     return params
 
 
+# GitHub returns `bypass_actors` only to a caller that can edit the ruleset.
+# The "Get a repository ruleset" REST docs say: "To prevent leaking sensitive
+# information, the bypass_actors property is only returned if the user making
+# the API request has write access to the ruleset."
+# (https://docs.github.com/en/rest/repos/rules#get-a-repository-ruleset).
+# PR #95 measured it: a read-only token got no field, and 9 rulesets read as
+# `'bypass': []` drift. So an ABSENT field normalizes to BYPASS_UNKNOWN, never
+# to [], and plan_ruleset compares everything else; a present [] still compares.
+BYPASS_UNKNOWN = None
+
+
+def _normalize_bypass(rs_: dict) -> list | None:
+    if "bypass_actors" not in rs_:
+        return BYPASS_UNKNOWN
+    return sorted(
+        (b.get("actor_type"), b.get("actor_id"), b.get("bypass_mode"))
+        for b in rs_["bypass_actors"] or []
+    )
+
+
 def normalize_extra_ruleset(rs_: dict | None) -> dict | None:
     """Reduce an extra ruleset (live or desired) to comparable fields. Rules are
     compared as a set of (type, parameters); includes and bypass sorted."""
@@ -676,10 +771,7 @@ def normalize_extra_ruleset(rs_: dict | None) -> dict | None:
         "include": sorted(cond.get("include", [])),
         "exclude": sorted(cond.get("exclude", [])),
         "rules": rules,
-        "bypass": sorted(
-            (b.get("actor_type"), b.get("actor_id"), b.get("bypass_mode"))
-            for b in rs_.get("bypass_actors", [])
-        ),
+        "bypass": _normalize_bypass(rs_),
     }
 
 
@@ -701,10 +793,7 @@ def normalize_ruleset(rs: dict | None) -> dict | None:
     include = sorted(
         rs.get("conditions", {}).get("ref_name", {}).get("include", [])
     )
-    bypass = sorted(
-        (b.get("actor_type"), b.get("actor_id"), b.get("bypass_mode"))
-        for b in rs.get("bypass_actors", [])
-    )
+    bypass = _normalize_bypass(rs)
     return {
         "enforcement": rs.get("enforcement"),
         "include": include,
@@ -737,6 +826,14 @@ def ruleset_doc(branch_rs: dict) -> dict:
     """Reduce a live branch ruleset to the config-schema `ruleset:` block
     (the inverse of build_ruleset_body, for `generate`)."""
     norm = normalize_ruleset(branch_rs)
+    if norm["bypass"] is BYPASS_UNKNOWN:
+        # Emitting "none" here would write a config that strips every bypass
+        # actor on the next apply.
+        raise SystemExit(
+            f"error: ruleset {branch_rs.get('name')!r} was read without "
+            f"bypass_actors (this token cannot edit it); generate needs a token "
+            f"that can"
+        )
     doc = {
         "enabled": True,
         "name": branch_rs.get("name"),
@@ -760,9 +857,16 @@ def ruleset_doc(branch_rs: dict) -> dict:
         "block_force_pushes": "non_fast_forward" in norm["rule_types"],
         "block_deletions": "deletion" in norm["rule_types"],
         "required_status_checks": norm["checks"],
-        "admin_bypass": any(
-            t == "RepositoryRole" and i == ADMIN_ROLE_ID
-            for (t, i, _m) in norm["bypass"]
+        # The admin role's live bypass_mode, or "none". A mode outside
+        # ADMIN_BYPASS_MODES (GitHub's `exempt`) is emitted as read, so the
+        # generated config fails validation rather than silently changing it.
+        "admin_bypass": next(
+            (
+                m
+                for (t, i, m) in norm["bypass"]
+                if t == "RepositoryRole" and i == ADMIN_ROLE_ID
+            ),
+            "none",
         ),
     }
     extra = [
@@ -775,7 +879,23 @@ def ruleset_doc(branch_rs: dict) -> dict:
     return doc
 
 
-def write_ruleset(repo: str, body: dict, existing_id: int | None) -> None:
+BYPASS_UNKNOWN_NOTE = (
+    "bypass actors not returned to this token (it cannot edit the ruleset) "
+    "-- bypass not compared"
+)
+BYPASS_UNKNOWN_REFUSAL = (
+    "refusing to write ruleset: the live read has no bypass_actors (this "
+    "token cannot edit the ruleset), so a PUT would overwrite bypass actors "
+    "it cannot see"
+)
+
+
+def write_ruleset(repo: str, body: dict, existing_id: int | None,
+                  bypass_unknown: bool = False) -> None:
+    if bypass_unknown:
+        # Never write blind: a PUT replaces bypass_actors wholesale, and this
+        # read could not see what it would overwrite.
+        raise GhError(None, BYPASS_UNKNOWN_REFUSAL)
     if existing_id is not None:
         gh_api(f"repos/{repo}/rulesets/{existing_id}", method="PUT", body=body)
     else:
@@ -1072,68 +1192,373 @@ def deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
+def merge_labels(default_labels, repo_labels) -> list:
+    """Fleet-wide `defaults.labels` plus a repo's own `labels`; the repo's
+    entry replaces a default of the same name. Shape errors are left for
+    build_label_specs to refuse, so a non-list passes through untouched."""
+    if repo_labels is None:
+        return copy.deepcopy(default_labels)
+    if not isinstance(default_labels, list) or not isinstance(repo_labels, list):
+        return copy.deepcopy(repo_labels)
+    own = {
+        str(c.get("name")).lower() for c in repo_labels if isinstance(c, dict)
+    }
+    kept = [
+        c for c in default_labels
+        if not (isinstance(c, dict) and str(c.get("name")).lower() in own)
+    ]
+    return copy.deepcopy(kept + repo_labels)
+
+
+# The surfaces: the top-level keys of one repo's resolved settings, each of
+# which plan_repo plans independently. Surfaces are top-level only -- there is
+# no way to manage part of `actions`. Defined ONCE: `manage` validation, the
+# unknown-key checks, the single-repo shape and every error message are built
+# from this tuple. Its order is the canonical order a `manage` array must use,
+# and it is alphabetical so a human can write it without looking it up.
+SURFACES = (
+    "actions",
+    "actions_policies",
+    "extra_rulesets",
+    "labels",
+    "repo",
+    "ruleset",
+    "security",
+)
+# `manage: ["all"]` -- every surface, INCLUDING any added to SURFACES later
+# (docs/decisions/0011).
+MANAGE_ALL = "all"
+
+# Surfaces whose value is a map; the rest are arrays of maps.
+MAP_SURFACES = ("actions", "repo", "ruleset", "security")
+
+# The keys each surface's planner reads: for a map surface the keys of the map,
+# for an array surface the keys of each element. Derived from plan_repo and the
+# build_* helpers; a key not listed here is one the engine would silently
+# ignore, so it is refused instead.
+SURFACE_KEYS = {
+    "actions": (
+        "sha_pinning_required",
+        "fork_pr_approval",
+        *WORKFLOW_PERMISSIONS_KEYS,
+    ),
+    "actions_policies": ACTIONS_POLICY_KEYS,
+    "extra_rulesets": ("name", "enforcement", "target_branches", "rules", "bypass_actors"),
+    "labels": ("name", "color", "description"),
+    "repo": (
+        "allow_auto_merge",
+        "delete_branch_on_merge",
+        *MERGE_METHOD_KEYS,
+        *MERGE_COMMIT_MESSAGE_KEYS,
+    ),
+    "ruleset": (
+        "enabled",
+        "name",
+        "enforcement",
+        "target_branches",
+        "require_pull_request",
+        "block_force_pushes",
+        "block_deletions",
+        "required_status_checks",
+        "admin_bypass",
+        "bypass_actors",
+    ),
+    "security": (
+        "vulnerability_alerts",
+        "automated_security_fixes",
+        "grouped_security_updates",
+    ),
+}
+
+# Accepted keys of the fleet shape's top level and of each `repos` element.
+FLEET_KEYS = ("defaults", "repos")
+REPO_ELEMENT_KEYS = ("name", "manage", "overrides")
+
+MANAGE_ACCEPTED = (
+    f'expected an array: ["{MANAGE_ALL}"] for every surface (including any '
+    f"added later), [] for none, or one or more of {', '.join(SURFACES)}, in "
+    f"that order"
+)
+
+
+def _json(value: Any) -> str:
+    """Render a config value the way the docs write it: `["labels"]`, not
+    Python's `['labels']`."""
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """SafeLoader that refuses a map with the same key twice. PyYAML's own
+    loaders silently keep the LAST one, so a second `manage:` or `ruleset:` in
+    one element would quietly win over the first."""
+
+
+def _construct_unique_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode,
+                              deep: bool = False) -> dict:
+    seen: dict = {}
+    for key_node, _value in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            continue  # `<<:` merges are flattened by construct_mapping
+        key = loader.construct_object(key_node, deep=True)
+        try:
+            first = seen.get(key)
+        except TypeError:
+            continue  # unhashable key: construct_mapping reports it
+        if first is not None:
+            raise ConfigError(
+                f"error: duplicate key {key!r} at line {key_node.start_mark.line + 1} "
+                f"(first at line {first.start_mark.line + 1}); a map may name a "
+                f"key once"
+            )
+        seen[key] = key_node
+    return loader.construct_mapping(node, deep=deep)
+
+
+_UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+)
+
+
 def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as fh:
-        return yaml.safe_load(fh) or {}
+    """Read a config file with the duplicate-key-refusing loader. A file that
+    does not parse, or whose top level is not a map, is a ConfigError."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            cfg = yaml.load(fh, Loader=_UniqueKeyLoader)  # a SafeLoader subclass
+    except ConfigError as e:
+        raise ConfigError(f"{e.code} in {path}") from e
+    except yaml.YAMLError as e:
+        raise ConfigError(f"error: {path} is not valid YAML: {e}") from e
+    if cfg is None:
+        return {}
+    if not isinstance(cfg, dict):
+        raise ConfigError(f"error: {path}: the top level must be a map (got {_json(cfg)})")
+    return cfg
+
+
+def _check_keys(where: str, value: dict, accepted) -> None:
+    unknown = [k for k in value if k not in accepted]
+    if unknown:
+        raise ConfigError(
+            f"error: {where}: unknown key(s) {', '.join(map(repr, unknown))} "
+            f"(accepted: {', '.join(accepted)})"
+        )
+
+
+def validate_surfaces(where: str, block: dict) -> None:
+    """Check a map of surfaces (`defaults:`, an element's `overrides:`, or the
+    single-repo top level): only surface names, each of the right shape, each
+    carrying only the keys its planner reads. Values are left to plan_repo and
+    the build_* helpers, which own them."""
+    _check_keys(where, block, SURFACES)
+    for surface, value in block.items():
+        at = f"{where}.{surface}"
+        if surface in MAP_SURFACES:
+            if not isinstance(value, dict):
+                raise ConfigError(f"error: {at} must be a map (got {_json(value)})")
+            _check_keys(at, value, SURFACE_KEYS[surface])
+        else:
+            if not isinstance(value, list):
+                raise ConfigError(f"error: {at} must be an array (got {_json(value)})")
+            for i, element in enumerate(value):
+                # A non-map element is left to the surface's build_* helper,
+                # which refuses it with its own message.
+                if isinstance(element, dict):
+                    _check_keys(f"{at}[{i}]", element, SURFACE_KEYS[surface])
+
+
+def validate_manage(where: str, value: Any) -> list[str]:
+    """Return a `manage` value if it is one of the documented ones, else raise
+    ConfigError. One meaning, one value: `["all"]`, `[]`, or surface names
+    from SURFACES, each once, in SURFACES' order, short of naming all seven."""
+
+    def bad(problem: str) -> ConfigError:
+        return ConfigError(f"error: {where}: `manage` {problem}; {MANAGE_ACCEPTED}")
+
+    if not isinstance(value, list):
+        raise bad(f"must be an array, not {_json(value)}")
+    for element in value:
+        if not isinstance(element, str):
+            raise bad(
+                f"element {_json(element)} is not a string (PyYAML loads an "
+                f"unquoted no, yes, on or off as a boolean)"
+            )
+    if MANAGE_ALL in value:
+        if value != [MANAGE_ALL]:
+            raise bad(f'"{MANAGE_ALL}" must stand alone, not in {_json(value)}')
+        return list(value)
+    unknown = [e for e in value if e not in SURFACES]
+    if unknown:
+        raise bad(f"names unknown surface(s) {_json(unknown)}")
+    if len(set(value)) != len(value):
+        raise bad(f"names a surface twice in {_json(value)}")
+    canonical = [s for s in SURFACES if s in value]
+    if value != canonical:
+        raise bad(f"must list surfaces in canonical order: write {_json(canonical)}")
+    if len(value) == len(SURFACES):
+        raise bad(f'names every surface; write ["{MANAGE_ALL}"]')
+    return list(value)
+
+
+def _validate_builders(where: str, settings: dict) -> None:
+    """Run the surfaces' own value checks (the build_* helpers) over one repo's
+    DECLARED settings, so a bad value is refused before anything is planned --
+    including on a surface the repo's `manage` leaves out."""
+    try:
+        build_label_specs(settings)
+        build_extra_ruleset_bodies(settings)
+        build_actions_policy_bodies(settings)
+        ruleset_cfg = settings.get("ruleset") or {}
+        if ruleset_cfg.get("enabled"):
+            build_ruleset_body(ruleset_cfg)
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            raise ConfigError(f"{e.code} (in {where})") from e
+        raise
+
+
+def manages(target: dict, surface: str) -> bool:
+    """Whether `target` manages `surface`. The only way to ask: never test
+    target["manage"] for truthiness."""
+    if surface not in SURFACES:
+        raise ValueError(f"unknown surface {surface!r}")
+    manage = target["manage"]
+    return MANAGE_ALL in manage or surface in manage
+
+
+def manage_label(target: dict) -> str:
+    """What `diff`, `apply` and `coverage` print about a target's scope."""
+    manage = target["manage"]
+    if not any(manages(target, s) for s in SURFACES):
+        return "excluded (manage: [])"
+    if MANAGE_ALL in manage:
+        return f"managed: {MANAGE_ALL}"
+    return "managed: " + ", ".join(s for s in SURFACES if manages(target, s))
+
+
+def effective_settings(declared: dict, manage: list[str]) -> dict:
+    """Keep only the surfaces `manage` lists. Applied after the defaults and
+    merge_labels, so a surface reaches plan_repo only when named: it fails
+    closed."""
+    if MANAGE_ALL in manage:
+        return copy.deepcopy(declared)
+    return {k: copy.deepcopy(v) for k, v in declared.items() if k in manage}
 
 
 def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
+    """Validate a config and resolve it into one target per repo:
+    `{"repo", "manage", "declared", "effective"}`. `declared` is the repo's
+    settings after defaults and overrides, before filtering; `effective` keeps
+    only the surfaces `manage` names, and is what plan_repo is given. The
+    whole config is validated before anything is filtered, so a `[]` element
+    and an unmanaged surface are checked too."""
     if "repos" in cfg:  # fleet mode
+        _check_keys("top level", cfg, FLEET_KEYS)
         defaults = cfg.get("defaults", {})
+        if not isinstance(defaults, dict):
+            raise ConfigError(f"error: defaults must be a map (got {_json(defaults)})")
+        validate_surfaces("defaults", defaults)
         # Per-repo only: deep_merge REPLACES lists, so a defaults-level list
         # would be silently dropped by any repo that declares its own, and a
         # ruleset with bypass actors is a repo-specific grant (ADR 0004).
         if "extra_rulesets" in defaults:
-            raise SystemExit(
+            raise ConfigError(
                 "error: extra_rulesets is per-repo only -- declare it under a "
-                "repo's `overrides:`, not `defaults:`"
-            )
-        # Same list-replacement hazard, and a label is a per-repo fixture of one
-        # workflow: a defaults-level label would be created in every repo.
-        if "labels" in defaults:
-            raise SystemExit(
-                "error: labels is per-repo only -- declare it under a "
                 "repo's `overrides:`, not `defaults:`"
             )
         # Same list-replacement hazard, and a policy names one repo's workflow
         # files: a defaults-level policy would point at files other repos lack.
         if "actions_policies" in defaults:
-            raise SystemExit(
+            raise ConfigError(
                 "error: actions_policies is per-repo only -- declare it under a "
                 "repo's `overrides:`, not `defaults:`"
             )
+        repos = cfg["repos"]
+        if not isinstance(repos, list):
+            raise ConfigError(f"error: repos must be an array (got {_json(repos)})")
         targets = []
-        for entry in cfg["repos"]:
-            if isinstance(entry, str):
-                entry = {"name": entry}
+        seen: dict[str, str] = {}
+        for i, entry in enumerate(repos):
+            if not isinstance(entry, dict):
+                # A bare `- owner/repo` string cannot carry `manage`.
+                raise ConfigError(
+                    f"error: repos[{i}] must be a map with `name` and `manage` "
+                    f"(got {_json(entry)}); write `- name: ...` with `manage:`"
+                )
+            name = entry.get("name")
+            if (
+                not isinstance(name, str)
+                or name.count("/") != 1
+                or not all(name.split("/"))
+            ):
+                raise ConfigError(
+                    f"error: repos[{i}] needs `name: owner/repo` (got {_json(name)})"
+                )
+            where = f"repos[{name}]"
+            _check_keys(where, entry, REPO_ELEMENT_KEYS)
+            if name.lower() in seen:
+                raise ConfigError(
+                    f"error: {where} is declared twice (as {seen[name.lower()]!r} "
+                    f"and {name!r}); repo names compare case-insensitively"
+                )
+            seen[name.lower()] = name
+            if "manage" not in entry:
+                raise ConfigError(f"error: {where}: `manage` is required; {MANAGE_ACCEPTED}")
+            manage = validate_manage(where, entry["manage"])
+            overrides = entry.get("overrides", {})
+            if not isinstance(overrides, dict):
+                raise ConfigError(
+                    f"error: {where}.overrides must be a map (got {_json(overrides)})"
+                )
+            validate_surfaces(f"{where}.overrides", overrides)
+            declared = deep_merge(defaults, overrides)
+            if "labels" in defaults:
+                # deep_merge REPLACES lists, so merge labels here instead: the
+                # fleet-wide labels plus the repo's own, a repo entry winning a
+                # name clash (names compare case-insensitively, as on GitHub).
+                declared["labels"] = merge_labels(defaults["labels"], overrides.get("labels"))
+            _validate_builders(where, declared)
             targets.append(
                 {
-                    "repo": entry["name"],
-                    "settings": deep_merge(defaults, entry.get("overrides", {})),
-                    "manage": entry.get("manage", True),
+                    "repo": name,
+                    "manage": manage,
+                    "declared": declared,
+                    "effective": effective_settings(declared, manage),
                 }
             )
         return targets
     repo_field = cfg.get("repo")
     # `repo:` is overloaded in this shape: the pre-existing convention is the
-    # identifier string `owner/name`; the new settings mapping (e.g.
+    # identifier string `owner/name`; the new settings map (e.g.
     # {allow_auto_merge: true}) is a different, mutually-exclusive use of the
     # same key. Only fall back to it as the identifier when it's a string, so
     # an existing config's `repo: owner/name` keeps working unchanged.
     repo = repo_arg or (repo_field if isinstance(repo_field, str) else None)
     if not repo:
-        raise SystemExit(
+        raise ConfigError(
             "error: single-repo config needs a top-level `repo: owner/name` "
             "or a --repo argument."
         )
-    settings = {
-        k: v
-        for k, v in cfg.items()
-        if k in ("actions", "ruleset", "extra_rulesets", "labels", "actions_policies")
+    # The surfaces are the blocks present, through the same constant -- an
+    # omitted block is not managed. A string `repo:` is the identifier, not a
+    # surface.
+    declared = {
+        k: v for k, v in cfg.items() if not (k == "repo" and isinstance(v, str))
     }
-    if isinstance(repo_field, dict):
-        settings["repo"] = repo_field
-    return [{"repo": repo, "settings": settings, "manage": True}]
+    validate_surfaces("top level", declared)
+    _validate_builders(repo, declared)
+    manage = [s for s in SURFACES if s in declared]
+    return [
+        {
+            "repo": repo,
+            "manage": manage,
+            "declared": declared,
+            "effective": effective_settings(declared, manage),
+        }
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -1339,7 +1764,7 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
         # exposes no REST endpoint for grouped security updates at repo OR
         # org level (absent from `security_and_analysis`, absent from
         # org/enterprise code-security configurations -- which are org-only
-        # anyway and so unreachable for the 18 fleet repos that sit under a
+        # anyway and so unreachable for the fleet repos that sit under a
         # user account). It is UI-only, or expressible per-repo in
         # `.github/dependabot.yml` via `groups:` with `applies-to:
         # security-updates`. Declaring the key at all (rather than omitting
@@ -1362,16 +1787,33 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
         try:
             existing = find_ruleset(repo, name)
             existing_id = existing["id"] if existing else None
-            same = normalize(existing) == normalize(body)
-            records.append(
-                {
-                    "setting": f"ruleset[{name}]",
-                    "status": "match" if same else "drift",
-                    "current": normalize(existing),
-                    "desired": normalize(body),
-                    "_writer": ("ruleset", body, existing_id),
-                }
-            )
+            current, desired = normalize(existing), normalize(body)
+            unknown = current is not None and current["bypass"] is BYPASS_UNKNOWN
+            if unknown:
+                # Compare all but the bypass list: the rest decides between
+                # an informational skip and drift on what does differ. Never
+                # `match` (the bypass is unverified), never drift BY the bypass.
+                current = dict(current, bypass="unknown")
+                rest_same = all(
+                    current[k] == desired[k] for k in desired if k != "bypass"
+                )
+                if rest_same:
+                    records.append(
+                        _skip(f"ruleset[{name}]", desired, BYPASS_UNKNOWN_NOTE)
+                    )
+                    return
+            same = current == desired
+            rec = {
+                "setting": f"ruleset[{name}]",
+                "status": "match" if same else "drift",
+                "current": current,
+                "desired": desired,
+                "_writer": ("ruleset", body, existing_id),
+            }
+            if unknown:
+                rec["note"] = BYPASS_UNKNOWN_NOTE
+                rec["bypass_unknown"] = True
+            records.append(rec)
         except GhError as e:
             if e.status in (402, 403) and is_private():
                 records.append(_skip(f"ruleset[{name}]", "enabled",
@@ -1383,6 +1825,9 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
     if ruleset_cfg.get("enabled"):
         name = ruleset_cfg.get("name", DEFAULT_RULESET_NAME)
         plan_ruleset(name, build_ruleset_body(ruleset_cfg), normalize_ruleset)
+    elif "admin_bypass" in ruleset_cfg:
+        # Not required while disabled, but a value that is given is checked.
+        admin_bypass_mode(ruleset_cfg)
 
     # Extra named rulesets: same by-name idempotence. Removing an entry from
     # config leaves its live ruleset alone (never touches undeclared rulesets).
@@ -1719,9 +2164,9 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
     # Per-repo only, by name, never deleting: an entry removed from config
     # leaves its live label alone. No private-repo gate: labels exist on every
     # plan. Writing one needs the credential's Issues (or Pull requests) write
-    # permission, which is NOT part of the fan-out App's Administration +
-    # Actions + Metadata grant -- so a write the credential cannot make comes
-    # back as an `error` record, not a silent skip.
+    # permission. The fan-out App holds Issues: write (README, "CI fan-out");
+    # any credential that does not gets an `error` record for the write, never
+    # a silent skip.
     for spec in build_label_specs(settings):
         setting = f"label[{spec['name']}]"
         desired = normalize_label(spec)
@@ -1787,7 +2232,7 @@ def apply_record(repo: str, rec: dict) -> None:
     elif kind == "workflow_permissions":
         write_workflow_permissions(repo, b)
     elif kind == "ruleset":
-        write_ruleset(repo, a, b)
+        write_ruleset(repo, a, b, rec.get("bypass_unknown", False))
     elif kind == "label":
         write_label(repo, a, b)
     elif kind == "actions_policy":
@@ -1825,8 +2270,10 @@ def _sym(status: str) -> str:
     }.get(status, status)
 
 
-def render_records(repo: str, records: list[dict]) -> None:
+def render_records(repo: str, records: list[dict], scope: str | None = None) -> None:
     print(f"\n{repo}")
+    if scope is not None:
+        print(f"  {DIM}{scope}{RESET}")
     if not records:
         print("  (no managed settings)")
         return
@@ -1834,6 +2281,8 @@ def render_records(repo: str, records: list[dict]) -> None:
         line = f"  [{_sym(r['status'])}] {r['setting']}"
         if r["status"] in ("drift", "would-change"):
             line += f"\n      from: {r['current']!r}\n      to:   {r['desired']!r}"
+            if r.get("note"):
+                line += f"\n      note: {r['note']}"
         elif r["status"] == "changed":
             line += f"  -> {r['desired']!r}"
         elif r["status"] in ("skipped", "error"):
@@ -1934,7 +2383,15 @@ def _filter_owner(targets: list[dict], owner: str | None) -> list[dict]:
 
 
 def installation_repos(owner: str | None) -> list[str]:
-    """Every repository this credential can administer, as `owner/name`.
+    """Every repository this credential can administer, as `owner/name`."""
+    return sorted(installation_repo_visibility(owner))
+
+
+def installation_repo_visibility(owner: str | None) -> dict[str, bool]:
+    """Every repository this credential can administer, as `owner/name` mapped
+    to whether it is private. A response missing `private` counts as private:
+    withholding a name wrongly costs a local re-run, publishing one cannot be
+    undone.
 
     `/installation/repositories` rather than `/users/{o}/repos` or
     `/orgs/{o}/repos`, for three reasons and the third is the one that matters:
@@ -1945,7 +2402,7 @@ def installation_repos(owner: str | None) -> list[str]:
     and reporting those as "undeclared" would be reporting a gap nothing in
     this repo could close.
     """
-    repos: list[str] = []
+    repos: dict[str, bool] = {}
     page = 1
     while True:
         # `gh api` follows no pagination of its own here because the response
@@ -1954,21 +2411,22 @@ def installation_repos(owner: str | None) -> list[str]:
         chunk = (payload or {}).get("repositories") or []
         if not chunk:
             break
-        repos.extend(r["full_name"] for r in chunk)
+        for r in chunk:
+            repos[r["full_name"]] = bool(r.get("private", True))
         if len(chunk) < 100:
             break
         page += 1
     if owner:
         o = owner.lower()
-        repos = [r for r in repos if r.split("/", 1)[0].lower() == o]
-    return sorted(repos)
+        repos = {n: v for n, v in repos.items() if n.split("/", 1)[0].lower() == o}
+    return repos
 
 
 def cmd_coverage(args) -> int:
     """Report repositories the credential can administer that `fleet.yml` does
     not DECLARE.
 
-    Declared, not managed. A repo carrying `manage: false` is a decision
+    Declared, not managed. A repo carrying `manage: []` is a decision
     somebody wrote down and is not reported; a repo absent from the file
     entirely is a decision nobody has made, and until this command existed the
     two were indistinguishable from the outside. Same shape as the
@@ -1979,7 +2437,15 @@ def cmd_coverage(args) -> int:
     Exit 0 when every reachable repo is declared, 1 when some are not, and 2
     when the question could not be asked -- never 0 on an enumeration that
     failed, because a clean line over zero repos reads exactly like a clean
-    line over all of them.
+    line over all of them. A refused config is also 2 (ConfigError, raised
+    before any API call).
+
+    The output goes to a public CI log and into an auto-filed issue, so the
+    name of an undeclared PRIVATE repo is withheld (a count is printed) unless
+    `--show-private` is passed, which is for local use only. Declared private
+    repos are still named: `fleet.yml` is in this repo and already names them,
+    so printing them adds no exposure. Only undeclared private names are new
+    information.
     """
     cfg = load_config(args.config)
     if "repos" not in cfg:
@@ -1990,7 +2456,9 @@ def cmd_coverage(args) -> int:
         return 2
 
     declared = {t["repo"].lower(): t for t in resolve_targets(cfg, None)}
-    reachable = installation_repos(getattr(args, "owner", None))
+    visibility = installation_repo_visibility(getattr(args, "owner", None))
+    reachable = sorted(visibility)
+    show_private = getattr(args, "show_private", False)
     if not reachable:
         sys.stderr.write(
             "coverage: the installation reported no repositories -- refusing to "
@@ -1999,14 +2467,21 @@ def cmd_coverage(args) -> int:
         return 2
 
     undeclared = [r for r in reachable if r.lower() not in declared]
+    withheld = 0
     for repo in reachable:
         t = declared.get(repo.lower())
-        if t is None:
+        if t is None and visibility[repo] and not show_private:
+            withheld += 1
+        elif t is None:
             print(f"UNDECLARED  {repo}: reachable by this credential, absent from the config")
-        elif not t["manage"]:
-            print(f"OK          {repo}: declared, manage: false")
         else:
-            print(f"OK          {repo}: declared and managed")
+            print(f"OK          {repo}: declared, {manage_label(t)}")
+
+    if withheld:
+        print(
+            f"UNDECLARED (private)  {withheld} undeclared private repo(s); "
+            "names withheld because this log is public"
+        )
 
     print(
         f"\n{len(reachable)} reachable, {len(reachable) - len(undeclared)} declared, "
@@ -2020,11 +2495,11 @@ def cmd_diff(args) -> int:
     targets = _filter_owner(resolve_targets(cfg, args.repo), getattr(args, "owner", None))
     any_drift = any_error = False
     for t in targets:
-        if not t["manage"]:
-            print(f"\n{t['repo']}\n  {DIM}excluded (manage: false){RESET}")
+        if not any(manages(t, s) for s in SURFACES):
+            print(f"\n{t['repo']}\n  {DIM}{manage_label(t)}{RESET}")
             continue
-        records = plan_repo_records(t["repo"], t["settings"])
-        render_records(t["repo"], records)
+        records = plan_repo_records(t["repo"], t["effective"])
+        render_records(t["repo"], records, manage_label(t))
         any_drift |= any(r["status"] == "drift" for r in records)
         any_error |= any(r["status"] == "error" for r in records)
     if any_error:
@@ -2037,13 +2512,18 @@ def cmd_apply(args) -> int:
     targets = _filter_owner(resolve_targets(cfg, args.repo), getattr(args, "owner", None))
     any_error = False
     for t in targets:
-        if not t["manage"]:
-            print(f"\n{t['repo']}\n  {DIM}excluded (manage: false){RESET}")
+        if not any(manages(t, s) for s in SURFACES):
+            print(f"\n{t['repo']}\n  {DIM}{manage_label(t)}{RESET}")
             continue
-        records = plan_repo_records(t["repo"], t["settings"])
+        records = plan_repo_records(t["repo"], t["effective"])
         for r in records:
             if r["status"] == "drift":
-                if args.dry_run:
+                if r.get("bypass_unknown"):
+                    # Refused in a dry run too, so it never promises a write
+                    # that apply would refuse.
+                    r["status"] = "error"
+                    r["note"] = BYPASS_UNKNOWN_REFUSAL
+                elif args.dry_run:
                     r["status"] = "would-change"
                 else:
                     try:
@@ -2052,7 +2532,7 @@ def cmd_apply(args) -> int:
                     except GhError as e:
                         r["status"] = "error"
                         r["note"] = e.message
-        render_records(t["repo"], records)
+        render_records(t["repo"], records, manage_label(t))
         any_error |= any(r["status"] == "error" for r in records)
     return 2 if any_error else 0
 
@@ -2085,6 +2565,12 @@ def main() -> int:
     )
     c.add_argument("--config", required=True)
     c.add_argument("--owner", help="only consider repos under this owner (account)")
+    c.add_argument(
+        "--show-private",
+        action="store_true",
+        help="name undeclared PRIVATE repos too; local use only, never in CI "
+        "(the log and the nudge issue are public)",
+    )
     c.set_defaults(func=cmd_coverage)
 
     args = p.parse_args()
@@ -2093,6 +2579,15 @@ def main() -> int:
     except GhError as e:
         sys.stderr.write(f"gh error: {e}\n")
         return 2
+    except SystemExit as e:
+        # A message-carrying SystemExit is a refused config (ConfigError, or
+        # a build_* helper's older `SystemExit("error: ...")`). Exit 2, not
+        # Python's default 1: 1 means drift for `diff` and undeclared repos
+        # for `coverage`, and a config the engine could not read is neither.
+        if isinstance(e.code, str):
+            sys.stderr.write(f"{e.code}\n")
+            return 2
+        raise
 
 
 if __name__ == "__main__":

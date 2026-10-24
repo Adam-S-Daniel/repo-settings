@@ -73,5 +73,28 @@ class DependabotConfigTests(unittest.TestCase):
                 )
 
 
+class PipEntryTests(unittest.TestCase):
+    def _pip_entries(self):
+        return [
+            entry
+            for entry in _load_config()["updates"]
+            if entry.get("package-ecosystem") == "pip"
+        ]
+
+    def test_pip_ecosystem_is_present_for_the_root_requirements(self):
+        entries = self._pip_entries()
+        self.assertTrue(entries, "expected an update entry for pip")
+        self.assertEqual(entries[0]["directory"], "/")
+        self.assertEqual(entries[0]["schedule"]["interval"], "weekly")
+
+    def test_pip_cooldown_is_7_days_with_30_for_majors_and_no_other_tier(self):
+        for entry in self._pip_entries():
+            cooldown = entry["cooldown"]
+            self.assertEqual(cooldown["default-days"], 7)
+            self.assertEqual(cooldown["semver-major-days"], 30)
+            self.assertNotIn("semver-minor-days", cooldown)
+            self.assertNotIn("semver-patch-days", cooldown)
+
+
 if __name__ == "__main__":
     unittest.main()

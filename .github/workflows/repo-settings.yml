@@ -16,7 +16,8 @@
 # be automated):
 #   1. Create a GitHub App (Settings > Developer settings > GitHub Apps) with
 #      repository permissions: Administration: Read & write, Actions: Read &
-#      write, Metadata: Read-only. No webhook needed.
+#      write, Issues: Read & write (the `labels` surface writes labels),
+#      Metadata: Read-only. No webhook needed.
 #   2. Generate a private key; install the App on BOTH `Adam-S-Daniel` and the
 #      `jodidaniel` org, granting access to the repos in fleet.yml.
 #   3. In THIS repo, add: variable `REPO_SETTINGS_APP_CLIENT_ID` (the App's
@@ -55,11 +56,13 @@ on:
       - "repo-settings/fleet.yml"
       - "scripts/repo_settings.py"
       - ".github/workflows/repo-settings.yml"
+      - "requirements.txt"
   pull_request:
     paths:
       - "repo-settings/fleet.yml"
       - "scripts/repo_settings.py"
       - ".github/workflows/repo-settings.yml"
+      - "requirements.txt"
 
 permissions:
   contents: read
@@ -89,7 +92,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install PyYAML
-        run: pip install pyyaml
+        run: python3 -m pip install -r requirements.txt
 
       - name: Mint GitHub App token for ${{ matrix.owner }}
         id: token
@@ -122,17 +125,18 @@ jobs:
       # are owed -- and a weekly apply that goes red because someone created a
       # repo teaches people to ignore a red weekly apply.
       #
-      # `fleet.yml` lists 21 repos today and the App is installed on ALL
-      # repositories in both accounts, so the two sets are equal by hand and
-      # nothing has been checking that they stay equal. A repo created next
-      # month gets no ruleset, no SHA-pinning enforcement and no fork-PR
-      # approval, and says nothing about it -- the same silence
+      # The App is installed on ALL repositories in both accounts, and
+      # `fleet.yml` was kept equal to that set by hand, with nothing checking
+      # that the two stay equal. A repo created next month gets no ruleset,
+      # no SHA-pinning enforcement and no fork-PR approval, and says nothing
+      # about it -- the same silence
       # `skills_bootstrap` had before _agent-guidance's ADR 0011.
       #
       # The APP token enumerates (only an installation token can ask
       # /installation/repositories what it can reach); the REPO token files the
-      # issue, because the App is scoped to Administration and Actions and has
-      # no business writing issues.
+      # issue. The App does hold Issues: write (README, "CI fan-out"), which
+      # the `labels` surface uses on managed repos; this step files its issue
+      # in this repo with the repo's own token.
       - name: Which repos does fleet.yml not declare?
         id: coverage
         if: github.event_name != 'pull_request'
@@ -142,10 +146,13 @@ jobs:
           OWNER: ${{ matrix.owner }}
         run: |
           set -uo pipefail
+          # No --show-private here: this log is public. See cmd_coverage.
+          # GitHub runs this under `bash -e`; `|| rc=$?` keeps a nonzero exit
+          # from killing the script before rc is recorded and the report shown.
+          rc=0
           python scripts/repo_settings.py coverage \
             --config repo-settings/fleet.yml --owner "$OWNER" \
-            > "coverage-$OWNER.txt" 2>&1
-          rc=$?
+            > "coverage-$OWNER.txt" 2>&1 || rc=$?
           # Three-valued, and the middle one is the whole point: 0 complete,
           # 1 something undeclared, 2 the question could not be asked. A `2`
           # must never reach the issue step as "nothing undeclared".
@@ -190,7 +197,7 @@ jobs:
           {
             echo "The repo-settings App can administer repositories under \`$OWNER\` that \`repo-settings/fleet.yml\` does not declare."
             echo
-            echo "Undeclared means nobody has decided about them -- not that they should be managed. Declaring one with \`manage: false\` is a perfectly good answer, and is what the two forks carry today; what is not an answer is absence, because absence and a deliberate omission look identical."
+            echo "Undeclared means nobody has decided about them -- not that they should be managed. Declaring one with \`manage: []\` is a perfectly good answer, and is what the two forks carry today; what is not an answer is absence, because absence and a deliberate omission look identical."
             echo
             echo "Until a repo is declared it gets no ruleset, no SHA-pinning enforcement and no fork-PR approval requirement, and nothing says so."
             echo
@@ -198,7 +205,9 @@ jobs:
             grep '^UNDECLARED' "$report" || true
             echo '```'
             echo
-            echo "Add each to \`repos:\` in \`repo-settings/fleet.yml\`, with \`manage: false\` if it should be left alone. This issue closes itself on the next weekly run."
+            echo "Names of undeclared private repositories are withheld because this issue is public. To see them, run \`python3 scripts/repo_settings.py coverage --config repo-settings/fleet.yml --owner $OWNER --show-private\` locally."
+            echo
+            echo "Add each to \`repos:\` in \`repo-settings/fleet.yml\`, with \`manage: [\"all\"]\` to manage it or \`manage: []\` to leave it alone. This issue closes itself on the next weekly run."
           } > /tmp/coverage-body.md
 
           if [[ -n "$existing" ]]; then
