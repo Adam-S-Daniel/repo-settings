@@ -130,11 +130,33 @@ configured, the workflow **skips itself** (guarded on
    - Variable `REPO_SETTINGS_APP_CLIENT_ID` = the App's **Client ID** (on the
      App's settings page). Not the numeric App ID -- the action's `app-id`
      input is deprecated in favour of `client-id`.
-   - Secret `REPO_SETTINGS_APP_PRIVATE_KEY` = the full contents of the `.pem`.
+   - Secret `REPO_SETTINGS_APP_PRIVATE_KEY` = the full contents of the `.pem`,
+     stored as a secret of the **`fleet-apply` environment** (Settings →
+     Environments), never as a repo-level secret. See step 5.
+5. **The `fleet-apply` environment gates the admin key**
+   ([#90](https://github.com/Adam-S-Daniel/repo-settings/issues/90),
+   [#13](https://github.com/Adam-S-Daniel/repo-settings/issues/13)). It needs a
+   required reviewer (the owner) and a deployment-branch policy that allows only
+   `main`. The `repo-settings` apply job declares it, so every apply waits for
+   approval, and its first step refuses to apply unless both rules are still
+   there: naming an environment that does not exist silently creates one with
+   no protection. GitHub serves environment secrets only to jobs that declare
+   the environment, and only after approval. An environment secret also
+   [takes precedence](https://docs.github.com/en/actions/reference/security/secrets)
+   over a repo secret of the same name.
+6. **Optional: a read-only App for the pull-request drift preview.** Pull
+   requests never get the admin key. The `drift` job instead mints from a
+   second App with only Administration: Read, Actions: Read, Issues: Read and
+   Metadata: Read, installed on all repos in both accounts. In this repo, set
+   variable `REPO_SETTINGS_READ_APP_CLIENT_ID` and secret
+   `REPO_SETTINGS_READ_APP_PRIVATE_KEY` (repo level). Until the variable
+   exists, `drift` is skipped. Reads that need write come back as skips, never
+   drift.
 
-After that the workflow runs on push to `main` (config/script changes), a weekly
-schedule, and manual dispatch (apply); on pull requests it reports drift only and
-fails the check if there is any.
+After that the workflow applies on push to `main` (config/script changes), a
+weekly schedule, and manual dispatch, each after the owner approves the
+`fleet-apply` deployment. On pull requests, once the read-only App exists, it
+reports drift only and fails the `drift` check if there is any.
 
 > Reuse note: `_agent-guidance` already runs a GitHub App (`agents-md-sync`) with
 > the same per-owner token-minting pattern, but only Contents/PR permissions. A
