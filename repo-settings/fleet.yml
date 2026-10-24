@@ -531,13 +531,13 @@ repos:
   # in the lockfile form, so its main is protected like theirs. Both CI jobs
   # are required: no on.paths (self-verify's action decides for itself and
   # still reports), plain job ids, no name/matrix/concurrency/timeout-minutes.
-  # No agent-checks: the sync skips that workflow where actions.lock pins the
-  # actions, so this repo has no such job to require.
+  # agent-checks was added by hand (verify-actions-lock#6), since the sync
+  # skips that workflow where actions.lock pins the actions.
   - name: Adam-S-Daniel/verify-actions-lock
     manage: ["all"]
     overrides:
       ruleset:
-        required_status_checks: [test, self-verify]
+        required_status_checks: [test, self-verify, agent-checks]
 
   # --- GHA-bench: migrated from classic branch protection to a ruleset (the
   #     fleet standard). Now managed like the other public repos. ---

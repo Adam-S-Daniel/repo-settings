@@ -684,7 +684,7 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         "Adam-S-Daniel/ai-usage-dashboard": ["node-test", "pester", "agent-checks"],
         "Adam-S-Daniel/wsl-automation": ["shell", "test", "test-linux", "agent-checks"],
         "Adam-S-Daniel/repo-settings": ["agent-checks", "unit"],
-        "Adam-S-Daniel/verify-actions-lock": ["test", "self-verify"],
+        "Adam-S-Daniel/verify-actions-lock": ["test", "self-verify", "agent-checks"],
     }
     PRE_EXISTING = {
         "Adam-S-Daniel/agentskills": ["pytest-windows"],
@@ -737,13 +737,7 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         # deep_merge REPLACES lists, so an override that forgets to repeat
         # agent-checks silently drops it for that repo.
         for repo, target in self.targets.items():
-            # verify-actions-lock has no agent-checks job: _agent-guidance's
-            # sync skips that workflow where actions.lock pins the actions, so
-            # requiring it there would block every merge.
-            if not rs.manages(target, "ruleset") or repo in (
-                "Adam-S-Daniel/GHA-bench",
-                "Adam-S-Daniel/verify-actions-lock",
-            ):
+            if not rs.manages(target, "ruleset") or repo == "Adam-S-Daniel/GHA-bench":
                 continue
             ruleset = target["declared"].get("ruleset") or {}
             if ruleset.get("enabled") is False:
