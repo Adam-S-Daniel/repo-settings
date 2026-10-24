@@ -525,6 +525,19 @@ repos:
     overrides:
       ruleset:
         required_status_checks: [node-test, pester, agent-checks]
+  # verify-actions-lock: public composite action, created 2026-10-20
+  # (https://github.com/Adam-S-Daniel/verify-actions-lock); the fleet's
+  # lockfile check (_agent-guidance ADR 0024) and a dependency of every repo
+  # in the lockfile form, so its main is protected like theirs. Both CI jobs
+  # are required: no on.paths (self-verify's action decides for itself and
+  # still reports), plain job ids, no name/matrix/concurrency/timeout-minutes.
+  # No agent-checks: the sync skips that workflow where actions.lock pins the
+  # actions, so this repo has no such job to require.
+  - name: Adam-S-Daniel/verify-actions-lock
+    manage: ["all"]
+    overrides:
+      ruleset:
+        required_status_checks: [test, self-verify]
 
   # --- GHA-bench: migrated from classic branch protection to a ruleset (the
   #     fleet standard). Now managed like the other public repos. ---

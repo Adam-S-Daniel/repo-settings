@@ -684,6 +684,7 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         "Adam-S-Daniel/ai-usage-dashboard": ["node-test", "pester", "agent-checks"],
         "Adam-S-Daniel/wsl-automation": ["shell", "test", "test-linux", "agent-checks"],
         "Adam-S-Daniel/repo-settings": ["agent-checks", "unit"],
+        "Adam-S-Daniel/verify-actions-lock": ["test", "self-verify"],
     }
     PRE_EXISTING = {
         "Adam-S-Daniel/agentskills": ["pytest-windows"],
@@ -736,7 +737,13 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         # deep_merge REPLACES lists, so an override that forgets to repeat
         # agent-checks silently drops it for that repo.
         for repo, target in self.targets.items():
-            if not rs.manages(target, "ruleset") or repo == "Adam-S-Daniel/GHA-bench":
+            # verify-actions-lock has no agent-checks job: _agent-guidance's
+            # sync skips that workflow where actions.lock pins the actions, so
+            # requiring it there would block every merge.
+            if not rs.manages(target, "ruleset") or repo in (
+                "Adam-S-Daniel/GHA-bench",
+                "Adam-S-Daniel/verify-actions-lock",
+            ):
                 continue
             ruleset = target["declared"].get("ruleset") or {}
             if ruleset.get("enabled") is False:
@@ -1498,7 +1505,7 @@ class AdminBypassFleetConfigTests(unittest.TestCase):
                     {k: v for k, v in none.items() if k != "bypass_actors"},
                 )
             checked += 1
-        self.assertEqual(checked, 19)
+        self.assertEqual(checked, 20)
 
 
 class BypassUnknownTests(unittest.TestCase):
@@ -3841,7 +3848,7 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
             by_value.setdefault(tuple(entry["manage"]), set()).add(entry["name"])
         self.assertEqual(set(by_value), {("all",), ()})
         self.assertEqual(by_value[()], self.WERE_FALSE)
-        self.assertEqual(len(by_value[("all",)]), 16)
+        self.assertEqual(len(by_value[("all",)]), 17)
 
     def test_diff_output_is_unchanged_apart_from_the_scope_strings(self):
         cfg = rs.load_config(str(self.FLEET))
