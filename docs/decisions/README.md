@@ -101,3 +101,4 @@ Optional sections for high-impact decisions:
 | [0009](0009-allow-pull-request-target-with-a-workflow-scoped-policy-owned-by-name.md) | Allow pull_request_target with a workflow-scoped Actions event policy the engine owns by name | Accepted |
 | [0010](0010-labels-may-be-declared-fleet-wide-and-merge-by-name.md) | Labels may be declared fleet-wide and merge with per-repo labels by name | Accepted |
 | [0011](0011-make-manage-a-required-array-of-surfaces.md) | Make `manage` a required array of surfaces | Accepted |
+| [0012](0012-eval-loop-prs-auto-merge-as-a-declared-exception.md) | Eval-loop PRs auto-merge as a declared exception | Accepted |

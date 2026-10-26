@@ -70,7 +70,11 @@ The sanctioned patterns
   override; `defaults:`-level only for a fleet-standard bot like
   agents-md-sync) so the grant is auditable and drift-checked. Never
   hand-grant bypass in the UI — the drift report flags it.
-- **PR + auto-merge is not a sanctioned bot-write path** in this fleet.
+- **PR + auto-merge is not a sanctioned bot-write path** in this fleet,
+  except where an ADR declares it: skills-evals' roster PR
+  ([ADR 0003](docs/decisions/0003-scope-skills-evals-roster-auto-merge-as-declared-exception.md))
+  and the eval loop's gated PRs in skills-evals, adam-agentskills and
+  _agent-guidance ([ADR 0012](docs/decisions/0012-eval-loop-prs-auto-merge-as-a-declared-exception.md)).
 
 ## Local use
 
