@@ -510,8 +510,13 @@ def read_codeql_default_setup(repo: str) -> dict | None:
         if e.status in (403, 404):
             return None
         raise
+    # An answer with no `state` is an unknown shape, not "off": reading it as
+    # off would PATCH a repo nobody has looked at. cms-platform's
+    # audit-repo-settings.js refuses the same shape.
+    if not isinstance(data, dict) or not isinstance(data.get("state"), str):
+        raise GhError(None, f"repos/{repo}/code-scanning/default-setup returned no 'state'")
     return {
-        "configured": data.get("state") == "configured",
+        "configured": data["state"] == "configured",
         "query_suite": data.get("query_suite"),
     }
 

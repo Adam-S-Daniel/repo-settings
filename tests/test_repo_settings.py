@@ -3997,6 +3997,10 @@ class CodeqlDefaultSetupTests(unittest.TestCase):
         records = self._plan(self.CFG, read_error=rs.GhError(500, "boom"))
         self.assertEqual([r["status"] for r in records], ["error"])
 
+    def test_answer_without_state_is_an_error_not_drift(self):
+        records = self._plan(self.CFG, live={"languages": []})
+        self.assertEqual([r["status"] for r in records], ["error"])
+
     def test_write_is_one_patch_and_leaves_languages_to_github(self):
         with patch.object(rs, "gh_api") as api:
             rs.write_codeql_default_setup("o/r", {"codeql_default_setup": True, "codeql_query_suite": "extended"})
