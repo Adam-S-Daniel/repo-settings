@@ -4,6 +4,9 @@ GitHub runs `run:` steps as `bash -e {0}`, so a bare `cmd; rc=$?` dies on the
 line of `cmd` when it exits nonzero: rc is never written, the report is never
 printed, and the nudge step concludes "could not enumerate". This runs the
 step's real script, taken from the parsed workflow, against a stub `python`.
+The step covers every owner in `$OWNERS`, each with its own token
+(`TOKEN_<KEY>`) and its own output (`rc_<KEY>`), where KEY is the owner
+uppercased with `-` as `_` (issue #116 moved it into the unmatrixed plan job).
 """
 
 import os
@@ -31,14 +34,17 @@ class CoverageStepTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             stub = tmp / "python"
-            stub.write_text(f'#!/bin/sh\necho "stub report {code}"\nexit {code}\n')
+            stub.write_text(
+                f'#!/bin/sh\necho "stub report {code} token=$GH_TOKEN"\nexit {code}\n')
             stub.chmod(0o755)
             out = tmp / "github_output"
             out.touch()
             env = {
                 "PATH": f"{tmp}:{os.environ['PATH']}",
                 "GITHUB_OUTPUT": str(out),
-                "OWNER": "example",
+                "OWNERS": "example other-owner",
+                "TOKEN_EXAMPLE": "token-one",
+                "TOKEN_OTHER_OWNER": "token-two",
             }
             proc = subprocess.run(
                 ["bash", "-e", "-c", coverage_script()],
@@ -51,8 +57,10 @@ class CoverageStepTest(unittest.TestCase):
             with self.subTest(code=code):
                 proc, output = self.run_with_exit(code)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
-                self.assertIn(f"rc={code}", output.splitlines())
-                self.assertIn(f"stub report {code}", proc.stdout)
+                self.assertEqual(output.splitlines(),
+                                 [f"rc_EXAMPLE={code}", f"rc_OTHER_OWNER={code}"])
+                self.assertIn(f"stub report {code} token=token-one", proc.stdout)
+                self.assertIn(f"stub report {code} token=token-two", proc.stdout)
 
 
 if __name__ == "__main__":
