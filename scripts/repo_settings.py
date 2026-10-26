@@ -54,6 +54,10 @@ Managed settings:
                                                call for the pair -- see
                                                write_secret_scanning; skipped
                                                on private repos)
+  * security.codeql_default_setup          -> repos/{repo}/code-scanning/default-setup
+    security.codeql_query_suite               (PATCH, one call for the pair --
+                                               see write_codeql_default_setup;
+                                               skipped on private repos)
   * labels (defaults + per-repo)           -> repos/{repo}/labels/{name}  (GET, then
                                                POST when absent or PATCH on
                                                drift; idempotent BY NAME, never
@@ -491,6 +495,35 @@ def write_secret_scanning(repo: str, desired: dict) -> None:
         }
     }
     gh_api(f"repos/{repo}", method="PATCH", body=body)
+
+
+CODEQL_QUERY_SUITES = ("default", "extended")
+
+
+def read_codeql_default_setup(repo: str) -> dict | None:
+    """Return {"configured": bool, "query_suite": str | None}, or None when
+    the read could not be answered (403/404: a scope gap, or code scanning not
+    available to the repo) -- a skip, never drift."""
+    try:
+        data = gh_api(f"repos/{repo}/code-scanning/default-setup") or {}
+    except GhError as e:
+        if e.status in (403, 404):
+            return None
+        raise
+    return {
+        "configured": data.get("state") == "configured",
+        "query_suite": data.get("query_suite"),
+    }
+
+
+def write_codeql_default_setup(repo: str, desired: dict) -> None:
+    """PATCH CodeQL default setup in ONE call: state plus, when declared, the
+    query suite. GitHub detects the languages itself; leaving `languages` out
+    keeps that, and a repo that later gains a language picks it up."""
+    body: dict = {"state": "configured" if desired.get("codeql_default_setup", True) else "not-configured"}
+    if body["state"] == "configured" and desired.get("codeql_query_suite"):
+        body["query_suite"] = desired["codeql_query_suite"]
+    gh_api(f"repos/{repo}/code-scanning/default-setup", method="PATCH", body=body)
 
 
 # --------------------------------------------------------------------------- #
@@ -1312,6 +1345,8 @@ SURFACE_KEYS = {
         "grouped_security_updates",
         "secret_scanning",
         "secret_scanning_push_protection",
+        "codeql_default_setup",
+        "codeql_query_suite",
     ),
 }
 
@@ -1866,6 +1901,45 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
                         "_writer": ("secret_scanning", None, ss_wanted),
                     })
 
+    # CodeQL default setup. Free on public repos; on a private repo it needs
+    # GitHub Code Security, which a personal account cannot buy, so private
+    # repos get an explicit skip.
+    cq_wanted = {k: security_cfg[k] for k in ("codeql_default_setup", "codeql_query_suite")
+                 if security_cfg.get(k) is not None}
+    if cq_wanted:
+        if "codeql_default_setup" in cq_wanted:
+            cq_wanted["codeql_default_setup"] = bool(cq_wanted["codeql_default_setup"])
+        if cq_wanted.get("codeql_query_suite", "default") not in CODEQL_QUERY_SUITES:
+            raise ConfigError(
+                f"error: security.codeql_query_suite must be one of {', '.join(CODEQL_QUERY_SUITES)} "
+                f"(got {_json(cq_wanted['codeql_query_suite'])})")
+        try:
+            private = is_private()
+            live = None if private else read_codeql_default_setup(repo)
+        except GhError as e:
+            records.extend(_err(f"security.{k}", v, e) for k, v in cq_wanted.items())
+        else:
+            if private or live is None:
+                note = ("private repo -- CodeQL needs GitHub Code Security (not offered to "
+                        "personal accounts)") if private else \
+                       "cannot read code-scanning/default-setup -- HTTP 403/404"
+                records.extend(_skip(f"security.{k}", v, note) for k, v in cq_wanted.items())
+            else:
+                current = {"codeql_default_setup": live["configured"],
+                           "codeql_query_suite": live["query_suite"] if live["configured"] else None}
+                for key, desired_v in cq_wanted.items():
+                    if key == "codeql_query_suite" and cq_wanted.get("codeql_default_setup") is False:
+                        continue  # a suite means nothing with default setup off
+                    records.append({
+                        "setting": f"security.{key}",
+                        "status": "match" if current[key] == desired_v else "drift",
+                        "current": current[key],
+                        "desired": desired_v,
+                        # Every record carries the WHOLE declared group: see
+                        # write_codeql_default_setup for why it is one PATCH.
+                        "_writer": ("codeql", None, cq_wanted),
+                    })
+
     # -- ruleset ------------------------------------------------------------ #
     def plan_ruleset(name: str, body: dict, normalize) -> None:
         try:
@@ -2335,6 +2409,8 @@ def apply_record(repo: str, rec: dict) -> None:
         write_automated_security_fixes(repo, b)
     elif kind == "secret_scanning":
         write_secret_scanning(repo, b)
+    elif kind == "codeql":
+        write_codeql_default_setup(repo, b)
 
 
 # --------------------------------------------------------------------------- #

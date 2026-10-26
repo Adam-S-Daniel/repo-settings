@@ -390,6 +390,9 @@ security:
   # scanning on). Omit a key to leave it unmanaged.
   secret_scanning: true
   secret_scanning_push_protection: true
+  # CodeQL default setup, and optionally its query suite (default | extended).
+  codeql_default_setup: true
+  codeql_query_suite: extended
 ```
 
 **Secret scanning.** Both toggles are read from the repo's
@@ -400,6 +403,16 @@ both are a `skipped` record: secret scanning there needs GitHub Secret
 Protection, which a personal account cannot buy. A toggle missing from
 `security_and_analysis` (a low-scope token, or a plan that does not offer it)
 is also a skip, never drift.
+
+**CodeQL default setup.** Read from `GET repos/{repo}/code-scanning/default-setup`
+(`state == "configured"`, plus `query_suite`) and written in one
+`PATCH` of the same endpoint with `{"state": "configured" | "not-configured"}`
+and, when declared, `query_suite`. `languages` is never sent, so GitHub keeps
+choosing them and a repo that gains a language picks it up. On a **private**
+repo both keys are a `skipped` record (CodeQL there needs GitHub Code
+Security); a 403/404 on the read is a skip too, never drift.
+`codeql_query_suite` is ignored when `codeql_default_setup` is `false`, and
+any value other than `default` or `extended` is a config error.
 
 **Endpoints, and the PUT/DELETE-carries-the-value shape.** Both applyable
 leaves are read and written through a pair of GitHub endpoints that take
