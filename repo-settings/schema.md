@@ -362,7 +362,7 @@ and put the map form (above) in the file's `repo:` key. This collision
 does not exist in the fleet/fan-out shape below, where the identifier always
 comes from each element's `name:` and `repo:` is free to be a settings map.
 
-### `security:` -- Dependabot alerts and security updates
+### `security:` -- Dependabot alerts, security updates and secret scanning
 
 Three leaves, two of them applyable. Like `repo:` above these are ordinary
 per-repo toggles, not Actions-specific and not the ruleset -- but unlike
@@ -385,7 +385,21 @@ security:
   # can never apply it (see "grouped_security_updates has no API" below).
   # Omit the key to leave it undeclared instead of declared-and-skipped.
   grouped_security_updates: true
+
+  # Secret scanning and push protection (push protection needs secret
+  # scanning on). Omit a key to leave it unmanaged.
+  secret_scanning: true
+  secret_scanning_push_protection: true
 ```
+
+**Secret scanning.** Both toggles are read from the repo's
+`security_and_analysis` object (`GET repos/{repo}`) and written together in one
+`PATCH repos/{repo}` with `{"security_and_analysis": {...}}`, so a run never
+asks for push protection on with secret scanning off. On a **private** repo
+both are a `skipped` record: secret scanning there needs GitHub Secret
+Protection, which a personal account cannot buy. A toggle missing from
+`security_and_analysis` (a low-scope token, or a plan that does not offer it)
+is also a skip, never drift.
 
 **Endpoints, and the PUT/DELETE-carries-the-value shape.** Both applyable
 leaves are read and written through a pair of GitHub endpoints that take

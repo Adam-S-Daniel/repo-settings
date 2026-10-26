@@ -49,6 +49,11 @@ Managed settings:
                                                vulnerability_alerts -- apply
                                                order is dependency-aware, see
                                                plan_repo)
+  * security.secret_scanning               -> repos/{repo}  (PATCH
+    security.secret_scanning_push_protection  `security_and_analysis`, one
+                                               call for the pair -- see
+                                               write_secret_scanning; skipped
+                                               on private repos)
   * labels (defaults + per-repo)           -> repos/{repo}/labels/{name}  (GET, then
                                                POST when absent or PATCH on
                                                drift; idempotent BY NAME, never
@@ -448,6 +453,44 @@ def write_automated_security_fixes(repo: str, desired: bool) -> None:
     value shape as write_vulnerability_alerts above, and for the same reason:
     this endpoint too takes PUT-to-enable / DELETE-to-disable with no body."""
     gh_api(f"repos/{repo}/automated-security-fixes", method="PUT" if desired else "DELETE")
+
+
+# The secret scanning toggles, in dependency order: push protection needs
+# secret scanning on.
+SECRET_SCANNING_KEYS = ("secret_scanning", "secret_scanning_push_protection")
+
+
+def read_secret_scanning(repo_payload: dict) -> dict:
+    """Return {key: bool} for each secret scanning toggle the repo payload
+    reports. A key is ABSENT, not False, when `security_and_analysis` does not
+    carry it: GitHub omits the object below admin access, and omits the
+    feature where the plan does not offer it. Absent is a skip, never drift
+    (the same rule AGENTS.md states for the merge-setting fields)."""
+    saa = repo_payload.get("security_and_analysis") or {}
+    out = {}
+    for key in SECRET_SCANNING_KEYS:
+        status = (saa.get(key) or {}).get("status")
+        if status in ("enabled", "disabled"):
+            out[key] = status == "enabled"
+    return out
+
+
+def write_secret_scanning(repo: str, desired: dict) -> None:
+    """PATCH the declared secret scanning group in ONE call.
+
+    One call, not one per toggle, for the same reason as write_merge_methods:
+    push protection cannot be on while secret scanning is off, so a per-toggle
+    apply could ask GitHub for that invalid state depending on record order.
+    Sending the pair together never does, and re-sending it is idempotent.
+    """
+    body = {
+        "security_and_analysis": {
+            key: {"status": "enabled" if desired[key] else "disabled"}
+            for key in SECRET_SCANNING_KEYS
+            if key in desired
+        }
+    }
+    gh_api(f"repos/{repo}", method="PATCH", body=body)
 
 
 # --------------------------------------------------------------------------- #
@@ -1267,6 +1310,8 @@ SURFACE_KEYS = {
         "vulnerability_alerts",
         "automated_security_fixes",
         "grouped_security_updates",
+        "secret_scanning",
+        "secret_scanning_push_protection",
     ),
 }
 
@@ -1782,6 +1827,45 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
             )
         )
 
+    # Secret scanning + push protection. Free for public repos; on a private
+    # repo it needs GitHub Secret Protection, which a personal account cannot
+    # buy, so private repos get an explicit skip rather than a write GitHub
+    # refuses (or, worse, accepts and ignores, as allow_auto_merge does).
+    ss_wanted = {k: bool(security_cfg[k]) for k in SECRET_SCANNING_KEYS if k in security_cfg}
+    if ss_wanted:
+        try:
+            private = is_private()
+            payload = None if private else get_repo(repo)
+        except GhError as e:
+            records.extend(_err(f"security.{k}", v, e) for k, v in ss_wanted.items())
+        else:
+            if private:
+                records.extend(
+                    _skip(f"security.{k}", v,
+                          "private repo -- secret scanning needs GitHub Secret Protection "
+                          "(not offered to personal accounts)")
+                    for k, v in ss_wanted.items()
+                )
+            else:
+                live = read_secret_scanning(payload)
+                for key, desired_v in ss_wanted.items():
+                    if key not in live:
+                        records.append(_skip(
+                            f"security.{key}", desired_v,
+                            "security_and_analysis does not report it (token lacks "
+                            "Administration, or the plan does not offer it)",
+                        ))
+                        continue
+                    records.append({
+                        "setting": f"security.{key}",
+                        "status": "match" if live[key] == desired_v else "drift",
+                        "current": live[key],
+                        "desired": desired_v,
+                        # Every record carries the WHOLE declared group: see
+                        # write_secret_scanning for why it is one PATCH.
+                        "_writer": ("secret_scanning", None, ss_wanted),
+                    })
+
     # -- ruleset ------------------------------------------------------------ #
     def plan_ruleset(name: str, body: dict, normalize) -> None:
         try:
@@ -2249,6 +2333,8 @@ def apply_record(repo: str, rec: dict) -> None:
         write_vulnerability_alerts(repo, b)
     elif kind == "auto_sec_fixes":
         write_automated_security_fixes(repo, b)
+    elif kind == "secret_scanning":
+        write_secret_scanning(repo, b)
 
 
 # --------------------------------------------------------------------------- #

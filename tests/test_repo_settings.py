@@ -1499,7 +1499,8 @@ class AdminBypassFleetConfigTests(unittest.TestCase):
                     {k: v for k, v in none.items() if k != "bypass_actors"},
                 )
             checked += 1
-        self.assertEqual(checked, 20)
+        # 21 since security-alerts joined the fleet (2026-10-26).
+        self.assertEqual(checked, 21)
 
 
 class BypassUnknownTests(unittest.TestCase):
@@ -3842,7 +3843,8 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
             by_value.setdefault(tuple(entry["manage"]), set()).add(entry["name"])
         self.assertEqual(set(by_value), {("all",), ()})
         self.assertEqual(by_value[()], self.WERE_FALSE)
-        self.assertEqual(len(by_value[("all",)]), 17)
+        # 18 since security-alerts joined with manage ["all"] (2026-10-26).
+        self.assertEqual(len(by_value[("all",)]), 18)
 
     def test_diff_output_is_unchanged_apart_from_the_scope_strings(self):
         cfg = rs.load_config(str(self.FLEET))
@@ -3864,3 +3866,77 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
         self.assertEqual(new_calls, legacy_calls)
         self.assertEqual({m for m, _ in new_calls}, {"GET"})
         self.assertIn("[\x1b[33mDRIFT\x1b[0m]", actual)
+
+
+class SecretScanningTests(unittest.TestCase):
+    """`security.secret_scanning` / `secret_scanning_push_protection`: read
+    from the repo payload's `security_and_analysis`, written as one PATCH,
+    skipped on private repos."""
+
+    CFG = {"secret_scanning": True, "secret_scanning_push_protection": True}
+
+    @staticmethod
+    def _payload(private=False, ss="disabled", pp="disabled"):
+        saa = {}
+        if ss is not None:
+            saa["secret_scanning"] = {"status": ss}
+        if pp is not None:
+            saa["secret_scanning_push_protection"] = {"status": pp}
+        return {"private": private, "security_and_analysis": saa}
+
+    def test_drift_when_off_carries_the_whole_group(self):
+        with patch.object(rs, "get_repo", return_value=self._payload()):
+            records = rs.plan_repo("o/r", {"security": dict(self.CFG)})
+        by = {r["setting"]: r for r in records}
+        for key in ("security.secret_scanning", "security.secret_scanning_push_protection"):
+            self.assertEqual(by[key]["status"], "drift")
+            self.assertEqual(by[key]["current"], False)
+            self.assertEqual(by[key]["_writer"], ("secret_scanning", None, self.CFG))
+
+    def test_match_when_on(self):
+        with patch.object(rs, "get_repo", return_value=self._payload(ss="enabled", pp="enabled")):
+            records = rs.plan_repo("o/r", {"security": dict(self.CFG)})
+        self.assertEqual({r["status"] for r in records}, {"match"})
+
+    def test_private_repo_is_a_skip_and_never_written(self):
+        with patch.object(rs, "get_repo", return_value=self._payload(private=True)):
+            records = rs.plan_repo("o/r", {"security": dict(self.CFG)})
+        self.assertEqual({r["status"] for r in records}, {"skipped"})
+        self.assertTrue(all("Secret Protection" in r["note"] for r in records))
+        self.assertTrue(all("_writer" not in r for r in records))
+
+    def test_absent_key_is_a_skip_not_drift(self):
+        with patch.object(rs, "get_repo", return_value=self._payload(pp=None)):
+            records = rs.plan_repo("o/r", {"security": dict(self.CFG)})
+        by = {r["setting"]: r for r in records}
+        self.assertEqual(by["security.secret_scanning"]["status"], "drift")
+        self.assertEqual(by["security.secret_scanning_push_protection"]["status"], "skipped")
+
+    def test_omitted_keys_are_unmanaged(self):
+        with patch.object(rs, "get_repo") as get:
+            records = rs.plan_repo("o/r", {"security": {}})
+        self.assertEqual(records, [])
+        get.assert_not_called()
+
+    def test_write_is_one_patch_with_both_toggles(self):
+        with patch.object(rs, "gh_api") as api:
+            rs.write_secret_scanning("o/r", dict(self.CFG))
+        api.assert_called_once_with(
+            "repos/o/r", method="PATCH",
+            body={"security_and_analysis": {
+                "secret_scanning": {"status": "enabled"},
+                "secret_scanning_push_protection": {"status": "enabled"},
+            }},
+        )
+
+    def test_apply_record_routes_to_the_writer(self):
+        with patch.object(rs, "write_secret_scanning") as w:
+            rs.apply_record("o/r", {"_writer": ("secret_scanning", None, dict(self.CFG))})
+        w.assert_called_once_with("o/r", self.CFG)
+
+    def test_fleet_defaults_turn_both_on(self):
+        import yaml
+        fleet = yaml.safe_load((Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml").read_text())
+        sec = fleet["defaults"]["security"]
+        self.assertIs(sec["secret_scanning"], True)
+        self.assertIs(sec["secret_scanning_push_protection"], True)
