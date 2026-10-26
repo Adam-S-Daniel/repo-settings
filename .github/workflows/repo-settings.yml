@@ -45,9 +45,19 @@
 # job outside the environment, can read the key.
 #
 # Behavior:
-#   * push to main / weekly schedule / manual dispatch -> `repo-settings` job:
-#     waits for the owner's approval in `fleet-apply`, checks that the gate is
-#     still configured, then applies
+#   * push to main / weekly schedule / manual dispatch -> `plan` job (no admin
+#     key) picks the owners that need an apply, then `repo-settings` job, one
+#     leg per picked owner: waits for the owner's approval in `fleet-apply`,
+#     checks that the gate is still configured, then applies. When `plan`
+#     picks no owner, nothing waits for approval. What `plan` picks:
+#       - push: every owner if the engine, this workflow or requirements.txt
+#         changed; otherwise only the owners whose resolved fleet.yml targets
+#         (`repo_settings.py resolve`) differ from the commit before the push,
+#         so a comment-only or reformatting edit picks none
+#       - schedule: the owners where the READ-ONLY App finds drift, an error,
+#         or an undeclared repo; every owner if that App is not configured
+#       - manual dispatch: every owner
+#     It fails closed: anything it cannot work out picks every owner.
 #   * pull_request touching config/script -> `drift` job: drift report only
 #     (fails on drift), under a token from a separate READ-ONLY App. Skipped
 #     until that App's `REPO_SETTINGS_READ_APP_CLIENT_ID` variable exists.
@@ -82,14 +92,177 @@ permissions:
   issues: write                # files the undeclared-repo nudge (see below)
 
 jobs:
+  # Decides which owners need an apply, so a run with nothing to apply never
+  # waits for approval. It holds no admin key: on push it reads only git and
+  # the config, and on schedule it mints from the READ-ONLY App (the same one
+  # `drift` uses). That App cannot see ruleset bypass actors, Actions
+  # policies, or the merge-setting fields, so drift confined to those does not
+  # pick an owner on schedule; the next settings push or a manual dispatch
+  # still converges it (the admin App cannot see merge-setting fields either).
+  #
+  # Every path that cannot reach an answer picks every owner. Only a failure
+  # before the decide step (checkout, Python setup) makes this job red, and a
+  # red `plan` skips the apply job: a visible failure, never a silent pass.
+  plan:
+    runs-on: ubuntu-latest
+    if: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID != '' && github.event_name != 'pull_request' }}
+    permissions:
+      contents: read
+    outputs:
+      owners: ${{ steps.decide.outputs.owners }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # The push comparison needs the commit before the push.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: python3 -m pip install -r requirements.txt
+
+      # A failed mint leaves the token empty, and the decide step reads an
+      # empty token as "cannot tell", so it picks that owner.
+      - name: Mint read-only GitHub App token for Adam-S-Daniel
+        id: read_token_adam
+        if: github.event_name == 'schedule' && vars.REPO_SETTINGS_READ_APP_CLIENT_ID != ''
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.REPO_SETTINGS_READ_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REPO_SETTINGS_READ_APP_PRIVATE_KEY }}
+          owner: Adam-S-Daniel
+          permission-administration: read
+          permission-actions: read
+          permission-issues: read
+          permission-metadata: read
+
+      - name: Mint read-only GitHub App token for jodidaniel
+        id: read_token_jodi
+        if: github.event_name == 'schedule' && vars.REPO_SETTINGS_READ_APP_CLIENT_ID != ''
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.REPO_SETTINGS_READ_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REPO_SETTINGS_READ_APP_PRIVATE_KEY }}
+          owner: jodidaniel
+          permission-administration: read
+          permission-actions: read
+          permission-issues: read
+          permission-metadata: read
+
+      # tests/test_repo_settings_plan.py runs this script against real git
+      # histories and a stub engine.
+      - name: Decide which owners need an apply
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          OWNERS: Adam-S-Daniel jodidaniel
+          READ_TOKEN_Adam_S_Daniel: ${{ steps.read_token_adam.outputs.token }}
+          READ_TOKEN_jodidaniel: ${{ steps.read_token_jodi.outputs.token }}
+        run: |
+          set -uo pipefail
+          read -r -a owners <<<"$OWNERS"
+          picked=()
+          emit() {
+            local json
+            json=$(jq -cn '$ARGS.positional' --args ${picked[@]+"${picked[@]}"})
+            echo "owners=$json" >> "$GITHUB_OUTPUT"
+            echo "Owners that need an apply: $json"
+            exit 0
+          }
+          pick_all() {
+            echo "$1 -- every owner needs an apply"
+            picked=("${owners[@]}")
+            emit
+          }
+
+          case "$EVENT" in
+            push)
+              if [[ ! "$BEFORE" =~ ^[0-9a-f]{40}$ || "$BEFORE" =~ ^0+$ ]] \
+                  || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+                pick_all "no usable commit before the push ($BEFORE)"
+              fi
+              if ! changed=$(git diff --name-only "$BEFORE" "$AFTER"); then
+                pick_all "could not list the files the push changed"
+              fi
+              for f in scripts/repo_settings.py .github/workflows/repo-settings.yml requirements.txt; do
+                if grep -qxF "$f" <<<"$changed"; then
+                  pick_all "$f changed"
+                fi
+              done
+              before_cfg="${RUNNER_TEMP:-/tmp}/fleet-before.yml"
+              if ! git show "$BEFORE:repo-settings/fleet.yml" > "$before_cfg"; then
+                pick_all "could not read fleet.yml as it was before the push"
+              fi
+              for o in "${owners[@]}"; do
+                if ! old=$(python scripts/repo_settings.py resolve --config "$before_cfg" --owner "$o") \
+                    || ! new=$(python scripts/repo_settings.py resolve --config repo-settings/fleet.yml --owner "$o"); then
+                  pick_all "could not resolve fleet.yml for $o"
+                fi
+                if [[ "$old" != "$new" ]]; then
+                  echo "$o: the push changes what apply would converge"
+                  picked+=("$o")
+                else
+                  echo "$o: the push changes nothing apply would converge"
+                fi
+              done
+              emit
+              ;;
+            schedule)
+              for o in "${owners[@]}"; do
+                var="READ_TOKEN_${o//-/_}"
+                token="${!var:-}"
+                if [[ -z "$token" ]]; then
+                  echo "$o: no read-only token, so drift cannot be ruled out"
+                  picked+=("$o")
+                  continue
+                fi
+                rc=0
+                GH_TOKEN="$token" python scripts/repo_settings.py diff \
+                  --config repo-settings/fleet.yml --owner "$o" || rc=$?
+                if [[ "$rc" != "0" ]]; then
+                  echo "$o: drift report exited $rc (1 drift, 2 error)"
+                  picked+=("$o")
+                  continue
+                fi
+                # No --show-private here: this log is public. Undeclared repos
+                # need the apply job's nudge step, so they pick the owner too.
+                rc=0
+                GH_TOKEN="$token" python scripts/repo_settings.py coverage \
+                  --config repo-settings/fleet.yml --owner "$o" || rc=$?
+                if [[ "$rc" != "0" ]]; then
+                  echo "$o: coverage exited $rc (1 undeclared, 2 error)"
+                  picked+=("$o")
+                  continue
+                fi
+                echo "$o: no drift the read-only App can see, nothing undeclared"
+              done
+              emit
+              ;;
+            *)
+              pick_all "$EVENT run"
+              ;;
+          esac
+
   repo-settings:
+    needs: plan
     runs-on: ubuntu-latest
     # Skip cleanly until the GitHub App is configured (avoids a failing run on a
     # repo that is still awaiting its one-time credential setup). Never on
     # pull_request: a PR branch controls its own copy of this file, so the job
     # that holds the admin key must not run there at all; `drift` below covers
     # PRs with a read-only App.
-    if: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID != '' && github.event_name != 'pull_request' }}
+    #
+    # Also skipped when `plan` picked no owner: nothing to apply, so nothing
+    # to approve.
+    if: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID != '' && github.event_name != 'pull_request' && needs.plan.outputs.owners != '[]' }}
     # The approval gate. GitHub pauses the job here, before its first step,
     # until a required reviewer approves, and serves the environment's secrets
     # only after that. A dry-run dispatch waits for approval too.
@@ -112,7 +285,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        owner: [Adam-S-Daniel, jodidaniel]
+        owner: ${{ fromJSON(needs.plan.outputs.owners) }}
     steps:
       # Naming an environment that does not exist does not fail: GitHub creates
       # it with no protection rules, and the gate silently disappears (issue

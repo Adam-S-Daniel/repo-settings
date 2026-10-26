@@ -148,18 +148,34 @@ configured, the workflow **skips itself** (guarded on
    the environment, and only after approval. An environment secret also
    [takes precedence](https://docs.github.com/en/actions/reference/security/secrets)
    over a repo secret of the same name.
-6. **Optional: a read-only App for the pull-request drift preview.** Pull
-   requests never get the admin key. The `drift` job instead mints from a
+6. **Optional: a read-only App for the pull-request drift preview and the
+   weekly `plan`.** Pull requests never get the admin key. The `drift` job instead mints from a
    second App with only Administration: Read, Actions: Read, Issues: Read and
    Metadata: Read, installed on all repos in both accounts. In this repo, set
    variable `REPO_SETTINGS_READ_APP_CLIENT_ID` and secret
    `REPO_SETTINGS_READ_APP_PRIVATE_KEY` (repo level). Until the variable
-   exists, `drift` is skipped. Reads that need write come back as skips, never
-   drift.
+   exists, `drift` is skipped and the weekly run asks for approval for every
+   owner. Reads that need write come back as skips, never drift.
 
 After that the workflow applies on push to `main` (config/script changes), a
 weekly schedule, and manual dispatch, each after the owner approves the
-`fleet-apply` deployment. On pull requests, once the read-only App exists, it
+`fleet-apply` deployment. A `plan` job runs first, without the admin key, and
+asks for approval only for the owners that have something to apply:
+
+- **Push:** every owner when `scripts/repo_settings.py`, the workflow or
+  `requirements.txt` changed. Otherwise only the owners whose resolved
+  `fleet.yml` targets (`repo_settings.py resolve`: repo, `manage` and effective
+  settings) differ from the commit before the push. A push that only edits
+  comments, reorders keys or reformats `fleet.yml` asks for nothing.
+- **Weekly schedule:** the owners where the read-only App (step 6) finds drift,
+  hits an error, or sees an undeclared repo. That App cannot see ruleset bypass
+  actors or Actions policies (nor the merge-setting fields, which the admin App
+  cannot see either), so drift confined to those waits for the next settings
+  push or a manual dispatch. Without the read-only App, every owner is asked.
+- **Manual dispatch:** every owner, dry run included.
+
+Anything `plan` cannot work out (no usable commit before the push, a config it
+cannot resolve, a failed token mint) asks for every owner. On pull requests, once the read-only App exists, it
 reports drift only and fails the `drift` check if there is any.
 
 > Reuse note: `_agent-guidance` already runs a GitHub App (`agents-md-sync`) with
