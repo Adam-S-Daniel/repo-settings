@@ -12,3 +12,5 @@
 # scripts/repo_settings.py and the tests parse YAML with it. 6.0.3 was uploaded
 # 2025-09-25.
 PyYAML==6.0.3
+
+# fork-PR test (throwaway, do not merge)
