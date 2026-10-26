@@ -284,6 +284,11 @@ defaults:
 # own design). skills-evals' weekly roster PR (docs/decisions/0003, as
 # amended 2026-09-29; issue #51) is opened and auto-merged by a dedicated
 # per-repo GitHub App behind the required `test` check, not by GITHUB_TOKEN.
+# The eval loop's gated PRs (fixtures in skills-evals, skill improvements and
+# removals in adam-agentskills, guidance sections in _agent-guidance) are the
+# second exception (docs/decisions/0012): per-repo Apps open them, they
+# auto-merge behind each repo's required checks, and skills-evals' gates
+# enforce their path allowlists. No setting here changes for it.
 # The one repo that does get `actions.can_approve_pull_request_reviews: true` is
 # skills-evals, so its scaffold gate can open DRAFT fixture PRs with
 # GITHUB_TOKEN (docs/decisions/0008); tests/test_repo_settings.py fails if any
