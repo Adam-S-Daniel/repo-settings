@@ -685,6 +685,7 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         "Adam-S-Daniel/wsl-automation": ["shell", "test", "test-linux", "agent-checks"],
         "Adam-S-Daniel/repo-settings": ["agent-checks", "unit"],
         "Adam-S-Daniel/verify-actions-lock": ["test", "self-verify", "agent-checks"],
+        "Adam-S-Daniel/security-alerts": ["agent-checks", "unit"],
     }
     PRE_EXISTING = {
         "Adam-S-Daniel/agentskills": ["pytest-windows"],
@@ -1395,8 +1396,18 @@ class ExtraRulesetsFleetConfigTests(unittest.TestCase):
                 "Adam-S-Daniel/skills-evals",
                 "Adam-S-Daniel/_agent-guidance",
                 "Adam-S-Daniel/GHA-bench",
+                "Adam-S-Daniel/security-alerts",
             }
         )
+
+    def test_security_alerts_declares_deletion_only_persistent_ruleset(self):
+        # docs/decisions/0007: collect.yml's `persistent/alerts-data` outlives
+        # its PRs; deletion blocked, no bypass actors.
+        (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/security-alerts"]
+        (body,) = rs.build_extra_ruleset_bodies(t["declared"])
+        self.assertEqual(body["conditions"]["ref_name"]["include"], ["refs/heads/persistent/**"])
+        self.assertEqual(body["rules"], [{"type": "deletion"}])
+        self.assertEqual(body["bypass_actors"], [])
 
     def test_agent_guidance_declares_deletion_only_persistent_ruleset(self):
         # docs/decisions/0007: deletion blocked, no bypass actors.
@@ -1499,7 +1510,7 @@ class AdminBypassFleetConfigTests(unittest.TestCase):
                     {k: v for k, v in none.items() if k != "bypass_actors"},
                 )
             checked += 1
-        self.assertEqual(checked, 20)
+        self.assertEqual(checked, 22)
 
 
 class BypassUnknownTests(unittest.TestCase):
@@ -3842,7 +3853,7 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
             by_value.setdefault(tuple(entry["manage"]), set()).add(entry["name"])
         self.assertEqual(set(by_value), {("all",), ()})
         self.assertEqual(by_value[()], self.WERE_FALSE)
-        self.assertEqual(len(by_value[("all",)]), 17)
+        self.assertEqual(len(by_value[("all",)]), 19)
 
     def test_diff_output_is_unchanged_apart_from_the_scope_strings(self):
         cfg = rs.load_config(str(self.FLEET))
