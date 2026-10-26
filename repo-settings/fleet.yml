@@ -612,6 +612,29 @@ repos:
     manage: ["all"]
   - name: Adam-S-Daniel/4A
     manage: ["all"]
+  # why: the feed writer ("Update waiting feed ...") and agents-md-sync push
+  # straight to `main` as the owner. That works because the fleet default's
+  # `admin_bypass: always` lets an admin push directly, and while the repo is
+  # private the ruleset is skipped anyway (403). If it ever goes public,
+  # revisit the writer per docs/decisions/0001: a results branch or a declared
+  # bypass. Its only workflow is agent-checks, the fleet default check.
+  - name: Adam-S-Daniel/waiting-feed
+    manage: ["all"]
+  # why: collect.yml writes its data to `persistent/alerts-data`, never to
+  # `main`, so that branch outlives its PRs and needs the deletion-only entry
+  # (docs/decisions/0007). A ruleset on a private repo plans as a 403 skip;
+  # it is declared anyway (docs/decisions/0002). tests.yml runs its `unit` job
+  # on pull_request with no paths filter or concurrency group, so it is
+  # required beside the fleet default.
+  - name: Adam-S-Daniel/security-alerts
+    manage: ["all"]
+    overrides:
+      ruleset:
+        required_status_checks: [agent-checks, unit]
+      extra_rulesets:
+        - name: persistent branches
+          target_branches: ["persistent/**"]
+          rules: [deletion]
 
   # --- this repo, managing itself. Previously absent from this list entirely --
   #     not even as an excluded element -- so the repo that holds the
