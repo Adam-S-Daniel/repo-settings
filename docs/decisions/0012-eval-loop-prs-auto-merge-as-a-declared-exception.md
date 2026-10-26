@@ -5,6 +5,9 @@
 - **Deciders:** Adam Daniel (decision cards 2026-10-25 23:14 UTC, removal PRs
   auto-merge with no human; 2026-10-26 14:14 UTC, "Yes to both": accepted loop
   changes open ready PRs and auto-merge once every required check passes)
+- **Amended:** 2026-10-26 by [ADR 0013](0013-lesson-check-prs-auto-merge-in-agent-guidance.md),
+  which adds a fourth row: lesson-check PRs in _agent-guidance's agent-checks
+  runner
 
 ## Context
 
