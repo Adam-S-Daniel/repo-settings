@@ -3,7 +3,7 @@
 repo_settings.py -- repo-settings-as-code for GitHub Actions security settings
 and default-branch protection (via GitHub repository rulesets).
 
-Subcommands:
+Three subcommands:
 
   generate   Introspect a repo's CURRENT settings and emit a repo-settings YAML
              document to stdout (so you can commit it and edit it).
@@ -18,11 +18,6 @@ Subcommands:
 
   coverage   Report repos the credential can administer that a fleet config
              does not declare. Exits 0 complete, 1 undeclared, 2 on error.
-
-  resolve    Print the targets a config resolves to (repo, manage, effective
-             settings) as canonical JSON, with no API call. The workflow
-             compares it before and after a push to tell a fleet.yml edit
-             that changes nothing apply would do from one that does.
 
 Every subcommand that reads a config exits 2 when the config is refused (see
 ConfigError), the same code as "could not ask": 1 already means drift for
@@ -2512,24 +2507,6 @@ def cmd_diff(args) -> int:
     return 1 if any_drift else 0
 
 
-def cmd_resolve(args) -> int:
-    """Print what `apply` would be asked to converge, as canonical JSON: each
-    target's repo, `manage` and effective settings, sorted, with no API call.
-    The workflow's `plan` job compares this for the pushed config against the
-    config before the push, so a push that changes only comments, ordering or
-    formatting in fleet.yml resolves to identical output and asks for no
-    approval. Exit 2 when the config is refused, like every other subcommand."""
-    cfg = load_config(args.config)
-    targets = _filter_owner(resolve_targets(cfg, args.repo), getattr(args, "owner", None))
-    out = sorted(
-        ({"repo": t["repo"], "manage": t["manage"], "effective": t["effective"]}
-         for t in targets),
-        key=lambda t: t["repo"].lower(),
-    )
-    print(json.dumps(out, sort_keys=True, default=str, indent=1))
-    return 0
-
-
 def cmd_apply(args) -> int:
     cfg = load_config(args.config)
     targets = _filter_owner(resolve_targets(cfg, args.repo), getattr(args, "owner", None))
@@ -2581,14 +2558,6 @@ def main() -> int:
     a.add_argument("--owner", help="only process repos under this owner (account)")
     a.add_argument("--dry-run", action="store_true", help="preview only")
     a.set_defaults(func=cmd_apply)
-
-    r = sub.add_parser(
-        "resolve", help="print the resolved targets apply would converge, as JSON"
-    )
-    r.add_argument("--config", required=True)
-    r.add_argument("--repo", help="override/set target for single-repo config")
-    r.add_argument("--owner", help="only process repos under this owner (account)")
-    r.set_defaults(func=cmd_resolve)
 
     c = sub.add_parser(
         "coverage",

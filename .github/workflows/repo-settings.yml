@@ -24,6 +24,10 @@
 #      Client ID, `Iv23li...`, on its settings page), and secret
 #      `REPO_SETTINGS_APP_PRIVATE_KEY` in the `fleet-apply` ENVIRONMENT
 #      (Settings > Environments), never as a repo-level secret.
+#   4. Create the separate READ-ONLY App (`repo-settings-drift-read`), install
+#      it on both owners, and set the repo-level variable
+#      `REPO_SETTINGS_READ_APP_CLIENT_ID` and secret
+#      `REPO_SETTINGS_READ_APP_PRIVATE_KEY`. The `plan` and `drift` jobs use it.
 #
 # Use the App's CLIENT ID, not its numeric App ID: the action's `app-id` input
 # is deprecated in favour of `client-id`. The two are the same input under the
@@ -44,22 +48,19 @@
 # once the repo-level copy is deleted, no workflow on any other branch, and no
 # job outside the environment, can read the key.
 #
-# Behavior:
-#   * push to main / weekly schedule / manual dispatch -> `plan` job (no admin
-#     key) picks the owners that need an apply, then `repo-settings` job, one
-#     leg per picked owner: waits for the owner's approval in `fleet-apply`,
-#     checks that the gate is still configured, then applies. When `plan`
-#     picks no owner, nothing waits for approval. What `plan` picks:
-#       - push: every owner if the engine, this workflow or requirements.txt
-#         changed; otherwise only the owners whose resolved fleet.yml targets
-#         (`repo_settings.py resolve`) differ from the commit before the push,
-#         so a comment-only or reformatting edit picks none
-#       - schedule: the owners where the READ-ONLY App finds drift, an error,
-#         or an undeclared repo; every owner if that App is not configured
-#       - manual dispatch: every owner
-#     It fails closed: anything it cannot work out picks every owner.
+# Behavior (issue #116):
+#   * push to main / weekly schedule / manual dispatch -> `plan` job, with no
+#     environment and no approval: mints a READ-ONLY token per owner from the
+#     read App, runs `diff` for each, and sets `needs_apply`. It also runs the
+#     coverage audit and files the undeclared-repo nudge.
+#   * then the `repo-settings` apply job, which waits for the owner's approval
+#     in `fleet-apply`, checks that the gate is still configured, and applies.
+#     It runs only when the plan found drift (push, or a non-dry-run dispatch),
+#     when a non-dry-run dispatch sets `force_apply`, or on the weekly schedule,
+#     which always goes through as the backstop. A dry-run dispatch is the plan
+#     alone and asks for no approval.
 #   * pull_request touching config/script -> `drift` job: drift report only
-#     (fails on drift), under a token from a separate READ-ONLY App. Skipped
+#     (fails on drift), under a token from the same READ-ONLY App. Skipped
 #     until that App's `REPO_SETTINGS_READ_APP_CLIENT_ID` variable exists.
 
 name: repo-settings
@@ -68,7 +69,11 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Preview changes without applying"
+        description: "Plan only: show drift, apply nothing, ask for no approval"
+        type: boolean
+        default: false
+      force_apply:
+        description: "Run the gated apply even if the plan finds no drift (ignored when dry_run is set)"
         type: boolean
         default: false
   schedule:
@@ -87,35 +92,39 @@ on:
       - ".github/workflows/repo-settings.yml"
       - "requirements.txt"
 
+# Each job states its own permissions; this is the floor for any that do not.
 permissions:
   contents: read
-  issues: write                # files the undeclared-repo nudge (see below)
 
 jobs:
-  # Decides which owners need an apply, so a run with nothing to apply never
-  # waits for approval. It holds no admin key: on push it reads only git and
-  # the config, and on schedule it mints from the READ-ONLY App (the same one
-  # `drift` uses). That App cannot see ruleset bypass actors, Actions
-  # policies, or the merge-setting fields, so drift confined to those does not
-  # pick an owner on schedule; the next settings push or a manual dispatch
-  # still converges it (the admin App cannot see merge-setting fields either).
+  # The ungated plan (issue #116; issue #13, properties 1 and 2). It never
+  # touches the admin key and declares no environment, so it needs no
+  # approval. It mints from the read-only App, narrowed to read again at mint
+  # time, and asks `diff` about each owner.
   #
-  # Every path that cannot reach an answer picks every owner. Only a failure
-  # before the decide step (checkout, Python setup) makes this job red, and a
-  # red `plan` skips the apply job: a visible failure, never a silent pass.
+  # Not a matrix: matrix legs write the same job outputs and the last one to
+  # finish wins, so one owner's drift could be overwritten by the other's
+  # "none". Each owner gets its own mint and diff step and its own output.
+  #
+  # The read token cannot see ruleset `bypass_actors` or the repo merge flags
+  # (both come back as skips, #97), so drift on those never sets
+  # `needs_apply`. The weekly schedule therefore always runs the gated apply,
+  # which sees everything.
+  #
+  # Not gated on the read App's variable, on purpose: a plan that skipped
+  # would read as "nothing to apply" on push. A missing App fails the mint and
+  # turns the plan red instead.
   plan:
     runs-on: ubuntu-latest
-    if: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID != '' && github.event_name != 'pull_request' }}
+    if: ${{ github.event_name != 'pull_request' }}
     permissions:
       contents: read
+      issues: write              # files the undeclared-repo nudge (see below)
     outputs:
-      owners: ${{ steps.decide.outputs.owners }}
+      needs_apply: ${{ steps.plan_adam.outputs.drift == 'true' || steps.plan_jodidaniel.outputs.drift == 'true' }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          # The push comparison needs the commit before the push.
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -125,12 +134,8 @@ jobs:
       - name: Install PyYAML
         run: python3 -m pip install -r requirements.txt
 
-      # A failed mint leaves the token empty, and the decide step reads an
-      # empty token as "cannot tell", so it picks that owner.
       - name: Mint read-only GitHub App token for Adam-S-Daniel
-        id: read_token_adam
-        if: github.event_name == 'schedule' && vars.REPO_SETTINGS_READ_APP_CLIENT_ID != ''
-        continue-on-error: true
+        id: token_adam
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         with:
           client-id: ${{ vars.REPO_SETTINGS_READ_APP_CLIENT_ID }}
@@ -142,9 +147,7 @@ jobs:
           permission-metadata: read
 
       - name: Mint read-only GitHub App token for jodidaniel
-        id: read_token_jodi
-        if: github.event_name == 'schedule' && vars.REPO_SETTINGS_READ_APP_CLIENT_ID != ''
-        continue-on-error: true
+        id: token_jodidaniel
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         with:
           client-id: ${{ vars.REPO_SETTINGS_READ_APP_CLIENT_ID }}
@@ -155,117 +158,187 @@ jobs:
           permission-issues: read
           permission-metadata: read
 
-      # tests/test_repo_settings_plan.py runs this script against real git
-      # histories and a stub engine.
-      - name: Decide which owners need an apply
-        id: decide
+      # `diff` exits 0 for no drift, 1 for drift, 2 when it could not ask or
+      # the config is wrong. GitHub runs this under `bash -e`, so `|| rc=$?`
+      # records the code instead of dying on it (the #99 bug). Anything but 0
+      # or 1 fails the plan: "could not ask" must never read as "no drift".
+      - name: Plan for Adam-S-Daniel
+        id: plan_adam
         env:
-          EVENT: ${{ github.event_name }}
-          BEFORE: ${{ github.event.before }}
-          AFTER: ${{ github.sha }}
-          OWNERS: Adam-S-Daniel jodidaniel
-          READ_TOKEN_Adam_S_Daniel: ${{ steps.read_token_adam.outputs.token }}
-          READ_TOKEN_jodidaniel: ${{ steps.read_token_jodi.outputs.token }}
+          GH_TOKEN: ${{ steps.token_adam.outputs.token }}
+          OWNER: Adam-S-Daniel
         run: |
           set -uo pipefail
-          read -r -a owners <<<"$OWNERS"
-          picked=()
-          emit() {
-            local json
-            json=$(jq -cn '$ARGS.positional' --args ${picked[@]+"${picked[@]}"})
-            echo "owners=$json" >> "$GITHUB_OUTPUT"
-            echo "Owners that need an apply: $json"
-            exit 0
-          }
-          pick_all() {
-            echo "$1 -- every owner needs an apply"
-            picked=("${owners[@]}")
-            emit
-          }
-
-          case "$EVENT" in
-            push)
-              if [[ ! "$BEFORE" =~ ^[0-9a-f]{40}$ || "$BEFORE" =~ ^0+$ ]] \
-                  || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
-                pick_all "no usable commit before the push ($BEFORE)"
-              fi
-              if ! changed=$(git diff --name-only "$BEFORE" "$AFTER"); then
-                pick_all "could not list the files the push changed"
-              fi
-              for f in scripts/repo_settings.py .github/workflows/repo-settings.yml requirements.txt; do
-                if grep -qxF "$f" <<<"$changed"; then
-                  pick_all "$f changed"
-                fi
-              done
-              before_cfg="${RUNNER_TEMP:-/tmp}/fleet-before.yml"
-              if ! git show "$BEFORE:repo-settings/fleet.yml" > "$before_cfg"; then
-                pick_all "could not read fleet.yml as it was before the push"
-              fi
-              for o in "${owners[@]}"; do
-                if ! old=$(python scripts/repo_settings.py resolve --config "$before_cfg" --owner "$o") \
-                    || ! new=$(python scripts/repo_settings.py resolve --config repo-settings/fleet.yml --owner "$o"); then
-                  pick_all "could not resolve fleet.yml for $o"
-                fi
-                if [[ "$old" != "$new" ]]; then
-                  echo "$o: the push changes what apply would converge"
-                  picked+=("$o")
-                else
-                  echo "$o: the push changes nothing apply would converge"
-                fi
-              done
-              emit
-              ;;
-            schedule)
-              for o in "${owners[@]}"; do
-                var="READ_TOKEN_${o//-/_}"
-                token="${!var:-}"
-                if [[ -z "$token" ]]; then
-                  echo "$o: no read-only token, so drift cannot be ruled out"
-                  picked+=("$o")
-                  continue
-                fi
-                rc=0
-                GH_TOKEN="$token" python scripts/repo_settings.py diff \
-                  --config repo-settings/fleet.yml --owner "$o" || rc=$?
-                if [[ "$rc" != "0" ]]; then
-                  echo "$o: drift report exited $rc (1 drift, 2 error)"
-                  picked+=("$o")
-                  continue
-                fi
-                # No --show-private here: this log is public. Undeclared repos
-                # need the apply job's nudge step, so they pick the owner too.
-                rc=0
-                GH_TOKEN="$token" python scripts/repo_settings.py coverage \
-                  --config repo-settings/fleet.yml --owner "$o" || rc=$?
-                if [[ "$rc" != "0" ]]; then
-                  echo "$o: coverage exited $rc (1 undeclared, 2 error)"
-                  picked+=("$o")
-                  continue
-                fi
-                echo "$o: no drift the read-only App can see, nothing undeclared"
-              done
-              emit
-              ;;
-            *)
-              pick_all "$EVENT run"
-              ;;
+          rc=0
+          python scripts/repo_settings.py diff --config repo-settings/fleet.yml --owner "$OWNER" || rc=$?
+          case "$rc" in
+            0) echo "drift=false" >> "$GITHUB_OUTPUT" ;;
+            1) echo "drift=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::diff for $OWNER exited $rc: it could not ask, or the config is wrong. Not planning."
+               exit 1 ;;
           esac
 
+      - name: Plan for jodidaniel
+        id: plan_jodidaniel
+        env:
+          GH_TOKEN: ${{ steps.token_jodidaniel.outputs.token }}
+          OWNER: jodidaniel
+        run: |
+          set -uo pipefail
+          rc=0
+          python scripts/repo_settings.py diff --config repo-settings/fleet.yml --owner "$OWNER" || rc=$?
+          case "$rc" in
+            0) echo "drift=false" >> "$GITHUB_OUTPUT" ;;
+            1) echo "drift=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::diff for $OWNER exited $rc: it could not ask, or the config is wrong. Not planning."
+               exit 1 ;;
+          esac
+
+      # AFTER the plan, and it may not fail the run. A repo nobody has
+      # declared yet is not a reason to withhold the settings the declared
+      # ones are owed -- and a plan that goes red because someone created a
+      # repo would also stop the apply on push.
+      #
+      # The App is installed on ALL repositories in both accounts, and
+      # `fleet.yml` was kept equal to that set by hand, with nothing checking
+      # that the two stay equal. A repo created next month gets no ruleset,
+      # no SHA-pinning enforcement and no fork-PR approval, and says nothing
+      # about it -- the same silence
+      # `skills_bootstrap` had before _agent-guidance's ADR 0011.
+      #
+      # The read App's installation token enumerates (only an installation
+      # token can ask /installation/repositories what it can reach); the REPO
+      # token files the issue. Both owners in one step, so the step keeps one
+      # id; each owner's exit code is its own output, `rc_<OWNER KEY>`.
+      - name: Which repos does fleet.yml not declare?
+        id: coverage
+        continue-on-error: true
+        env:
+          OWNERS: Adam-S-Daniel jodidaniel
+          TOKEN_ADAM_S_DANIEL: ${{ steps.token_adam.outputs.token }}
+          TOKEN_JODIDANIEL: ${{ steps.token_jodidaniel.outputs.token }}
+        run: |
+          set -uo pipefail
+          for OWNER in $OWNERS; do
+            key=$(tr 'a-z-' 'A-Z_' <<<"$OWNER")
+            token_var="TOKEN_$key"
+            # No --show-private here: this log is public. See cmd_coverage.
+            # GitHub runs this under `bash -e`; `|| rc=$?` keeps a nonzero exit
+            # from killing the script before rc is recorded and the report shown.
+            rc=0
+            GH_TOKEN="${!token_var:-}" python scripts/repo_settings.py coverage \
+              --config repo-settings/fleet.yml --owner "$OWNER" \
+              > "coverage-$OWNER.txt" 2>&1 || rc=$?
+            # Three-valued, and the middle one is the whole point: 0 complete,
+            # 1 something undeclared, 2 the question could not be asked. A `2`
+            # must never reach the issue step as "nothing undeclared".
+            echo "rc_$key=$rc" >> "$GITHUB_OUTPUT"
+            cat "coverage-$OWNER.txt"
+          done
+          exit 0
+
+      # continue-on-error: a nudge that cannot file its issue must not fail the
+      # plan, because a failed plan withholds the apply on push.
+      - name: Nudge on repos fleet.yml does not declare
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNERS: Adam-S-Daniel jodidaniel
+          RC_ADAM_S_DANIEL: ${{ steps.coverage.outputs.rc_ADAM_S_DANIEL }}
+          RC_JODIDANIEL: ${{ steps.coverage.outputs.rc_JODIDANIEL }}
+        run: |
+          set -euo pipefail
+          nudge() {
+            local OWNER=$1 RC=$2
+            # EXPORTED, because the jq filter below reads it as `env.title`.
+            # A shell local would be invisible there, the filter would match
+            # nothing, and every run would open a fresh duplicate issue while
+            # never closing one.
+            export title="Undeclared in fleet.yml: $OWNER"
+            local report="coverage-$OWNER.txt" existing
+
+            if [[ "${RC:-2}" == "2" ]]; then
+              echo "::warning::coverage could not enumerate $OWNER — concluding nothing, and leaving any open nudge alone"
+              return 0
+            fi
+
+            existing=$(gh issue list --state open --label ci \
+              --search "$title in:title" --json number,title \
+              --jq "[.[] | select(.title == env.title)] | .[0].number // empty")
+
+            if [[ "$RC" == "0" ]]; then
+              if [[ -n "$existing" ]]; then
+                gh issue close "$existing" --comment \
+                  "Every repository the App can administer under \`$OWNER\` is now declared in \`fleet.yml\`. Closed by the weekly run."
+              fi
+              return 0
+            fi
+
+            # Body from a file, never an argument: repo names are data, and the
+            # command line is echoed into a log.
+            {
+              echo "The repo-settings App can administer repositories under \`$OWNER\` that \`repo-settings/fleet.yml\` does not declare."
+              echo
+              echo "Undeclared means nobody has decided about them -- not that they should be managed. Declaring one with \`manage: []\` is a perfectly good answer, and is what the two forks carry today; what is not an answer is absence, because absence and a deliberate omission look identical."
+              echo
+              echo "Until a repo is declared it gets no ruleset, no SHA-pinning enforcement and no fork-PR approval requirement, and nothing says so."
+              echo
+              echo '```'
+              grep '^UNDECLARED' "$report" || true
+              echo '```'
+              echo
+              echo "Names of undeclared private repositories are withheld because this issue is public. To see them, run \`python3 scripts/repo_settings.py coverage --config repo-settings/fleet.yml --owner $OWNER --show-private\` locally."
+              echo
+              echo "Add each to \`repos:\` in \`repo-settings/fleet.yml\`, with \`manage: [\"all\"]\` to manage it or \`manage: []\` to leave it alone. This issue closes itself on the next weekly run."
+            } > /tmp/coverage-body.md
+
+            if [[ -n "$existing" ]]; then
+              gh issue edit "$existing" --body-file /tmp/coverage-body.md
+            else
+              gh issue create --title "$title" --label ci --body-file /tmp/coverage-body.md
+            fi
+          }
+
+          for OWNER in $OWNERS; do
+            key=$(tr 'a-z-' 'A-Z_' <<<"$OWNER")
+            rc_var="RC_$key"
+            nudge "$OWNER" "${!rc_var:-}"
+          done
+
   repo-settings:
-    needs: plan
     runs-on: ubuntu-latest
-    # Skip cleanly until the GitHub App is configured (avoids a failing run on a
-    # repo that is still awaiting its one-time credential setup). Never on
-    # pull_request: a PR branch controls its own copy of this file, so the job
-    # that holds the admin key must not run there at all; `drift` below covers
-    # PRs with a read-only App.
+    needs: plan
+    # Runs only when (issue #116):
+    #   * the event is `schedule` -- the weekly backstop, whatever the plan
+    #     said, and even when the plan failed (say the read App is broken):
+    #     the gated apply sees what the read token cannot;
+    #   * the plan succeeded and found drift, on push or on a dispatch that is
+    #     not a dry run;
+    #   * the plan succeeded and a dispatch that is not a dry run sets
+    #     `force_apply`.
+    # A dry-run dispatch never gets here: it is the plan alone. Outside
+    # schedule, a failed or skipped plan never triggers an apply.
     #
-    # Also skipped when `plan` picked no owner: nothing to apply, so nothing
-    # to approve.
-    if: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID != '' && github.event_name != 'pull_request' && needs.plan.outputs.owners != '[]' }}
+    # `!cancelled()` because GitHub skips a dependent job whose `needs` failed
+    # unless `if:` calls a status function; the schedule backstop needs that,
+    # and every other branch requires `needs.plan.result == 'success'`. Not
+    # `always()`: a run someone cancelled should not go on to ask for an apply.
+    #
+    # Skip cleanly until the admin App is configured. Never on pull_request:
+    # a PR branch controls its own copy of this file, so the job that holds
+    # the admin key must not run there at all; `drift` below covers PRs.
+    if: >-
+      ${{ !cancelled()
+      && vars.REPO_SETTINGS_APP_CLIENT_ID != ''
+      && github.event_name != 'pull_request'
+      && (github.event_name == 'schedule'
+      || (needs.plan.result == 'success'
+      && ((github.event_name == 'push' && needs.plan.outputs.needs_apply == 'true')
+      || (github.event_name == 'workflow_dispatch' && !inputs.dry_run
+      && (needs.plan.outputs.needs_apply == 'true' || inputs.force_apply))))) }}
     # The approval gate. GitHub pauses the job here, before its first step,
     # until a required reviewer approves, and serves the environment's secrets
-    # only after that. A dry-run dispatch waits for approval too.
+    # only after that.
     environment: fleet-apply
     # Serialize applies per owner, here and not at workflow level. A run waiting
     # for approval holds its group, so a workflow-level group would make PR
@@ -277,15 +350,15 @@ jobs:
       group: repo-settings-${{ matrix.owner }}
       cancel-in-progress: false
     # Job-level permissions replace the workflow-level block, so restate it.
-    # `actions: read` is what the environment self-check's two GETs need.
+    # `actions: read` is what the environment self-check's two GETs need. No
+    # `issues: write`: the nudge moved to `plan`.
     permissions:
       contents: read
-      issues: write
       actions: read
     strategy:
       fail-fast: false
       matrix:
-        owner: ${{ fromJSON(needs.plan.outputs.owners) }}
+        owner: [Adam-S-Daniel, jodidaniel]
     steps:
       # Naming an environment that does not exist does not fail: GitHub creates
       # it with no protection rules, and the gate silently disappears (issue
@@ -340,113 +413,10 @@ jobs:
           private-key: ${{ secrets.REPO_SETTINGS_APP_PRIVATE_KEY }}
           owner: ${{ matrix.owner }}
 
-      - name: Apply (dry run)
-        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
-        env:
-          GH_TOKEN: ${{ steps.token.outputs.token }}
-        run: python scripts/repo_settings.py apply --config repo-settings/fleet.yml --owner ${{ matrix.owner }} --dry-run
-
       - name: Apply
-        if: github.event_name != 'pull_request' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
         run: python scripts/repo_settings.py apply --config repo-settings/fleet.yml --owner ${{ matrix.owner }}
-
-      # AFTER the apply, and it may not fail the run. A repo nobody has
-      # declared yet is not a reason to abandon the settings the declared ones
-      # are owed -- and a weekly apply that goes red because someone created a
-      # repo teaches people to ignore a red weekly apply.
-      #
-      # The App is installed on ALL repositories in both accounts, and
-      # `fleet.yml` was kept equal to that set by hand, with nothing checking
-      # that the two stay equal. A repo created next month gets no ruleset,
-      # no SHA-pinning enforcement and no fork-PR approval, and says nothing
-      # about it -- the same silence
-      # `skills_bootstrap` had before _agent-guidance's ADR 0011.
-      #
-      # The APP token enumerates (only an installation token can ask
-      # /installation/repositories what it can reach); the REPO token files the
-      # issue. The App does hold Issues: write (README, "CI fan-out"), which
-      # the `labels` surface uses on managed repos; this step files its issue
-      # in this repo with the repo's own token.
-      - name: Which repos does fleet.yml not declare?
-        id: coverage
-        if: github.event_name != 'pull_request'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ steps.token.outputs.token }}
-          OWNER: ${{ matrix.owner }}
-        run: |
-          set -uo pipefail
-          # No --show-private here: this log is public. See cmd_coverage.
-          # GitHub runs this under `bash -e`; `|| rc=$?` keeps a nonzero exit
-          # from killing the script before rc is recorded and the report shown.
-          rc=0
-          python scripts/repo_settings.py coverage \
-            --config repo-settings/fleet.yml --owner "$OWNER" \
-            > "coverage-$OWNER.txt" 2>&1 || rc=$?
-          # Three-valued, and the middle one is the whole point: 0 complete,
-          # 1 something undeclared, 2 the question could not be asked. A `2`
-          # must never reach the issue step as "nothing undeclared".
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          cat "coverage-$OWNER.txt"
-          exit 0
-
-      - name: Nudge on repos fleet.yml does not declare
-        if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OWNER: ${{ matrix.owner }}
-          RC: ${{ steps.coverage.outputs.rc }}
-        run: |
-          set -euo pipefail
-          # EXPORTED, because the jq filter below reads it as `env.title`.
-          # A shell local would be invisible there, the filter would match
-          # nothing, and every run would open a fresh duplicate issue while
-          # never closing one.
-          export title="Undeclared in fleet.yml: $OWNER"
-          report="coverage-$OWNER.txt"
-
-          if [[ "${RC:-2}" == "2" ]]; then
-            echo "::warning::coverage could not enumerate $OWNER — concluding nothing, and leaving any open nudge alone"
-            exit 0
-          fi
-
-          existing=$(gh issue list --state open --label ci \
-            --search "$title in:title" --json number,title \
-            --jq "[.[] | select(.title == env.title)] | .[0].number // empty")
-
-          if [[ "$RC" == "0" ]]; then
-            if [[ -n "$existing" ]]; then
-              gh issue close "$existing" --comment \
-                "Every repository the App can administer under \`$OWNER\` is now declared in \`fleet.yml\`. Closed by the weekly run."
-            fi
-            exit 0
-          fi
-
-          # Body from a file, never an argument: repo names are data, and the
-          # command line is echoed into a log.
-          {
-            echo "The repo-settings App can administer repositories under \`$OWNER\` that \`repo-settings/fleet.yml\` does not declare."
-            echo
-            echo "Undeclared means nobody has decided about them -- not that they should be managed. Declaring one with \`manage: []\` is a perfectly good answer, and is what the two forks carry today; what is not an answer is absence, because absence and a deliberate omission look identical."
-            echo
-            echo "Until a repo is declared it gets no ruleset, no SHA-pinning enforcement and no fork-PR approval requirement, and nothing says so."
-            echo
-            echo '```'
-            grep '^UNDECLARED' "$report" || true
-            echo '```'
-            echo
-            echo "Names of undeclared private repositories are withheld because this issue is public. To see them, run \`python3 scripts/repo_settings.py coverage --config repo-settings/fleet.yml --owner $OWNER --show-private\` locally."
-            echo
-            echo "Add each to \`repos:\` in \`repo-settings/fleet.yml\`, with \`manage: [\"all\"]\` to manage it or \`manage: []\` to leave it alone. This issue closes itself on the next weekly run."
-          } > /tmp/coverage-body.md
-
-          if [[ -n "$existing" ]]; then
-            gh issue edit "$existing" --body-file /tmp/coverage-body.md
-          else
-            gh issue create --title "$title" --label ci --body-file /tmp/coverage-body.md
-          fi
 
   # The pull_request drift report. It never touches the admin key: a PR branch
   # controls its own copy of this workflow, so any job that can run on a PR
@@ -454,9 +424,9 @@ jobs:
   # SEPARATE App that holds only read permissions, so its key exposes reads
   # if it ever leaks, and its token is narrowed to read again at mint time.
   #
-  # SKIPPED until the owner creates that read-only App (issue #90) and sets the
-  # repo-level variable `REPO_SETTINGS_READ_APP_CLIENT_ID` and secret
-  # `REPO_SETTINGS_READ_APP_PRIVATE_KEY`. Reads that need write (the Actions
+  # It is the same read-only App the `plan` job uses. SKIPPED while the
+  # repo-level variable `REPO_SETTINGS_READ_APP_CLIENT_ID` (and secret
+  # `REPO_SETTINGS_READ_APP_PRIVATE_KEY`) is unset (issue #90). Reads that need write (the Actions
   # policies endpoints, GET included) come back as informational skips, never
   # drift (#97). Dependabot and fork PRs get no secrets, so it fails to mint
   # there; it is advisory and not a required check (AGENTS.md).

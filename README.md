@@ -120,11 +120,12 @@ configured, the workflow **skips itself** (guarded on
    `/installation/repositories` what the credential can actually administer and
    reports anything `fleet.yml` does not DECLARE; the weekly workflow runs it
    per owner and files a `ci`-labelled issue naming the repos, closing it when
-   the file catches up. Declared is the test, not managed: a repo carrying
+   the file catches up. It runs in the ungated `plan` job, under the read-only
+   App's token (step 6), so it needs no approval. Declared is the test, not managed: a repo carrying
    `manage: []` has been decided about and is not reported -- which is what
    the two forks carry. Absence is the finding, because absence and a
    deliberate omission looked identical from outside the file.
-   Three things it deliberately does NOT do: fail the weekly apply (a repo
+   Three things it deliberately does NOT do: fail the plan or the apply (a repo
    nobody has declared is no reason to abandon the settings the declared ones
    are owed), run on pull requests, or conclude anything from an enumeration
    that failed -- an empty listing exits 2 and leaves any open issue alone,
@@ -142,41 +143,43 @@ configured, the workflow **skips itself** (guarded on
    [#13](https://github.com/Adam-S-Daniel/repo-settings/issues/13)). It needs a
    required reviewer (the owner) and a deployment-branch policy that allows only
    `main`. The `repo-settings` apply job declares it, so every apply waits for
-   approval, and its first step refuses to apply unless both rules are still
+   approval (the `plan` job does not, so a plan alone asks for none), and its
+   first step refuses to apply unless both rules are still
    there: naming an environment that does not exist silently creates one with
    no protection. GitHub serves environment secrets only to jobs that declare
    the environment, and only after approval. An environment secret also
    [takes precedence](https://docs.github.com/en/actions/reference/security/secrets)
    over a repo secret of the same name.
-6. **Optional: a read-only App for the pull-request drift preview and the
-   weekly `plan`.** Pull requests never get the admin key. The `drift` job instead mints from a
-   second App with only Administration: Read, Actions: Read, Issues: Read and
-   Metadata: Read, installed on all repos in both accounts. In this repo, set
-   variable `REPO_SETTINGS_READ_APP_CLIENT_ID` and secret
+6. **A read-only App for the plan and the pull-request drift preview**
+   (`repo-settings-drift-read`). The `plan` job and the pull-request `drift`
+   job never get the admin key; they mint from a second App with only
+   Administration: Read, Actions: Read, Issues: Read and Metadata: Read,
+   installed on all repos in **both** accounts (each owner's mint fails until
+   it is installed there). In this repo, set variable
+   `REPO_SETTINGS_READ_APP_CLIENT_ID` and secret
    `REPO_SETTINGS_READ_APP_PRIVATE_KEY` (repo level). Until the variable
-   exists, `drift` is skipped and the weekly run asks for approval for every
-   owner. Reads that need write come back as skips, never drift.
+   exists, `drift` is skipped, and `plan` fails, which withholds the apply
+   except on the weekly schedule. Reads that need write come back as skips,
+   never drift.
 
-After that the workflow applies on push to `main` (config/script changes), a
-weekly schedule, and manual dispatch, each after the owner approves the
-`fleet-apply` deployment. A `plan` job runs first, without the admin key, and
-asks for approval only for the owners that have something to apply:
+After that, every push to `main` (config/script changes), weekly schedule and
+manual dispatch first runs the `plan` job, with no approval: `diff` per owner
+under the read-only token
+([#116](https://github.com/Adam-S-Daniel/repo-settings/issues/116)). The gated
+apply, and so the owner's approval of the `fleet-apply` deployment, follows
+only when:
 
-- **Push:** every owner when `scripts/repo_settings.py`, the workflow or
-  `requirements.txt` changed. Otherwise only the owners whose resolved
-  `fleet.yml` targets (`repo_settings.py resolve`: repo, `manage` and effective
-  settings) differ from the commit before the push. A push that only edits
-  comments, reorders keys or reformats `fleet.yml` asks for nothing.
-- **Weekly schedule:** the owners where the read-only App (step 6) finds drift,
-  hits an error, or sees an undeclared repo. That App cannot see ruleset bypass
-  actors or Actions policies (nor the merge-setting fields, which the admin App
-  cannot see either), so drift confined to those waits for the next settings
-  push or a manual dispatch. Without the read-only App, every owner is asked.
-- **Manual dispatch:** every owner, dry run included.
+- the plan found drift, on a push or on a dispatch that is not a dry run;
+- a dispatch that is not a dry run sets `force_apply`, for an apply the plan
+  saw no reason for;
+- the run is the weekly schedule, always, even after a failed plan. The read
+  token cannot see ruleset `bypass_actors` or the repo merge flags (both are
+  skips), so drift there never shows in the plan; this backstop costs one
+  approval a week.
 
-Anything `plan` cannot work out (no usable commit before the push, a config it
-cannot resolve, a failed token mint) asks for every owner. On pull requests, once the read-only App exists, it
-reports drift only and fails the `drift` check if there is any.
+A dry-run dispatch is the plan alone and asks for no approval. On pull
+requests, the workflow reports drift only and fails the `drift` check if there
+is any.
 
 > Reuse note: `_agent-guidance` already runs a GitHub App (`agents-md-sync`) with
 > the same per-owner token-minting pattern, but only Contents/PR permissions. A
