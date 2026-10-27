@@ -3,6 +3,7 @@ import argparse
 import contextlib
 import copy
 import io
+import json
 import os
 import sys
 import tempfile
@@ -2406,6 +2407,77 @@ class SecretScanningTests(unittest.TestCase):
             self.assertIs(security["secret_scanning"], True, msg=target["repo"])
             self.assertIs(security["secret_scanning_push_protection"], True,
                           msg=target["repo"])
+
+
+class ChangesReportTests(unittest.TestCase):
+    """`diff --changes-json` and `changes-report`: the job summary and the
+    notices a reviewer reads before approving an apply."""
+
+    def _change(self, i, status="drift"):
+        return {"repo": f"o/r{i}", "setting": "security.secret_scanning",
+                "status": status, "current": False, "desired": True,
+                "note": "boom" if status == "error" else None}
+
+    def test_markdown_lists_every_drift_row(self):
+        md = rs.changes_markdown([self._change(i) for i in range(12)])
+        self.assertIn("12 setting(s) would change", md)
+        self.assertEqual(md.count("| o/r"), 12)
+        self.assertIn("| o/r0 | security.secret_scanning | `false` | `true` |", md)
+
+    def test_markdown_says_so_when_nothing_changes(self):
+        self.assertIn("No changes planned", rs.changes_markdown([]))
+
+    def test_markdown_lists_errors_as_an_incomplete_plan(self):
+        md = rs.changes_markdown([self._change(0, "error")])
+        self.assertIn("could not be read", md)
+        self.assertIn("o/r0: security.secret_scanning (boom)", md)
+
+    def test_markdown_escapes_pipes_in_values(self):
+        c = dict(self._change(0), desired="a|b")
+        self.assertIn('`"a\\|b"`', rs.changes_markdown([c]))
+
+    def test_long_values_are_cut(self):
+        c = dict(self._change(0), desired={"k": "x" * 500})
+        md = rs.changes_markdown([c])
+        self.assertIn("\u2026", md)
+        self.assertLess(max(len(l) for l in md.splitlines()), 400)
+
+    def test_ten_or_fewer_changes_are_all_notices(self):
+        lines = rs.changes_annotations([self._change(i) for i in range(10)], "U")
+        self.assertEqual(len(lines), 10)
+        self.assertTrue(all(l.startswith("::notice title=repo-settings plan::") for l in lines))
+        self.assertNotIn("NOT THE WHOLE PLAN", "".join(lines))
+        self.assertIn("o/r0: security.secret_scanning false -> true", lines[0])
+
+    def test_more_than_ten_spends_the_tenth_on_a_heads_up(self):
+        lines = rs.changes_annotations([self._change(i) for i in range(14)], "https://x/runs/1")
+        self.assertEqual(len(lines), rs.MAX_NOTICES)
+        self.assertIn("o/r8:", lines[8])
+        self.assertIn("NOT THE WHOLE PLAN: 5 MORE CHANGE(S) NOT SHOWN HERE", lines[9])
+        self.assertIn("https://x/runs/1", lines[9])
+
+    def test_notice_text_is_escaped(self):
+        c = dict(self._change(0), setting="a%b")
+        self.assertIn("a%25b", rs.changes_annotations([c], None)[0])
+
+    def test_diff_writes_drift_and_error_records_only(self):
+        cfg = {"repos": [{"name": "o/r", "manage": ["all"]}]}
+        records = [
+            {"setting": "a", "status": "drift", "current": 1, "desired": 2},
+            {"setting": "b", "status": "match", "current": 1, "desired": 1},
+            {"setting": "c", "status": "skipped", "current": None, "desired": 1, "note": "n"},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "changes.json")
+            args = argparse.Namespace(config="x", repo=None, owner=None, changes_json=out)
+            with patch.object(rs, "load_config", return_value=cfg), \
+                 patch.object(rs, "plan_repo_records", return_value=records), \
+                 patch.object(rs, "render_records"):
+                self.assertEqual(rs.cmd_diff(args), 1)
+            with open(out) as fh:
+                written = json.load(fh)
+        self.assertEqual(written, [{"repo": "o/r", "setting": "a", "status": "drift",
+                                    "current": 1, "desired": 2, "note": None}])
 
 
 class WorkflowPermissionsTests(unittest.TestCase):

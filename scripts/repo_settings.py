@@ -3,7 +3,7 @@
 repo_settings.py -- repo-settings-as-code for GitHub Actions security settings
 and default-branch protection (via GitHub repository rulesets).
 
-Three subcommands:
+Subcommands:
 
   generate   Introspect a repo's CURRENT settings and emit a repo-settings YAML
              document to stdout (so you can commit it and edit it).
@@ -18,6 +18,10 @@ Three subcommands:
 
   coverage   Report repos the credential can administer that a fleet config
              does not declare. Exits 0 complete, 1 undeclared, 2 on error.
+
+  changes-report
+             Render the files `diff --changes-json` wrote as a job-summary
+             table or as `::notice` lines, for the reviewer of an apply.
 
 Every subcommand that reads a config exits 2 when the config is refused (see
 ConfigError), the same code as "could not ask": 1 already means drift for
@@ -2660,6 +2664,7 @@ def cmd_diff(args) -> int:
     cfg = load_config(args.config)
     targets = _filter_owner(resolve_targets(cfg, args.repo), getattr(args, "owner", None))
     any_drift = any_error = False
+    changes: list[dict] = []
     for t in targets:
         if not any(manages(t, s) for s in SURFACES):
             print(f"\n{t['repo']}\n  {DIM}{manage_label(t)}{RESET}")
@@ -2668,6 +2673,15 @@ def cmd_diff(args) -> int:
         render_records(t["repo"], records, manage_label(t))
         any_drift |= any(r["status"] == "drift" for r in records)
         any_error |= any(r["status"] == "error" for r in records)
+        changes.extend(
+            {"repo": t["repo"], "setting": r["setting"], "status": r["status"],
+             "current": r["current"], "desired": r["desired"],
+             "note": r.get("note")}
+            for r in records if r["status"] in ("drift", "error")
+        )
+    if getattr(args, "changes_json", None):
+        with open(args.changes_json, "w", encoding="utf-8") as fh:
+            json.dump(changes, fh, indent=2, default=repr)
     if any_error:
         return 2
     return 1 if any_drift else 0
@@ -2714,6 +2728,100 @@ def cmd_apply(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# changes-report: what a reviewer reads before approving an apply
+# --------------------------------------------------------------------------- #
+# GitHub keeps at most 10 annotations of each level per step and drops the
+# rest without saying so. Past this many changes the last notice slot carries
+# the heads-up instead, so a truncated list never reads as the whole plan.
+MAX_NOTICES = 10
+# A ruleset's current and desired values are whole normalized bodies; a table
+# cell or a notice line shows this much and the log keeps the rest.
+MAX_VALUE_CHARS = 120
+
+
+def _short(value: Any) -> str:
+    text = _json(value)
+    if len(text) > MAX_VALUE_CHARS:
+        text = text[: MAX_VALUE_CHARS - 1] + "\u2026"
+    return text
+
+
+def _change_line(c: dict) -> str:
+    if c["status"] == "error":
+        return f"{c['repo']}: {c['setting']} could not be read ({c.get('note') or 'error'})"
+    return f"{c['repo']}: {c['setting']} {_short(c['current'])} -> {_short(c['desired'])}"
+
+
+def _annotation_escape(text: str) -> str:
+    # GitHub's workflow-command encoding for a message.
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def changes_markdown(changes: list[dict]) -> str:
+    """The job summary: one row per planned change, errors included."""
+    drift = [c for c in changes if c["status"] == "drift"]
+    errors = [c for c in changes if c["status"] == "error"]
+    lines = ["## Planned changes", ""]
+    if not changes:
+        lines.append("No changes planned. An apply would change nothing.")
+        return "\n".join(lines) + "\n"
+
+    def cell(text: str) -> str:
+        return "`" + text.replace("|", "\\|").replace("`", "'") + "`"
+
+    if drift:
+        lines += [
+            f"{len(drift)} setting(s) would change. Settings this token cannot "
+            "read are skipped, not listed; the plan log names them.",
+            "",
+            "| Repo | Setting | From | To |",
+            "|---|---|---|---|",
+        ]
+        lines += [
+            f"| {c['repo']} | {c['setting']} | {cell(_short(c['current']))} "
+            f"| {cell(_short(c['desired']))} |"
+            for c in drift
+        ]
+    if errors:
+        lines += ["", f"**{len(errors)} setting(s) could not be read**, so the "
+                  "plan is incomplete:", ""]
+        lines += [f"- {c['repo']}: {c['setting']} ({c.get('note') or 'error'})"
+                  for c in errors]
+    return "\n".join(lines) + "\n"
+
+
+def changes_annotations(changes: list[dict], summary_url: str | None) -> list[str]:
+    """`::notice` lines, at most MAX_NOTICES. When there are more changes than
+    that, the last line says so instead of showing one more."""
+    where = f" at {summary_url}" if summary_url else ""
+    lines = [_change_line(c) for c in changes]
+    if len(lines) > MAX_NOTICES:
+        shown = lines[: MAX_NOTICES - 1]
+        hidden = len(lines) - len(shown)
+        shown.append(
+            f"NOT THE WHOLE PLAN: {hidden} MORE CHANGE(S) NOT SHOWN HERE. "
+            f"SEE THE JOB SUMMARY (PLANNED CHANGES){where}."
+        )
+        lines = shown
+    return [f"::notice title=repo-settings plan::{_annotation_escape(l)}" for l in lines]
+
+
+def cmd_changes_report(args) -> int:
+    """Merge the `diff --changes-json` files given and print the job-summary
+    Markdown (--markdown) or the notice lines (--annotations)."""
+    changes: list[dict] = []
+    for path in args.inputs:
+        with open(path, "r", encoding="utf-8") as fh:
+            changes.extend(json.load(fh))
+    if args.format == "markdown":
+        sys.stdout.write(changes_markdown(changes))
+    else:
+        for line in changes_annotations(changes, args.summary_url):
+            print(line)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 def cmd_cms_label_repos(args) -> int:
     """One line: the names (after the `/`) of this owner's label-managing
     cms-platform repos, comma-separated, for the workflow's token mint."""
@@ -2740,7 +2848,23 @@ def main() -> int:
     d.add_argument("--config", required=True)
     d.add_argument("--repo", help="override/set target for single-repo config")
     d.add_argument("--owner", help="only process repos under this owner (account)")
+    d.add_argument(
+        "--changes-json",
+        help="also write the drift and error records to this file, for changes-report",
+    )
     d.set_defaults(func=cmd_diff)
+
+    cr = sub.add_parser(
+        "changes-report",
+        help="render diff --changes-json files as a job summary or notice lines",
+    )
+    cr.add_argument("inputs", nargs="+", help="files written by diff --changes-json")
+    cr.add_argument("--format", choices=("markdown", "annotations"), required=True)
+    cr.add_argument(
+        "--summary-url",
+        help="where the job summary is, named in the notice that flags a cut-off list",
+    )
+    cr.set_defaults(func=cmd_changes_report)
 
     a = sub.add_parser("apply", help="apply desired settings")
     a.add_argument("--config", required=True)
