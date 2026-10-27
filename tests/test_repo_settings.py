@@ -3790,6 +3790,9 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
     WERE_FALSE = {
         "Adam-S-Daniel/agentskills", "Adam-S-Daniel/GHA-bench",
         "Adam-S-Daniel/OctopusDeploy-Api", "Adam-S-Daniel/SonosAmpJuicePi",
+    }
+    # Since issue #88 these manage `labels` only, not nothing.
+    LABELS_ONLY = {
         "Adam-S-Daniel/cms-platform", "Adam-S-Daniel/adamdaniel.ai",
         "jodidaniel/jodidaniel.com",
     }
@@ -3835,6 +3838,8 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
             if "labels" in defaults:
                 settings["labels"] = rs.merge_labels(
                     defaults["labels"], (entry.get("overrides") or {}).get("labels"))
+            if entry["name"] in self.LABELS_ONLY:
+                settings = {"labels": settings["labels"]}
             targets.append({"repo": entry["name"], "settings": settings,
                             "manage": entry["manage"] != []})
         return targets
@@ -3851,8 +3856,9 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
         by_value = {}
         for entry in cfg["repos"]:
             by_value.setdefault(tuple(entry["manage"]), set()).add(entry["name"])
-        self.assertEqual(set(by_value), {("all",), ()})
+        self.assertEqual(set(by_value), {("all",), (), ("labels",)})
         self.assertEqual(by_value[()], self.WERE_FALSE)
+        self.assertEqual(by_value[("labels",)], self.LABELS_ONLY)
         self.assertEqual(len(by_value[("all",)]), 19)
 
     def test_diff_output_is_unchanged_apart_from_the_scope_strings(self):
@@ -3870,8 +3876,159 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
             legacy.getvalue()
             .replace("excluded (manage: false)", "excluded (manage: [])")
         )
-        actual = new.getvalue().replace(f"\n  {rs.DIM}managed: all{rs.RESET}", "")
+        actual = new.getvalue()
+        for scope in ("all", "labels"):
+            actual = actual.replace(f"\n  {rs.DIM}managed: {scope}{rs.RESET}", "")
         self.assertEqual(actual, expected)
         self.assertEqual(new_calls, legacy_calls)
         self.assertEqual({m for m, _ in new_calls}, {"GET"})
         self.assertIn("[\x1b[33mDRIFT\x1b[0m]", actual)
+
+
+class CmsLabelOnlyTests(unittest.TestCase):
+    """The guard that keeps the three cms-platform-managed repos to the
+    fleet-wide label (docs/decisions/0016), and the CLI built on it."""
+
+    FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
+    CMS = "Adam-S-Daniel/cms-platform"
+    AGENT = {"name": "agent-authored", "color": "D4C5F9", "description": "d"}
+
+    def _resolve(self, defaults_labels=None, overrides_labels=None, manage=None,
+                 name=None):
+        entry = {"name": name or self.CMS,
+                 "manage": ["labels"] if manage is None else manage}
+        if overrides_labels is not None:
+            entry["overrides"] = {"labels": overrides_labels}
+        cfg = {"repos": [entry]}
+        if defaults_labels is not None:
+            cfg["defaults"] = {"labels": defaults_labels}
+        return rs.resolve_targets(cfg, None)
+
+    def _refused(self, **kw):
+        with self.assertRaises(rs.ConfigError) as cm:
+            self._resolve(**kw)
+        return str(cm.exception)
+
+    def _run(self, *argv):
+        out = io.StringIO()
+        with patch.object(sys, "argv", ["repo_settings.py", *argv]), \
+                contextlib.redirect_stdout(out):
+            rc = rs.main()
+        return rc, out.getvalue()
+
+    def test_real_fleet_resolves_and_only_three_repos_are_label_only(self):
+        targets = rs.resolve_targets(rs.load_config(str(self.FLEET)), None)
+        cms = [t for t in targets if rs.is_cms_label_only(t["repo"])]
+        self.assertEqual({t["repo"] for t in cms}, set(rs.CMS_LABEL_ONLY_REPOS))
+        for t in cms:
+            self.assertEqual(t["manage"], ["labels"])
+            self.assertEqual(list(t["effective"]), ["labels"])
+            self.assertEqual([l["name"] for l in t["effective"]["labels"]],
+                             ["agent-authored"])
+
+    def test_allowed(self):
+        for name in ("agent-authored", "Agent-Authored"):
+            for repo in (self.CMS, "adam-s-daniel/CMS-Platform"):
+                with self.subTest(name=name, repo=repo):
+                    t = self._resolve(defaults_labels=[{**self.AGENT, "name": name}],
+                                      name=repo)
+                    self.assertEqual(len(t[0]["effective"]["labels"]), 1)
+
+    def test_owned_and_off_allowlist_names_are_refused(self):
+        bad = ("ci", "CI", "cms/draft", "cms/anything", "Decap-CMS/x",
+               "not-decap-created", "content-guard/override", "triage")
+        for name in bad:
+            entry = {"name": name, "color": "ffffff"}
+            with self.subTest(name=name, via="defaults"):
+                self.assertIn(repr(name), self._refused(defaults_labels=[entry]))
+            with self.subTest(name=name, via="overrides"):
+                self.assertIn(repr(name), self._refused(
+                    defaults_labels=[self.AGENT], overrides_labels=[entry]))
+
+    def test_every_label_is_checked_not_the_first_match(self):
+        msg = self._refused(defaults_labels=[
+            self.AGENT, {"name": "ci", "color": "ffffff"},
+            {"name": "triage", "color": "ffffff"}])
+        self.assertIn("'ci'", msg)
+        self.assertIn("'triage'", msg)
+        self.assertNotIn("'agent-authored'", msg)
+
+    def test_bad_name_listed_after_a_good_one(self):
+        msg = self._refused(defaults_labels=[self.AGENT, {"name": "cms/ready", "color": "ffffff"}])
+        self.assertIn("'cms/ready'", msg)
+
+    def test_other_manage_values_are_refused(self):
+        for manage in (["all"], ["labels", "security"]):
+            with self.subTest(manage=manage):
+                with self.assertRaises(rs.ConfigError) as cm:
+                    self._resolve(defaults_labels=[self.AGENT], manage=manage)
+                self.assertIn('[] or ["labels"]', str(cm.exception))
+
+    def test_manage_empty_checks_no_labels(self):
+        t = self._resolve(defaults_labels=[{"name": "ci", "color": "ffffff"}], manage=[])
+        self.assertEqual(t[0]["effective"], {})
+
+    def test_other_repos_may_carry_any_label(self):
+        t = self._resolve(defaults_labels=[{"name": "ci", "color": "ffffff"}],
+                          name="Adam-S-Daniel/other")
+        self.assertEqual(t[0]["effective"]["labels"][0]["name"], "ci")
+
+    def test_constant_hygiene(self):
+        for name in rs.CMS_LABEL_ALLOWLIST:
+            self.assertFalse(rs._cms_owned(name), name)
+        msg = self._refused(defaults_labels=[{"name": "ci", "color": "ffffff"}])
+        for name in rs.CMS_LABEL_ALLOWLIST:
+            self.assertIn(name, msg)
+        for pat in rs.CMS_OWNED_LABELS:
+            self.assertIn(pat, msg)
+
+    def test_single_repo_shape_is_guarded(self):
+        cfg = {"repo": self.CMS, "labels": [{"name": "ci", "color": "ffffff"}]}
+        with self.assertRaises(rs.ConfigError):
+            rs.resolve_targets(cfg, None)
+        cfg["labels"] = [self.AGENT]
+        self.assertEqual(len(rs.resolve_targets(cfg, None)), 1)
+
+    def test_cms_label_repos_on_the_real_fleet(self):
+        for owner, want in (("Adam-S-Daniel", "adamdaniel.ai,cms-platform"),
+                            ("jodidaniel", "jodidaniel.com")):
+            with self.subTest(owner=owner):
+                rc, out = self._run("cms-label-repos", "--config", str(self.FLEET),
+                                    "--owner", owner)
+                self.assertEqual((rc, out), (0, want + "\n"))
+
+    def test_cms_label_repos_empty_when_none(self):
+        path = _write_yaml(self, 'repos:\n  - name: o/r\n    manage: ["labels"]\n'
+                                 '  - name: Adam-S-Daniel/cms-platform\n    manage: []\n')
+        rc, out = self._run("cms-label-repos", "--config", path, "--owner", "Adam-S-Daniel")
+        self.assertEqual((rc, out), (0, "\n"))
+
+    def test_cms_label_repos_config_error_exits_2(self):
+        path = _write_yaml(self, 'repos:\n  - name: Adam-S-Daniel/cms-platform\n    manage: ["all"]\n')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, _ = self._run("cms-label-repos", "--config", path, "--owner", "Adam-S-Daniel")
+        self.assertEqual(rc, 2)
+
+    def test_apply_cms_label_only_skip_and_only(self):
+        path = _write_yaml(self, 'repos:\n  - name: o/plain\n    manage: ["labels"]\n'
+                                 '  - name: Adam-S-Daniel/cms-platform\n    manage: ["labels"]\n'
+                                 'defaults:\n  labels:\n    - {name: agent-authored, color: D4C5F9}\n')
+        for mode, want in (("skip", ["o/plain"]), ("only", ["Adam-S-Daniel/cms-platform"]),
+                           (None, ["o/plain", "Adam-S-Daniel/cms-platform"])):
+            planned = []
+
+            def fake(repo, settings):
+                planned.append(repo)
+                return []
+
+            argv = ["apply", "--config", path, "--dry-run"]
+            if mode:
+                argv += ["--cms-label-only", mode]
+            with self.subTest(mode=mode), \
+                    patch.object(rs, "plan_repo_records", side_effect=fake):
+                rc, out = self._run(*argv)
+            self.assertEqual(rc, 0)
+            self.assertEqual(planned, want)
+            if mode == "skip":
+                self.assertIn("label-only step", out)

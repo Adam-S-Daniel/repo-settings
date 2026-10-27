@@ -111,6 +111,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fnmatch
 import json
 import re
 import subprocess
@@ -1280,6 +1281,31 @@ MANAGE_ACCEPTED = (
     f"that order"
 )
 
+# The three cms-platform-managed repos (docs/decisions/0016). cms-platform owns
+# every surface but one through its own manifest, so here they may manage
+# `labels` and nothing else, and only the names on CMS_LABEL_ALLOWLIST: the
+# fleet-wide default label the engine must create there. CMS_OWNED_LABELS are
+# fnmatch patterns of the label names cms-platform's workflows (and Decap, for
+# `decap-cms/*`) create and own; the engine must never write them. Names and
+# patterns compare case-insensitively, as on GitHub.
+CMS_LABEL_ONLY_REPOS = (
+    "Adam-S-Daniel/adamdaniel.ai",
+    "Adam-S-Daniel/cms-platform",
+    "jodidaniel/jodidaniel.com",
+)
+CMS_LABEL_ALLOWLIST = ("agent-authored",)
+CMS_OWNED_LABELS = (
+    "ci",
+    "cms/*",
+    "cms/draft",
+    "cms/preview-only",
+    "cms/ready",
+    "content-guard/override",
+    "decap-cms/*",
+    "not-decap-created",
+)
+CMS_LABEL_ONLY_MANAGE = ("labels",)
+
 
 def _json(value: Any) -> str:
     """Render a config value the way the docs write it: `["labels"]`, not
@@ -1448,6 +1474,50 @@ def effective_settings(declared: dict, manage: list[str]) -> dict:
     return {k: copy.deepcopy(v) for k, v in declared.items() if k in manage}
 
 
+def is_cms_label_only(repo: str) -> bool:
+    return repo.casefold() in {r.casefold() for r in CMS_LABEL_ONLY_REPOS}
+
+
+def _cms_owned(name: str) -> bool:
+    return any(
+        fnmatch.fnmatchcase(name.casefold(), pat.casefold())
+        for pat in CMS_OWNED_LABELS
+    )
+
+
+def check_cms_label_only(target: dict) -> None:
+    """Refuse a config that would let the engine touch more than the fleet-wide
+    label in a cms-platform-managed repo (docs/decisions/0016). Runs for every
+    target in CMS_LABEL_ONLY_REPOS, in both config shapes."""
+    if not is_cms_label_only(target["repo"]):
+        return
+    where = f"repos[{target['repo']}]"
+    manage = target["manage"]
+    if manage not in ([], list(CMS_LABEL_ONLY_MANAGE)):
+        raise ConfigError(
+            f"error: {where}: `manage` is {_json(manage)}; a cms-platform-managed "
+            f"repo accepts only [] or {_json(list(CMS_LABEL_ONLY_MANAGE))}, because "
+            f"cms-platform owns every other surface"
+        )
+    if not manages(target, "labels"):
+        return  # labels never reach the repo, so none are checked
+    allowed = {n.casefold() for n in CMS_LABEL_ALLOWLIST}
+    refused = []
+    # EVERY entry, not the first bad one: the message names them all.
+    for entry in target["effective"].get("labels") or []:
+        if not isinstance(entry, dict):
+            continue  # build_label_specs refuses a non-map entry
+        name = str(entry.get("name"))
+        if name.casefold() not in allowed or _cms_owned(name):
+            refused.append(name)
+    if refused:
+        raise ConfigError(
+            f"error: {where}: label(s) {', '.join(repr(n) for n in refused)} are not "
+            f"allowed; this repo may carry only {', '.join(CMS_LABEL_ALLOWLIST)} "
+            f"(cms-platform owns labels matching {', '.join(CMS_OWNED_LABELS)})"
+        )
+
+
 def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
     """Validate a config and resolve it into one target per repo:
     `{"repo", "manage", "declared", "effective"}`. `declared` is the repo's
@@ -1521,14 +1591,14 @@ def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
                 # name clash (names compare case-insensitively, as on GitHub).
                 declared["labels"] = merge_labels(defaults["labels"], overrides.get("labels"))
             _validate_builders(where, declared)
-            targets.append(
-                {
-                    "repo": name,
-                    "manage": manage,
-                    "declared": declared,
-                    "effective": effective_settings(declared, manage),
-                }
-            )
+            target = {
+                "repo": name,
+                "manage": manage,
+                "declared": declared,
+                "effective": effective_settings(declared, manage),
+            }
+            check_cms_label_only(target)
+            targets.append(target)
         return targets
     repo_field = cfg.get("repo")
     # `repo:` is overloaded in this shape: the pre-existing convention is the
@@ -1551,14 +1621,14 @@ def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
     validate_surfaces("top level", declared)
     _validate_builders(repo, declared)
     manage = [s for s in SURFACES if s in declared]
-    return [
-        {
-            "repo": repo,
-            "manage": manage,
-            "declared": declared,
-            "effective": effective_settings(declared, manage),
-        }
-    ]
+    target = {
+        "repo": repo,
+        "manage": manage,
+        "declared": declared,
+        "effective": effective_settings(declared, manage),
+    }
+    check_cms_label_only(target)
+    return [target]
 
 
 # --------------------------------------------------------------------------- #
@@ -2510,8 +2580,18 @@ def cmd_diff(args) -> int:
 def cmd_apply(args) -> int:
     cfg = load_config(args.config)
     targets = _filter_owner(resolve_targets(cfg, args.repo), getattr(args, "owner", None))
+    # The workflow applies the cms-platform repos in their own step, under a
+    # token that can write issues and nothing else (docs/decisions/0016).
+    mode = getattr(args, "cms_label_only", None)
     any_error = False
     for t in targets:
+        if mode and is_cms_label_only(t["repo"]) != (mode == "only"):
+            if mode == "skip":
+                print(
+                    f"\n{t['repo']}\n  {DIM}applied by the label-only step "
+                    f"(--cms-label-only only){RESET}"
+                )
+            continue
         if not any(manages(t, s) for s in SURFACES):
             print(f"\n{t['repo']}\n  {DIM}{manage_label(t)}{RESET}")
             continue
@@ -2538,6 +2618,20 @@ def cmd_apply(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+def cmd_cms_label_repos(args) -> int:
+    """One line: the names (after the `/`) of this owner's label-managing
+    cms-platform repos, comma-separated, for the workflow's token mint."""
+    cfg = load_config(args.config)
+    targets = _filter_owner(resolve_targets(cfg, None), args.owner)
+    names = sorted(
+        t["repo"].split("/", 1)[1]
+        for t in targets
+        if is_cms_label_only(t["repo"]) and manages(t, "labels")
+    )
+    print(",".join(names))
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="repo-settings-as-code for GitHub")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2557,7 +2651,21 @@ def main() -> int:
     a.add_argument("--repo", help="override/set target for single-repo config")
     a.add_argument("--owner", help="only process repos under this owner (account)")
     a.add_argument("--dry-run", action="store_true", help="preview only")
+    a.add_argument(
+        "--cms-label-only",
+        choices=("skip", "only"),
+        help="skip the cms-platform label-only repos, or apply only them "
+        "(default: every target)",
+    )
     a.set_defaults(func=cmd_apply)
+
+    cl = sub.add_parser(
+        "cms-label-repos",
+        help="print the owner's label-managing cms-platform repos, comma-separated",
+    )
+    cl.add_argument("--config", required=True)
+    cl.add_argument("--owner", required=True)
+    cl.set_defaults(func=cmd_cms_label_repos)
 
     c = sub.add_parser(
         "coverage",
