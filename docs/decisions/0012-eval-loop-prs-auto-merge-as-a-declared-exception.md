@@ -7,7 +7,8 @@
   changes open ready PRs and auto-merge once every required check passes)
 - **Amended:** 2026-10-26 by [ADR 0013](0013-lesson-check-prs-auto-merge-in-agent-guidance.md),
   which adds a fourth row: lesson-check PRs in _agent-guidance's agent-checks
-  runner
+  runner; 2026-10-27 by [ADR 0014](0014-guidance-loop-prs-use-the-eval-improve-app.md),
+  which has the eval-improve App open the _agent-guidance guidance-loop PRs
 
 ## Context
 
