@@ -1,6 +1,6 @@
 # 0006. Accumulate the changelog routine's work on a persistent branch; the owner merges
 
-- **Status:** Accepted
+- **Status:** Accepted; "the owner merges" superseded by [ADR 0015](0015-changelog-routine-prs-merge-through-a-workflow-gate.md) (2026-10-27)
 - **Date:** 2026-10-02
 - **Deciders:** Adam Daniel (decided 2026-10-02)
 
