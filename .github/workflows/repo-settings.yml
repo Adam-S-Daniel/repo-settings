@@ -139,7 +139,7 @@ jobs:
 
       - name: Mint read-only GitHub App token for Adam-S-Daniel
         id: token_adam
-        uses: actions/create-github-app-token@v3.2.0
+        uses: actions/create-github-app-token@v3.3.0
         with:
           client-id: ${{ vars.REPO_SETTINGS_READ_APP_CLIENT_ID }}
           private-key: ${{ secrets.REPO_SETTINGS_READ_APP_PRIVATE_KEY }}
@@ -151,7 +151,7 @@ jobs:
 
       - name: Mint read-only GitHub App token for jodidaniel
         id: token_jodidaniel
-        uses: actions/create-github-app-token@v3.2.0
+        uses: actions/create-github-app-token@v3.3.0
         with:
           client-id: ${{ vars.REPO_SETTINGS_READ_APP_CLIENT_ID }}
           private-key: ${{ secrets.REPO_SETTINGS_READ_APP_PRIVATE_KEY }}
@@ -411,7 +411,7 @@ jobs:
 
       - name: Mint GitHub App token for ${{ matrix.owner }}
         id: token
-        uses: actions/create-github-app-token@v3.2.0
+        uses: actions/create-github-app-token@v3.3.0
         with:
           client-id: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID }}
           private-key: ${{ secrets.REPO_SETTINGS_APP_PRIVATE_KEY }}
@@ -448,7 +448,7 @@ jobs:
       - name: Mint labels-only GitHub App token for ${{ matrix.owner }}
         id: token_labels
         if: ${{ !cancelled() && steps.environment_gate.outcome == 'success' && steps.cms_label_repos.outputs.repos != '' }}
-        uses: actions/create-github-app-token@v3.2.0
+        uses: actions/create-github-app-token@v3.3.0
         with:
           client-id: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID }}
           private-key: ${{ secrets.REPO_SETTINGS_APP_PRIVATE_KEY }}
@@ -498,7 +498,7 @@ jobs:
 
       - name: Mint read-only GitHub App token for ${{ matrix.owner }}
         id: token
-        uses: actions/create-github-app-token@v3.2.0
+        uses: actions/create-github-app-token@v3.3.0
         with:
           client-id: ${{ vars.REPO_SETTINGS_READ_APP_CLIENT_ID }}
           private-key: ${{ secrets.REPO_SETTINGS_READ_APP_PRIVATE_KEY }}
