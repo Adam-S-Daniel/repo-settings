@@ -2424,6 +2424,20 @@ class ChangesReportTests(unittest.TestCase):
         self.assertEqual(md.count("| o/r"), 12)
         self.assertIn("| o/r0 | security.secret_scanning | `false` | `true` |", md)
 
+    def test_markdown_rows_sort_by_setting_then_repo(self):
+        changes = [
+            dict(self._change(0), repo="o/b", setting="security.secret_scanning"),
+            dict(self._change(0), repo="o/a", setting="security.secret_scanning"),
+            dict(self._change(0), repo="o/c", setting="actions.fork_pr_approval"),
+            dict(self._change(0), repo="O/B2", setting="actions.fork_pr_approval"),
+        ]
+        rows = [l for l in rs.changes_markdown(changes).splitlines() if l.startswith("| o/") or l.startswith("| O/")]
+        self.assertEqual(
+            [tuple(cell.strip() for cell in r.split("|")[1:3]) for r in rows],
+            [("O/B2", "actions.fork_pr_approval"), ("o/c", "actions.fork_pr_approval"),
+             ("o/a", "security.secret_scanning"), ("o/b", "security.secret_scanning")],
+        )
+
     def test_markdown_says_so_when_nothing_changes(self):
         self.assertIn("No changes planned", rs.changes_markdown([]))
 
