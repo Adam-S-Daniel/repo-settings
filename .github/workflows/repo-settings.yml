@@ -124,10 +124,10 @@ jobs:
       needs_apply: ${{ steps.plan_adam.outputs.drift == 'true' || steps.plan_jodidaniel.outputs.drift == 'true' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
 
@@ -136,7 +136,7 @@ jobs:
 
       - name: Mint read-only GitHub App token for Adam-S-Daniel
         id: token_adam
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        uses: actions/create-github-app-token@v3.2.0
         with:
           client-id: ${{ vars.REPO_SETTINGS_READ_APP_CLIENT_ID }}
           private-key: ${{ secrets.REPO_SETTINGS_READ_APP_PRIVATE_KEY }}
@@ -148,7 +148,7 @@ jobs:
 
       - name: Mint read-only GitHub App token for jodidaniel
         id: token_jodidaniel
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        uses: actions/create-github-app-token@v3.2.0
         with:
           client-id: ${{ vars.REPO_SETTINGS_READ_APP_CLIENT_ID }}
           private-key: ${{ secrets.REPO_SETTINGS_READ_APP_PRIVATE_KEY }}
@@ -395,10 +395,10 @@ jobs:
           echo "Environment $ENVIRONMENT: a required reviewer is configured and only main may deploy."
 
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
 
@@ -407,7 +407,7 @@ jobs:
 
       - name: Mint GitHub App token for ${{ matrix.owner }}
         id: token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        uses: actions/create-github-app-token@v3.2.0
         with:
           client-id: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID }}
           private-key: ${{ secrets.REPO_SETTINGS_APP_PRIVATE_KEY }}
@@ -441,10 +441,10 @@ jobs:
         owner: [Adam-S-Daniel, jodidaniel]
     steps:
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
 
@@ -453,7 +453,7 @@ jobs:
 
       - name: Mint read-only GitHub App token for ${{ matrix.owner }}
         id: token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        uses: actions/create-github-app-token@v3.2.0
         with:
           client-id: ${{ vars.REPO_SETTINGS_READ_APP_CLIENT_ID }}
           private-key: ${{ secrets.REPO_SETTINGS_READ_APP_PRIVATE_KEY }}
