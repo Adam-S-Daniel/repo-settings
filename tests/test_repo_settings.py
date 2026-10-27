@@ -685,6 +685,7 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         "Adam-S-Daniel/wsl-automation": ["shell", "test", "test-linux", "agent-checks"],
         "Adam-S-Daniel/repo-settings": ["agent-checks", "unit"],
         "Adam-S-Daniel/verify-actions-lock": ["test", "self-verify", "agent-checks"],
+        "Adam-S-Daniel/security-alerts": ["agent-checks", "unit"],
     }
     PRE_EXISTING = {
         "Adam-S-Daniel/agentskills": ["pytest-windows"],
@@ -1395,8 +1396,18 @@ class ExtraRulesetsFleetConfigTests(unittest.TestCase):
                 "Adam-S-Daniel/skills-evals",
                 "Adam-S-Daniel/_agent-guidance",
                 "Adam-S-Daniel/GHA-bench",
+                "Adam-S-Daniel/security-alerts",
             }
         )
+
+    def test_security_alerts_declares_deletion_only_persistent_ruleset(self):
+        # docs/decisions/0007: collect.yml's `persistent/alerts-data` outlives
+        # its PRs; deletion blocked, no bypass actors.
+        (t,) = [t for t in self.targets if t["repo"] == "Adam-S-Daniel/security-alerts"]
+        (body,) = rs.build_extra_ruleset_bodies(t["declared"])
+        self.assertEqual(body["conditions"]["ref_name"]["include"], ["refs/heads/persistent/**"])
+        self.assertEqual(body["rules"], [{"type": "deletion"}])
+        self.assertEqual(body["bypass_actors"], [])
 
     def test_agent_guidance_declares_deletion_only_persistent_ruleset(self):
         # docs/decisions/0007: deletion blocked, no bypass actors.
@@ -1499,7 +1510,6 @@ class AdminBypassFleetConfigTests(unittest.TestCase):
                     {k: v for k, v in none.items() if k != "bypass_actors"},
                 )
             checked += 1
-        # 22 since security-alerts and waiting-feed joined the fleet (2026-10-26).
         self.assertEqual(checked, 22)
 
 
@@ -2271,6 +2281,131 @@ class SecurityFleetConfigTests(unittest.TestCase):
             self.assertIs(security["vulnerability_alerts"], True, msg=target["repo"])
             self.assertIs(security["automated_security_fixes"], True, msg=target["repo"])
             self.assertIs(security["grouped_security_updates"], True, msg=target["repo"])
+
+
+class SecretScanningTests(unittest.TestCase):
+    """`security.secret_scanning` and `security.secret_scanning_push_protection`
+    (issue #102): read from the repo object's `security_and_analysis`, written
+    together in one PATCH, skipped on private repos."""
+
+    CFG = {"secret_scanning": True, "secret_scanning_push_protection": True}
+
+    def _repo(self, private=False, scanning="disabled", push="disabled"):
+        saa = {}
+        if scanning is not None:
+            saa["secret_scanning"] = {"status": scanning}
+        if push is not None:
+            saa["secret_scanning_push_protection"] = {"status": push}
+        return {"private": private, "security_and_analysis": saa}
+
+    def _plan(self, repo_obj, cfg=None):
+        with patch.object(rs, "get_repo", return_value=repo_obj):
+            return rs.plan_repo("o/r", {"security": dict(cfg or self.CFG)})
+
+    def test_drift_when_both_disabled_on_a_public_repo(self):
+        records = self._plan(self._repo())
+        self.assertEqual(
+            [r["setting"] for r in records],
+            ["security.secret_scanning", "security.secret_scanning_push_protection"],
+        )
+        for r in records:
+            self.assertEqual(r["status"], "drift")
+            self.assertIs(r["current"], False)
+            self.assertIs(r["desired"], True)
+            self.assertEqual(r["_writer"], ("secret_scanning", None, self.CFG))
+
+    def test_match_when_both_enabled(self):
+        records = self._plan(self._repo(scanning="enabled", push="enabled"))
+        self.assertEqual([r["status"] for r in records], ["match", "match"])
+
+    def test_private_repo_is_a_skip_and_never_reads_the_field(self):
+        records = self._plan(self._repo(private=True))
+        self.assertEqual([r["status"] for r in records], ["skipped", "skipped"])
+        for r in records:
+            self.assertIn("private repo", r["note"])
+            self.assertNotIn("_writer", r)
+
+    def test_absent_security_and_analysis_is_a_skip_not_drift(self):
+        # A token that may not administer the repo gets no
+        # security_and_analysis at all; that must not read as "disabled".
+        records = self._plan({"private": False})
+        self.assertEqual([r["status"] for r in records], ["skipped", "skipped"])
+        self.assertIn("did not return", records[0]["note"])
+
+    def test_absent_single_key_skips_only_that_key(self):
+        records = self._plan(self._repo(push=None))
+        by_setting = {r["setting"]: r["status"] for r in records}
+        self.assertEqual(by_setting["security.secret_scanning"], "drift")
+        self.assertEqual(by_setting["security.secret_scanning_push_protection"], "skipped")
+
+    def test_read_failure_is_an_error_record(self):
+        with patch.object(rs, "get_repo", side_effect=[
+            {"private": False}, rs.GhError(500, "boom"),
+        ]):
+            records = rs.plan_repo("o/r", {"security": dict(self.CFG)})
+        self.assertEqual([r["status"] for r in records], ["error", "error"])
+
+    def test_omitted_and_null_keys_are_unmanaged(self):
+        with patch.object(rs, "get_repo") as get:
+            self.assertEqual(rs.plan_repo("o/r", {"security": {}}), [])
+            self.assertEqual(
+                rs.plan_repo("o/r", {"security": {"secret_scanning": None}}), []
+            )
+        get.assert_not_called()
+
+    def test_writer_patches_both_keys_in_one_call(self):
+        with patch.object(rs, "gh_api") as api:
+            rs.write_secret_scanning("o/r", self.CFG)
+        api.assert_called_once_with(
+            "repos/o/r",
+            method="PATCH",
+            body={"security_and_analysis": {
+                "secret_scanning": {"status": "enabled"},
+                "secret_scanning_push_protection": {"status": "enabled"},
+            }},
+        )
+
+    def test_writer_disables_with_disabled_status(self):
+        with patch.object(rs, "gh_api") as api:
+            rs.write_secret_scanning("o/r", {"secret_scanning_push_protection": False})
+        self.assertEqual(
+            api.call_args.kwargs["body"],
+            {"security_and_analysis": {
+                "secret_scanning_push_protection": {"status": "disabled"}}},
+        )
+
+    def test_end_to_end_apply_record_reaches_gh_api(self):
+        rec = self._plan(self._repo())[0]
+        with patch.object(rs, "gh_api") as api:
+            rs.apply_record("o/r", rec)
+        api.assert_called_once()
+        self.assertEqual(api.call_args.args, ("repos/o/r",))
+        self.assertEqual(api.call_args.kwargs["method"], "PATCH")
+
+    def test_keys_pass_the_unknown_key_check(self):
+        rs.validate_surfaces("defaults", {"security": dict(self.CFG)})
+
+    def test_archived_repo_is_a_skip(self):
+        repo = dict(self._repo(), archived=True)
+        records = self._plan(repo)
+        self.assertEqual([r["status"] for r in records], ["skipped", "skipped"])
+        for r in records:
+            self.assertIn("archived", r["note"])
+            self.assertNotIn("_writer", r)
+
+    def test_fleet_defaults_turn_both_on_for_every_managed_repo(self):
+        # Declared once in defaults (issue #102); the engine's private and
+        # archived skips, and `manage`, decide which repos it reaches.
+        cfg = rs.load_config(str(SecurityFleetConfigTests.FLEET))
+        self.assertIs(cfg["defaults"]["security"]["secret_scanning"], True)
+        self.assertIs(cfg["defaults"]["security"]["secret_scanning_push_protection"], True)
+        for target in rs.resolve_targets(cfg, None):
+            if not rs.manages(target, "security"):
+                continue
+            security = target["effective"]["security"]
+            self.assertIs(security["secret_scanning"], True, msg=target["repo"])
+            self.assertIs(security["secret_scanning_push_protection"], True,
+                          msg=target["repo"])
 
 
 class WorkflowPermissionsTests(unittest.TestCase):
@@ -3780,6 +3915,9 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
     WERE_FALSE = {
         "Adam-S-Daniel/agentskills", "Adam-S-Daniel/GHA-bench",
         "Adam-S-Daniel/OctopusDeploy-Api", "Adam-S-Daniel/SonosAmpJuicePi",
+    }
+    # Since issue #88 these manage `labels` only, not nothing.
+    LABELS_ONLY = {
         "Adam-S-Daniel/cms-platform", "Adam-S-Daniel/adamdaniel.ai",
         "jodidaniel/jodidaniel.com",
     }
@@ -3825,6 +3963,8 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
             if "labels" in defaults:
                 settings["labels"] = rs.merge_labels(
                     defaults["labels"], (entry.get("overrides") or {}).get("labels"))
+            if entry["name"] in self.LABELS_ONLY:
+                settings = {"labels": settings["labels"]}
             targets.append({"repo": entry["name"], "settings": settings,
                             "manage": entry["manage"] != []})
         return targets
@@ -3841,10 +3981,9 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
         by_value = {}
         for entry in cfg["repos"]:
             by_value.setdefault(tuple(entry["manage"]), set()).add(entry["name"])
-        self.assertEqual(set(by_value), {("all",), ()})
+        self.assertEqual(set(by_value), {("all",), (), ("labels",)})
         self.assertEqual(by_value[()], self.WERE_FALSE)
-        # 19 since security-alerts and waiting-feed joined with manage ["all"]
-        # (2026-10-26).
+        self.assertEqual(by_value[("labels",)], self.LABELS_ONLY)
         self.assertEqual(len(by_value[("all",)]), 19)
 
     def test_diff_output_is_unchanged_apart_from_the_scope_strings(self):
@@ -3862,85 +4001,162 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
             legacy.getvalue()
             .replace("excluded (manage: false)", "excluded (manage: [])")
         )
-        actual = new.getvalue().replace(f"\n  {rs.DIM}managed: all{rs.RESET}", "")
+        actual = new.getvalue()
+        for scope in ("all", "labels"):
+            actual = actual.replace(f"\n  {rs.DIM}managed: {scope}{rs.RESET}", "")
         self.assertEqual(actual, expected)
         self.assertEqual(new_calls, legacy_calls)
         self.assertEqual({m for m, _ in new_calls}, {"GET"})
         self.assertIn("[\x1b[33mDRIFT\x1b[0m]", actual)
 
 
-class SecretScanningTests(unittest.TestCase):
-    """`security.secret_scanning` / `secret_scanning_push_protection`: read
-    from the repo payload's `security_and_analysis`, written as one PATCH,
-    skipped on private repos."""
+class CmsLabelOnlyTests(unittest.TestCase):
+    """The guard that keeps the three cms-platform-managed repos to the
+    fleet-wide label (docs/decisions/0016), and the CLI built on it."""
 
-    CFG = {"secret_scanning": True, "secret_scanning_push_protection": True}
+    FLEET = Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml"
+    CMS = "Adam-S-Daniel/cms-platform"
+    AGENT = {"name": "agent-authored", "color": "D4C5F9", "description": "d"}
 
-    @staticmethod
-    def _payload(private=False, ss="disabled", pp="disabled"):
-        saa = {}
-        if ss is not None:
-            saa["secret_scanning"] = {"status": ss}
-        if pp is not None:
-            saa["secret_scanning_push_protection"] = {"status": pp}
-        return {"private": private, "security_and_analysis": saa}
+    def _resolve(self, defaults_labels=None, overrides_labels=None, manage=None,
+                 name=None):
+        entry = {"name": name or self.CMS,
+                 "manage": ["labels"] if manage is None else manage}
+        if overrides_labels is not None:
+            entry["overrides"] = {"labels": overrides_labels}
+        cfg = {"repos": [entry]}
+        if defaults_labels is not None:
+            cfg["defaults"] = {"labels": defaults_labels}
+        return rs.resolve_targets(cfg, None)
 
-    def test_drift_when_off_carries_the_whole_group(self):
-        with patch.object(rs, "get_repo", return_value=self._payload()):
-            records = rs.plan_repo("o/r", {"security": dict(self.CFG)})
-        by = {r["setting"]: r for r in records}
-        for key in ("security.secret_scanning", "security.secret_scanning_push_protection"):
-            self.assertEqual(by[key]["status"], "drift")
-            self.assertEqual(by[key]["current"], False)
-            self.assertEqual(by[key]["_writer"], ("secret_scanning", None, self.CFG))
+    def _refused(self, **kw):
+        with self.assertRaises(rs.ConfigError) as cm:
+            self._resolve(**kw)
+        return str(cm.exception)
 
-    def test_match_when_on(self):
-        with patch.object(rs, "get_repo", return_value=self._payload(ss="enabled", pp="enabled")):
-            records = rs.plan_repo("o/r", {"security": dict(self.CFG)})
-        self.assertEqual({r["status"] for r in records}, {"match"})
+    def _run(self, *argv):
+        out = io.StringIO()
+        with patch.object(sys, "argv", ["repo_settings.py", *argv]), \
+                contextlib.redirect_stdout(out):
+            rc = rs.main()
+        return rc, out.getvalue()
 
-    def test_private_repo_is_a_skip_and_never_written(self):
-        with patch.object(rs, "get_repo", return_value=self._payload(private=True)):
-            records = rs.plan_repo("o/r", {"security": dict(self.CFG)})
-        self.assertEqual({r["status"] for r in records}, {"skipped"})
-        self.assertTrue(all("Secret Protection" in r["note"] for r in records))
-        self.assertTrue(all("_writer" not in r for r in records))
+    def test_real_fleet_resolves_and_only_three_repos_are_label_only(self):
+        targets = rs.resolve_targets(rs.load_config(str(self.FLEET)), None)
+        cms = [t for t in targets if rs.is_cms_label_only(t["repo"])]
+        self.assertEqual({t["repo"] for t in cms}, set(rs.CMS_LABEL_ONLY_REPOS))
+        for t in cms:
+            self.assertEqual(t["manage"], ["labels"])
+            self.assertEqual(list(t["effective"]), ["labels"])
+            self.assertEqual([l["name"] for l in t["effective"]["labels"]],
+                             ["agent-authored"])
 
-    def test_absent_key_is_a_skip_not_drift(self):
-        with patch.object(rs, "get_repo", return_value=self._payload(pp=None)):
-            records = rs.plan_repo("o/r", {"security": dict(self.CFG)})
-        by = {r["setting"]: r for r in records}
-        self.assertEqual(by["security.secret_scanning"]["status"], "drift")
-        self.assertEqual(by["security.secret_scanning_push_protection"]["status"], "skipped")
+    def test_allowed(self):
+        for name in ("agent-authored", "Agent-Authored"):
+            for repo in (self.CMS, "adam-s-daniel/CMS-Platform"):
+                with self.subTest(name=name, repo=repo):
+                    t = self._resolve(defaults_labels=[{**self.AGENT, "name": name}],
+                                      name=repo)
+                    self.assertEqual(len(t[0]["effective"]["labels"]), 1)
 
-    def test_omitted_keys_are_unmanaged(self):
-        with patch.object(rs, "get_repo") as get:
-            records = rs.plan_repo("o/r", {"security": {}})
-        self.assertEqual(records, [])
-        get.assert_not_called()
+    def test_owned_and_off_allowlist_names_are_refused(self):
+        bad = ("ci", "CI", "cms/draft", "cms/anything", "Decap-CMS/x",
+               "not-decap-created", "content-guard/override", "triage")
+        for name in bad:
+            entry = {"name": name, "color": "ffffff"}
+            with self.subTest(name=name, via="defaults"):
+                self.assertIn(repr(name), self._refused(defaults_labels=[entry]))
+            with self.subTest(name=name, via="overrides"):
+                self.assertIn(repr(name), self._refused(
+                    defaults_labels=[self.AGENT], overrides_labels=[entry]))
 
-    def test_write_is_one_patch_with_both_toggles(self):
-        with patch.object(rs, "gh_api") as api:
-            rs.write_secret_scanning("o/r", dict(self.CFG))
-        api.assert_called_once_with(
-            "repos/o/r", method="PATCH",
-            body={"security_and_analysis": {
-                "secret_scanning": {"status": "enabled"},
-                "secret_scanning_push_protection": {"status": "enabled"},
-            }},
-        )
+    def test_every_label_is_checked_not_the_first_match(self):
+        msg = self._refused(defaults_labels=[
+            self.AGENT, {"name": "ci", "color": "ffffff"},
+            {"name": "triage", "color": "ffffff"}])
+        self.assertIn("'ci'", msg)
+        self.assertIn("'triage'", msg)
+        self.assertNotIn("'agent-authored'", msg)
 
-    def test_apply_record_routes_to_the_writer(self):
-        with patch.object(rs, "write_secret_scanning") as w:
-            rs.apply_record("o/r", {"_writer": ("secret_scanning", None, dict(self.CFG))})
-        w.assert_called_once_with("o/r", self.CFG)
+    def test_bad_name_listed_after_a_good_one(self):
+        msg = self._refused(defaults_labels=[self.AGENT, {"name": "cms/ready", "color": "ffffff"}])
+        self.assertIn("'cms/ready'", msg)
 
-    def test_fleet_defaults_turn_both_on(self):
-        import yaml
-        fleet = yaml.safe_load((Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml").read_text())
-        sec = fleet["defaults"]["security"]
-        self.assertIs(sec["secret_scanning"], True)
-        self.assertIs(sec["secret_scanning_push_protection"], True)
+    def test_other_manage_values_are_refused(self):
+        for manage in (["all"], ["labels", "security"]):
+            with self.subTest(manage=manage):
+                with self.assertRaises(rs.ConfigError) as cm:
+                    self._resolve(defaults_labels=[self.AGENT], manage=manage)
+                self.assertIn('[] or ["labels"]', str(cm.exception))
+
+    def test_manage_empty_checks_no_labels(self):
+        t = self._resolve(defaults_labels=[{"name": "ci", "color": "ffffff"}], manage=[])
+        self.assertEqual(t[0]["effective"], {})
+
+    def test_other_repos_may_carry_any_label(self):
+        t = self._resolve(defaults_labels=[{"name": "ci", "color": "ffffff"}],
+                          name="Adam-S-Daniel/other")
+        self.assertEqual(t[0]["effective"]["labels"][0]["name"], "ci")
+
+    def test_constant_hygiene(self):
+        for name in rs.CMS_LABEL_ALLOWLIST:
+            self.assertFalse(rs._cms_owned(name), name)
+        msg = self._refused(defaults_labels=[{"name": "ci", "color": "ffffff"}])
+        for name in rs.CMS_LABEL_ALLOWLIST:
+            self.assertIn(name, msg)
+        for pat in rs.CMS_OWNED_LABELS:
+            self.assertIn(pat, msg)
+
+    def test_single_repo_shape_is_guarded(self):
+        cfg = {"repo": self.CMS, "labels": [{"name": "ci", "color": "ffffff"}]}
+        with self.assertRaises(rs.ConfigError):
+            rs.resolve_targets(cfg, None)
+        cfg["labels"] = [self.AGENT]
+        self.assertEqual(len(rs.resolve_targets(cfg, None)), 1)
+
+    def test_cms_label_repos_on_the_real_fleet(self):
+        for owner, want in (("Adam-S-Daniel", "adamdaniel.ai,cms-platform"),
+                            ("jodidaniel", "jodidaniel.com")):
+            with self.subTest(owner=owner):
+                rc, out = self._run("cms-label-repos", "--config", str(self.FLEET),
+                                    "--owner", owner)
+                self.assertEqual((rc, out), (0, want + "\n"))
+
+    def test_cms_label_repos_empty_when_none(self):
+        path = _write_yaml(self, 'repos:\n  - name: o/r\n    manage: ["labels"]\n'
+                                 '  - name: Adam-S-Daniel/cms-platform\n    manage: []\n')
+        rc, out = self._run("cms-label-repos", "--config", path, "--owner", "Adam-S-Daniel")
+        self.assertEqual((rc, out), (0, "\n"))
+
+    def test_cms_label_repos_config_error_exits_2(self):
+        path = _write_yaml(self, 'repos:\n  - name: Adam-S-Daniel/cms-platform\n    manage: ["all"]\n')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, _ = self._run("cms-label-repos", "--config", path, "--owner", "Adam-S-Daniel")
+        self.assertEqual(rc, 2)
+
+    def test_apply_cms_label_only_skip_and_only(self):
+        path = _write_yaml(self, 'repos:\n  - name: o/plain\n    manage: ["labels"]\n'
+                                 '  - name: Adam-S-Daniel/cms-platform\n    manage: ["labels"]\n'
+                                 'defaults:\n  labels:\n    - {name: agent-authored, color: D4C5F9}\n')
+        for mode, want in (("skip", ["o/plain"]), ("only", ["Adam-S-Daniel/cms-platform"]),
+                           (None, ["o/plain", "Adam-S-Daniel/cms-platform"])):
+            planned = []
+
+            def fake(repo, settings):
+                planned.append(repo)
+                return []
+
+            argv = ["apply", "--config", path, "--dry-run"]
+            if mode:
+                argv += ["--cms-label-only", mode]
+            with self.subTest(mode=mode), \
+                    patch.object(rs, "plan_repo_records", side_effect=fake):
+                rc, out = self._run(*argv)
+            self.assertEqual(rc, 0)
+            self.assertEqual(planned, want)
+            if mode == "skip":
+                self.assertIn("label-only step", out)
 
 
 class CodeqlDefaultSetupTests(unittest.TestCase):

@@ -95,11 +95,14 @@ Optional sections for high-impact decisions:
 | [0003](0003-scope-skills-evals-roster-auto-merge-as-declared-exception.md) | Scope skills-evals' roster auto-merge as a declared exception to ADR 0001 | Superseded in part (2026-09-29): GitHub App replaced GITHUB_TOKEN |
 | [0004](0004-confine-roster-proposal-branch-to-the-roster-app.md) | Confine skills-evals' roster/proposal branch to the roster App with an extra ruleset | Accepted |
 | [0005](0005-changelog-routine-merges-its-own-pr-through-a-gate.md) | Let the vendor changelog routine merge its own PR through a mechanical gate | Superseded by 0006 (2026-10-02) |
-| [0006](0006-changelog-routine-accumulates-on-a-persistent-branch-owner-merges.md) | Accumulate the changelog routine's work on a persistent branch; the owner merges | Accepted |
+| [0006](0006-changelog-routine-accumulates-on-a-persistent-branch-owner-merges.md) | Accumulate the changelog routine's work on a persistent branch; the owner merges | Accepted; merge half superseded by 0015 (2026-10-27) |
 | [0007](0007-persistent-branches-use-the-persistent-prefix-and-a-deletion-ruleset.md) | Name persistent branches `persistent/<purpose>` and protect them from deletion with a ruleset | Accepted |
 | [0008](0008-let-skills-evals-open-draft-scaffold-prs-with-github-token.md) | Let skills-evals' scaffold gate open draft PRs with GITHUB_TOKEN | Accepted |
 | [0009](0009-allow-pull-request-target-with-a-workflow-scoped-policy-owned-by-name.md) | Allow pull_request_target with a workflow-scoped Actions event policy the engine owns by name | Accepted |
 | [0010](0010-labels-may-be-declared-fleet-wide-and-merge-by-name.md) | Labels may be declared fleet-wide and merge with per-repo labels by name | Accepted |
 | [0011](0011-make-manage-a-required-array-of-surfaces.md) | Make `manage` a required array of surfaces | Accepted |
-| [0012](0012-eval-loop-prs-auto-merge-as-a-declared-exception.md) | Eval-loop PRs auto-merge as a declared exception | Accepted; amended by 0013 (2026-10-26) |
+| [0012](0012-eval-loop-prs-auto-merge-as-a-declared-exception.md) | Eval-loop PRs auto-merge as a declared exception | Accepted; amended by 0013 (2026-10-26) and 0014 (2026-10-27) |
 | [0013](0013-lesson-check-prs-auto-merge-in-agent-guidance.md) | Lesson-check PRs in _agent-guidance auto-merge under ADR 0012 | Accepted |
+| [0014](0014-guidance-loop-prs-use-the-eval-improve-app.md) | Guidance-loop PRs in _agent-guidance use the eval-improve App | Accepted |
+| [0015](0015-changelog-routine-prs-merge-through-a-workflow-gate.md) | The changelog routine's PRs merge through a workflow running its gate | Accepted |
+| [0016](0016-cms-platform-repos-take-allowlisted-labels-only.md) | The cms-platform repos take allowlisted labels only, under a narrowed token | Accepted |

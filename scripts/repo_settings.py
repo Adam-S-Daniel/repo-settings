@@ -49,11 +49,6 @@ Managed settings:
                                                vulnerability_alerts -- apply
                                                order is dependency-aware, see
                                                plan_repo)
-  * security.secret_scanning               -> repos/{repo}  (PATCH
-    security.secret_scanning_push_protection  `security_and_analysis`, one
-                                               call for the pair -- see
-                                               write_secret_scanning; skipped
-                                               on private repos)
   * security.codeql_default_setup          -> repos/{repo}/code-scanning/default-setup
     security.codeql_query_suite               (PATCH, one call for the pair --
                                                see write_codeql_default_setup;
@@ -65,6 +60,11 @@ Managed settings:
   * actions_policies (per-repo only)       -> repos/{repo}/actions/policies  (idempotent
                                                BY NAME; never edits or deletes an
                                                undeclared policy)
+  * security.secret_scanning               -> repos/{repo}  (PATCH
+    security.secret_scanning_push_protection  `security_and_analysis`, one call
+                                               for the pair -- see
+                                               write_secret_scanning; skipped
+                                               on private and archived repos)
   * security.grouped_security_updates      -> NOT APPLYABLE. No REST endpoint
                                                exists at any scope; declared
                                                and always reported `skipped`
@@ -120,6 +120,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fnmatch
 import json
 import re
 import subprocess
@@ -259,6 +260,31 @@ def write_merge_commit_message(repo: str, desired: dict) -> None:
     PATCH carries both keys.
     """
     gh_api(f"repos/{repo}", method="PATCH", body=dict(desired))
+
+
+# The two secret-scanning toggles under `security_and_analysis`, always
+# written together.
+SECRET_SCANNING_KEYS = ("secret_scanning", "secret_scanning_push_protection")
+
+
+def write_secret_scanning(repo: str, desired: dict) -> None:
+    """PATCH every declared secret-scanning toggle in ONE call.
+
+    Push protection depends on secret scanning, so a per-toggle apply that
+    enables both would ask for push protection on a repo whose scanning is
+    still off whenever the records happen to come in that order. One PATCH
+    carrying the whole declared group never passes through that state.
+    """
+    gh_api(
+        f"repos/{repo}",
+        method="PATCH",
+        body={
+            "security_and_analysis": {
+                key: {"status": "enabled" if on else "disabled"}
+                for key, on in desired.items()
+            }
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -457,44 +483,6 @@ def write_automated_security_fixes(repo: str, desired: bool) -> None:
     value shape as write_vulnerability_alerts above, and for the same reason:
     this endpoint too takes PUT-to-enable / DELETE-to-disable with no body."""
     gh_api(f"repos/{repo}/automated-security-fixes", method="PUT" if desired else "DELETE")
-
-
-# The secret scanning toggles, in dependency order: push protection needs
-# secret scanning on.
-SECRET_SCANNING_KEYS = ("secret_scanning", "secret_scanning_push_protection")
-
-
-def read_secret_scanning(repo_payload: dict) -> dict:
-    """Return {key: bool} for each secret scanning toggle the repo payload
-    reports. A key is ABSENT, not False, when `security_and_analysis` does not
-    carry it: GitHub omits the object below admin access, and omits the
-    feature where the plan does not offer it. Absent is a skip, never drift
-    (the same rule AGENTS.md states for the merge-setting fields)."""
-    saa = repo_payload.get("security_and_analysis") or {}
-    out = {}
-    for key in SECRET_SCANNING_KEYS:
-        status = (saa.get(key) or {}).get("status")
-        if status in ("enabled", "disabled"):
-            out[key] = status == "enabled"
-    return out
-
-
-def write_secret_scanning(repo: str, desired: dict) -> None:
-    """PATCH the declared secret scanning group in ONE call.
-
-    One call, not one per toggle, for the same reason as write_merge_methods:
-    push protection cannot be on while secret scanning is off, so a per-toggle
-    apply could ask GitHub for that invalid state depending on record order.
-    Sending the pair together never does, and re-sending it is idempotent.
-    """
-    body = {
-        "security_and_analysis": {
-            key: {"status": "enabled" if desired[key] else "disabled"}
-            for key in SECRET_SCANNING_KEYS
-            if key in desired
-        }
-    }
-    gh_api(f"repos/{repo}", method="PATCH", body=body)
 
 
 CODEQL_QUERY_SUITES = ("default", "extended")
@@ -1348,8 +1336,7 @@ SURFACE_KEYS = {
         "vulnerability_alerts",
         "automated_security_fixes",
         "grouped_security_updates",
-        "secret_scanning",
-        "secret_scanning_push_protection",
+        *SECRET_SCANNING_KEYS,
         "codeql_default_setup",
         "codeql_query_suite",
     ),
@@ -1364,6 +1351,31 @@ MANAGE_ACCEPTED = (
     f"added later), [] for none, or one or more of {', '.join(SURFACES)}, in "
     f"that order"
 )
+
+# The three cms-platform-managed repos (docs/decisions/0016). cms-platform owns
+# every surface but one through its own manifest, so here they may manage
+# `labels` and nothing else, and only the names on CMS_LABEL_ALLOWLIST: the
+# fleet-wide default label the engine must create there. CMS_OWNED_LABELS are
+# fnmatch patterns of the label names cms-platform's workflows (and Decap, for
+# `decap-cms/*`) create and own; the engine must never write them. Names and
+# patterns compare case-insensitively, as on GitHub.
+CMS_LABEL_ONLY_REPOS = (
+    "Adam-S-Daniel/adamdaniel.ai",
+    "Adam-S-Daniel/cms-platform",
+    "jodidaniel/jodidaniel.com",
+)
+CMS_LABEL_ALLOWLIST = ("agent-authored",)
+CMS_OWNED_LABELS = (
+    "ci",
+    "cms/*",
+    "cms/draft",
+    "cms/preview-only",
+    "cms/ready",
+    "content-guard/override",
+    "decap-cms/*",
+    "not-decap-created",
+)
+CMS_LABEL_ONLY_MANAGE = ("labels",)
 
 
 def _json(value: Any) -> str:
@@ -1533,6 +1545,50 @@ def effective_settings(declared: dict, manage: list[str]) -> dict:
     return {k: copy.deepcopy(v) for k, v in declared.items() if k in manage}
 
 
+def is_cms_label_only(repo: str) -> bool:
+    return repo.casefold() in {r.casefold() for r in CMS_LABEL_ONLY_REPOS}
+
+
+def _cms_owned(name: str) -> bool:
+    return any(
+        fnmatch.fnmatchcase(name.casefold(), pat.casefold())
+        for pat in CMS_OWNED_LABELS
+    )
+
+
+def check_cms_label_only(target: dict) -> None:
+    """Refuse a config that would let the engine touch more than the fleet-wide
+    label in a cms-platform-managed repo (docs/decisions/0016). Runs for every
+    target in CMS_LABEL_ONLY_REPOS, in both config shapes."""
+    if not is_cms_label_only(target["repo"]):
+        return
+    where = f"repos[{target['repo']}]"
+    manage = target["manage"]
+    if manage not in ([], list(CMS_LABEL_ONLY_MANAGE)):
+        raise ConfigError(
+            f"error: {where}: `manage` is {_json(manage)}; a cms-platform-managed "
+            f"repo accepts only [] or {_json(list(CMS_LABEL_ONLY_MANAGE))}, because "
+            f"cms-platform owns every other surface"
+        )
+    if not manages(target, "labels"):
+        return  # labels never reach the repo, so none are checked
+    allowed = {n.casefold() for n in CMS_LABEL_ALLOWLIST}
+    refused = []
+    # EVERY entry, not the first bad one: the message names them all.
+    for entry in target["effective"].get("labels") or []:
+        if not isinstance(entry, dict):
+            continue  # build_label_specs refuses a non-map entry
+        name = str(entry.get("name"))
+        if name.casefold() not in allowed or _cms_owned(name):
+            refused.append(name)
+    if refused:
+        raise ConfigError(
+            f"error: {where}: label(s) {', '.join(repr(n) for n in refused)} are not "
+            f"allowed; this repo may carry only {', '.join(CMS_LABEL_ALLOWLIST)} "
+            f"(cms-platform owns labels matching {', '.join(CMS_OWNED_LABELS)})"
+        )
+
+
 def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
     """Validate a config and resolve it into one target per repo:
     `{"repo", "manage", "declared", "effective"}`. `declared` is the repo's
@@ -1606,14 +1662,14 @@ def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
                 # name clash (names compare case-insensitively, as on GitHub).
                 declared["labels"] = merge_labels(defaults["labels"], overrides.get("labels"))
             _validate_builders(where, declared)
-            targets.append(
-                {
-                    "repo": name,
-                    "manage": manage,
-                    "declared": declared,
-                    "effective": effective_settings(declared, manage),
-                }
-            )
+            target = {
+                "repo": name,
+                "manage": manage,
+                "declared": declared,
+                "effective": effective_settings(declared, manage),
+            }
+            check_cms_label_only(target)
+            targets.append(target)
         return targets
     repo_field = cfg.get("repo")
     # `repo:` is overloaded in this shape: the pre-existing convention is the
@@ -1636,14 +1692,14 @@ def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
     validate_surfaces("top level", declared)
     _validate_builders(repo, declared)
     manage = [s for s in SURFACES if s in declared]
-    return [
-        {
-            "repo": repo,
-            "manage": manage,
-            "declared": declared,
-            "effective": effective_settings(declared, manage),
-        }
-    ]
+    target = {
+        "repo": repo,
+        "manage": manage,
+        "declared": declared,
+        "effective": effective_settings(declared, manage),
+    }
+    check_cms_label_only(target)
+    return [target]
 
 
 # --------------------------------------------------------------------------- #
@@ -1867,44 +1923,68 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
             )
         )
 
-    # Secret scanning + push protection. Free for public repos; on a private
-    # repo it needs GitHub Secret Protection, which a personal account cannot
-    # buy, so private repos get an explicit skip rather than a write GitHub
-    # refuses (or, worse, accepts and ignores, as allow_auto_merge does).
-    ss_wanted = {k: bool(security_cfg[k]) for k in SECRET_SCANNING_KEYS if k in security_cfg}
+    # -- secret scanning + push protection ----------------------------------- #
+    # Free on public repos. On a private repo without GitHub Secret Protection
+    # (Advanced Security) the API refuses them, and an archived repo is
+    # read-only, so both plan a skip rather than a write that can only fail.
+    ss_wanted = {
+        key: bool(security_cfg[key])
+        for key in SECRET_SCANNING_KEYS
+        if security_cfg.get(key) is not None
+    }
     if ss_wanted:
-        try:
-            private = is_private()
-            payload = None if private else get_repo(repo)
-        except GhError as e:
-            records.extend(_err(f"security.{k}", v, e) for k, v in ss_wanted.items())
-        else:
-            if private:
-                records.extend(
-                    _skip(f"security.{k}", v,
-                          "private repo -- secret scanning needs GitHub Secret Protection "
-                          "(not offered to personal accounts)")
-                    for k, v in ss_wanted.items()
+        if is_private():
+            for key, desired in ss_wanted.items():
+                records.append(
+                    _skip(f"security.{key}", desired,
+                          "private repo -- secret scanning needs GitHub Secret "
+                          "Protection (Advanced Security), which the API refuses "
+                          "without")
                 )
+        else:
+            try:
+                repo_obj = get_repo(repo)
+            except GhError as e:
+                for key, desired in ss_wanted.items():
+                    records.append(_err(f"security.{key}", desired, e))
             else:
-                live = read_secret_scanning(payload)
-                for key, desired_v in ss_wanted.items():
-                    if key not in live:
-                        records.append(_skip(
-                            f"security.{key}", desired_v,
-                            "security_and_analysis does not report it (token lacks "
-                            "Administration, or the plan does not offer it)",
-                        ))
-                        continue
-                    records.append({
-                        "setting": f"security.{key}",
-                        "status": "match" if live[key] == desired_v else "drift",
-                        "current": live[key],
-                        "desired": desired_v,
-                        # Every record carries the WHOLE declared group: see
-                        # write_secret_scanning for why it is one PATCH.
-                        "_writer": ("secret_scanning", None, ss_wanted),
-                    })
+                if repo_obj.get("archived"):
+                    # An archived repo is read-only: the PATCH would fail, and
+                    # nothing new can be pushed to it to leak a secret.
+                    for key, desired in ss_wanted.items():
+                        records.append(
+                            _skip(f"security.{key}", desired,
+                                  "archived repo -- read-only, nothing to protect")
+                        )
+                else:
+                    # Read defensively, like the repo-field blocks below:
+                    # `security_and_analysis` is returned only to a token that
+                    # may administer the repo, and a KeyError here would
+                    # escape plan_repo_records' GhError-only guard.
+                    saa = repo_obj.get("security_and_analysis")
+                    for key, desired in ss_wanted.items():
+                        entry = saa.get(key) if isinstance(saa, dict) else None
+                        status = entry.get("status") if isinstance(entry, dict) else None
+                        if status not in ("enabled", "disabled"):
+                            records.append(
+                                _skip(f"security.{key}", desired,
+                                      f"GitHub did not return "
+                                      f"security_and_analysis.{key} for this repo "
+                                      "(token scope or payload shape) -- leaving "
+                                      "it unmanaged")
+                            )
+                            continue
+                        current = status == "enabled"
+                        records.append(
+                            {
+                                "setting": f"security.{key}",
+                                "status": "match" if current == desired else "drift",
+                                "current": current,
+                                "desired": desired,
+                                # The WHOLE declared pair: see write_secret_scanning.
+                                "_writer": ("secret_scanning", None, ss_wanted),
+                            }
+                        )
 
     # CodeQL default setup. Free on public repos; on a private repo it needs
     # GitHub Code Security, which a personal account cannot buy, so private
@@ -2677,8 +2757,18 @@ def cmd_diff(args) -> int:
 def cmd_apply(args) -> int:
     cfg = load_config(args.config)
     targets = _filter_owner(resolve_targets(cfg, args.repo), getattr(args, "owner", None))
+    # The workflow applies the cms-platform repos in their own step, under a
+    # token that can write issues and nothing else (docs/decisions/0016).
+    mode = getattr(args, "cms_label_only", None)
     any_error = False
     for t in targets:
+        if mode and is_cms_label_only(t["repo"]) != (mode == "only"):
+            if mode == "skip":
+                print(
+                    f"\n{t['repo']}\n  {DIM}applied by the label-only step "
+                    f"(--cms-label-only only){RESET}"
+                )
+            continue
         if not any(manages(t, s) for s in SURFACES):
             print(f"\n{t['repo']}\n  {DIM}{manage_label(t)}{RESET}")
             continue
@@ -2705,6 +2795,20 @@ def cmd_apply(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+def cmd_cms_label_repos(args) -> int:
+    """One line: the names (after the `/`) of this owner's label-managing
+    cms-platform repos, comma-separated, for the workflow's token mint."""
+    cfg = load_config(args.config)
+    targets = _filter_owner(resolve_targets(cfg, None), args.owner)
+    names = sorted(
+        t["repo"].split("/", 1)[1]
+        for t in targets
+        if is_cms_label_only(t["repo"]) and manages(t, "labels")
+    )
+    print(",".join(names))
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="repo-settings-as-code for GitHub")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2724,7 +2828,21 @@ def main() -> int:
     a.add_argument("--repo", help="override/set target for single-repo config")
     a.add_argument("--owner", help="only process repos under this owner (account)")
     a.add_argument("--dry-run", action="store_true", help="preview only")
+    a.add_argument(
+        "--cms-label-only",
+        choices=("skip", "only"),
+        help="skip the cms-platform label-only repos, or apply only them "
+        "(default: every target)",
+    )
     a.set_defaults(func=cmd_apply)
+
+    cl = sub.add_parser(
+        "cms-label-repos",
+        help="print the owner's label-managing cms-platform repos, comma-separated",
+    )
+    cl.add_argument("--config", required=True)
+    cl.add_argument("--owner", required=True)
+    cl.set_defaults(func=cmd_cms_label_repos)
 
     c = sub.add_parser(
         "coverage",

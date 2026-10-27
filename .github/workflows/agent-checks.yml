@@ -19,10 +19,12 @@ jobs:
   agent-checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Verify action lockfile
+        uses: Adam-S-Daniel/verify-actions-lock@v1.1.0
       - name: Run the commit-time checks over this change
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}

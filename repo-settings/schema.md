@@ -95,6 +95,11 @@ security:
   # converging it -- see "security:" below for why this repo does the latter).
   grouped_security_updates: true
 
+  # Secret scanning and push protection. Public repos only -- see "Secret
+  # scanning" below. Omit either key, or set it to null, to leave it unmanaged.
+  secret_scanning: true
+  secret_scanning_push_protection: true
+
 ruleset:
   # Omit the whole block, or set enabled: false, to leave protection unmanaged.
   # PUBLIC repos only -- private repos need GitHub Pro (API 403); the engine
@@ -364,9 +369,11 @@ comes from each element's `name:` and `repo:` is free to be a settings map.
 
 ### `security:` -- Dependabot alerts, security updates and secret scanning
 
-Three leaves, two of them applyable. Like `repo:` above these are ordinary
-per-repo toggles, not Actions-specific and not the ruleset -- but unlike
-`repo:`, two of the three DO need downgrade handling, because the read (not
+Five leaves. The three Dependabot leaves are below, two of them applyable; the
+two secret-scanning leaves are under "Secret scanning" at the end of this
+section. Like `repo:` above, the Dependabot leaves are ordinary per-repo
+toggles, not Actions-specific and not the ruleset -- but unlike `repo:`, two
+of the three DO need downgrade handling, because the read (not
 the write) can fail on a scope the fan-out App's grant does not cover on every
 installation.
 
@@ -394,15 +401,6 @@ security:
   codeql_default_setup: true
   codeql_query_suite: extended
 ```
-
-**Secret scanning.** Both toggles are read from the repo's
-`security_and_analysis` object (`GET repos/{repo}`) and written together in one
-`PATCH repos/{repo}` with `{"security_and_analysis": {...}}`, so a run never
-asks for push protection on with secret scanning off. On a **private** repo
-both are a `skipped` record: secret scanning there needs GitHub Secret
-Protection, which a personal account cannot buy. A toggle missing from
-`security_and_analysis` (a low-scope token, or a plan that does not offer it)
-is also a skip, never drift.
 
 **CodeQL default setup.** Read from `GET repos/{repo}/code-scanning/default-setup`
 (`state == "configured"`, plus `query_suite`) and written in one
@@ -498,6 +496,26 @@ blocked, and here is why" -- which is the true state. See
 [docs/decisions/0002](../docs/decisions/0002-declare-dependabot-security-settings-including-the-unenforceable-one.md)
 for the full reasoning.
 
+#### Secret scanning
+
+`secret_scanning` and `secret_scanning_push_protection` live on the repository
+object, under `security_and_analysis.<key>.status` (`"enabled"` or
+`"disabled"`). The engine reads them from `GET repos/{repo}` and writes them
+with one `PATCH repos/{repo}` carrying every declared key, so push protection
+is never asked for on a repo whose scanning is still off.
+
+- **Private repos are skipped.** Both are free on public repos; on a private
+  repo they need GitHub Secret Protection (Advanced Security), and the API
+  refuses them without it.
+- **A missing field is a skip, never drift.** `security_and_analysis` is
+  returned only to a token that may administer the repo. Below that the key is
+  absent, and the engine records a skip, the same handling as the merge-setting
+  fields.
+- **Archived repos are skipped.** An archived repo is read-only, so the PATCH
+  would fail.
+- **Declared in `defaults:`** (issue #102), so every managed public repo gets
+  both.
+
 ## Fleet / fan-out shape
 
 One document describing many repos. The top level is a map with two keys:
@@ -541,6 +559,20 @@ of each repo, after `defaults`, `overrides` and the label merge are applied. A
 surface reaches the planner only when `manage` names it, so the filter fails
 closed. `diff`, `apply` and `coverage` print each repo's scope as `managed:
 all`, `managed: labels, security` or `excluded (manage: [])`.
+
+**The cms-platform-managed repos** (`CMS_LABEL_ONLY_REPOS` in the engine:
+`Adam-S-Daniel/cms-platform`, `Adam-S-Daniel/adamdaniel.ai`,
+`jodidaniel/jodidaniel.com`) accept only `[]` or `["labels"]`, because
+cms-platform owns every other surface. When they manage labels, every label
+reaching them, defaults included, must be on `CMS_LABEL_ALLOWLIST` (today
+`agent-authored`) and must match none of `CMS_OWNED_LABELS` (`ci`, `cms/*`,
+`decap-cms/*`, `not-decap-created`, `content-guard/override`, ...), compared
+case-insensitively. Anything else refuses the whole config, naming every
+offending label (docs/decisions/0016). A new fleet-wide default label therefore
+needs a deliberate allowlist change before it can land. `apply
+--cms-label-only skip` leaves these repos out and `--cms-label-only only` applies
+just them; the workflow runs the second under a token minted with only Issues
+write, and `cms-label-repos --owner <owner>` prints the names it narrows to.
 
 ```yaml
 defaults:
@@ -608,6 +640,9 @@ logging a `skip` with the reason:
 | Private repo | `actions.fork_pr_approval` | 422 "not allowed for private repositories" |
 | Private repo without GitHub Pro | `ruleset` | 403 "Upgrade to GitHub Pro" |
 | Private repo without GitHub Pro | `repo.allow_auto_merge` | **none -- 200, then silently ignored** |
+| Private repo | `security.secret_scanning`, `security.secret_scanning_push_protection` | refused without GitHub Secret Protection (skipped before asking) |
+| Archived repo | `security.secret_scanning`, `security.secret_scanning_push_protection` | read-only repo (skipped before asking) |
+| Private repo | `security.codeql_default_setup`, `security.codeql_query_suite` | needs GitHub Code Security (skipped before asking) |
 
 That third row is the dangerous one, because it is the only downgrade with **no
 error to catch**. GitHub offers auto-merge on private repos only on

@@ -39,9 +39,9 @@ defaults:
     # is the only form that works anywhere in the fleet.
     #
     # NOT fleet-wide in practice: the three cms-platform-managed repos
-    # (cms-platform, adamdaniel.ai, jodidaniel.com) carry `manage: []`
-    # below, so this never reaches them. That is deliberate and load-bearing,
-    # not an oversight — their Decap publish chain arms SQUASH auto-merge on
+    # (cms-platform, adamdaniel.ai, jodidaniel.com) carry
+    # `manage: ["labels"]` below, so this (a `repo:` key) still never reaches
+    # them. That is deliberate and load-bearing, not an oversight — their Decap publish chain arms SQUASH auto-merge on
     # every editorial PR, and squash is what collapses an editor's many
     # per-save commits into one `publish: <title>` commit. They keep squash on,
     # governed by cms-platform's own repo-settings.yml.
@@ -68,7 +68,7 @@ defaults:
     # 2026-09-15). Its merge subjects switch from `Merge pull request` to PR
     # titles between 2026-04-29 and 2026-05-11, before this file existed, and no
     # reason is recorded in its docs, its history or here. Every other repo --
-    # the three `manage: []` cms-platform repos included, which this never
+    # the three `manage: ["labels"]` cms-platform repos included, which this never
     # reaches -- was already on MERGE_MESSAGE/PR_TITLE, so declaring it changes
     # agentskills alone.
     #
@@ -105,8 +105,9 @@ defaults:
     #
     # NOT plan-gated, unlike allow_auto_merge above: GitHub honours this on
     # private repos too, so no downgrade/skip handling is needed. It does NOT
-    # reach the three cms-platform-managed repos, which carry `manage: []`
-    # below and are governed by cms-platform's own repo-settings.yml.
+    # reach the three cms-platform-managed repos, which carry
+    # `manage: ["labels"]` below and are governed by cms-platform's own
+    # repo-settings.yml.
     delete_branch_on_merge: true
   actions:
     sha_pinning_required: true
@@ -174,17 +175,18 @@ defaults:
     # which is the truth. This is the one line in `defaults:` that a run can
     # never make converge; see docs/decisions/0002 for the reasoning in full.
     grouped_security_updates: true
-    # Secret scanning and push protection (owner, 2026-10-26: "Turn on secret
-    # scanning"). Free on public repos. On private repos it needs GitHub
-    # Secret Protection, which a personal account cannot buy, so the engine
-    # records an explicit skip there instead of a write GitHub would refuse.
-    # Before this, 12 repos had it off with nobody having decided that
-    # (security-alerts snapshot, 2026-10-26).
+    # Secret scanning and push protection: a pasted token is caught at scan
+    # time, and push protection refuses the push before it lands in public
+    # history. Both are free on public repos. The engine skips them on a
+    # private or archived repo, and `manage: []` repos are never planned, so
+    # this reaches only managed public repos (issue #102). On 2026-10-27 that
+    # turned on four: _agent-guidance, rss-inator, squarespacetemp and
+    # scratch-claude-002. Every other managed public repo already had both on.
     secret_scanning: true
     secret_scanning_push_protection: true
     # CodeQL default setup (owner, 2026-10-26: "turn on codeql for all public
-    # repos"). Free on public repos; private repos are skipped for the same
-    # plan reason as secret scanning. GitHub picks the languages itself
+    # repos"). Free on public repos; private repos are skipped because CodeQL
+    # there needs GitHub Code Security. GitHub picks the languages itself
     # (GitHub Actions workflows count, so every repo here has one), and
     # `codeql_query_suite` is left unmanaged: `default` is GitHub's own
     # default, and a repo that wants `extended` can declare it in overrides.
@@ -352,8 +354,10 @@ repos:
   # `cancelled` by hitting a wall), and an unfiltered `pull_request:` trigger
   # (all three report on every PR, never skipped by a path filter).
   #
-  # Secret scanning + push protection: enabled here since before 2026-09-24,
-  # and declared fleet-wide in `defaults: security:` since 2026-10-26.
+  # Secret scanning + push protection: already enabled on this repo
+  # (`security_and_analysis.secret_scanning.status` /
+  # `.secret_scanning_push_protection.status`, both "enabled", checked
+  # 2026-09-24); managed through `defaults:` since issue #102.
   #
   # Fourth check, `plugin-runtime-approval` (added 2026-10-08): the job in
   # .github/workflows/plugin-runtime-review.yml that holds a PR changing a
@@ -601,6 +605,12 @@ repos:
           target_branches: ["persistent/**"]
           rules: [deletion]
 
+  # Public (read 2026-10-27; listed with the private repos below until then).
+  # The engine reads visibility live, so the ruleset and fork-PR approval
+  # already applied here; only this file's grouping was stale.
+  - name: Adam-S-Daniel/rss-inator
+    manage: ["all"]
+
   # --- private: only SHA pinning applies. fork-PR approval (422), rulesets
   #     (403, needs Pro) and allow_auto_merge are all auto-skipped by the engine
   #     with an explicit reason.
@@ -608,11 +618,10 @@ repos:
   #     allow_auto_merge is the non-obvious one: auto-merge is Pro/Team/
   #     Enterprise-only on private repos, and below that the PATCH returns 200
   #     and is silently ignored -- so it looked like it applied. Measured
-  #     2026-08-11: these four went `CHANGED -> True` on the apply and read back
+  #     2026-08-11: the four private repos of the time (4A, rss-inator, jc,
+  #     agentskills-private) went `CHANGED -> True` on the apply and read back
   #     False seven minutes later, while a public repo in the same run stuck.
   #     See schema.md, "Downgrade behavior". ---
-  - name: Adam-S-Daniel/rss-inator
-    manage: ["all"]
   - name: Adam-S-Daniel/jc
     manage: ["all"]
   # Renamed from Adam-S-Daniel/agentskills-private 2026-09-24 (companion
@@ -623,15 +632,29 @@ repos:
     manage: ["all"]
   - name: Adam-S-Daniel/4A
     manage: ["all"]
-  # Daily security alert snapshot, triage record and dismiss workflow
-  # (created 2026-10-26). Private on purpose: its data names unpatched
-  # vulnerabilities.
-  - name: Adam-S-Daniel/security-alerts
-    manage: ["all"]
-  # Private repo, previously in no list at all (security-alerts snapshot,
-  # 2026-10-26, found it unmanaged).
+  # why: the feed writer ("Update waiting feed ...") and agents-md-sync push
+  # straight to `main` as the owner. That works because the fleet default's
+  # `admin_bypass: always` lets an admin push directly, and while the repo is
+  # private the ruleset is skipped anyway (403). If it ever goes public,
+  # revisit the writer per docs/decisions/0001: a results branch or a declared
+  # bypass. Its only workflow is agent-checks, the fleet default check.
   - name: Adam-S-Daniel/waiting-feed
     manage: ["all"]
+  # why: collect.yml writes its data to `persistent/alerts-data`, never to
+  # `main`, so that branch outlives its PRs and needs the deletion-only entry
+  # (docs/decisions/0007). A ruleset on a private repo plans as a 403 skip;
+  # it is declared anyway (docs/decisions/0002). tests.yml runs its `unit` job
+  # on pull_request with no paths filter or concurrency group, so it is
+  # required beside the fleet default.
+  - name: Adam-S-Daniel/security-alerts
+    manage: ["all"]
+    overrides:
+      ruleset:
+        required_status_checks: [agent-checks, unit]
+      extra_rulesets:
+        - name: persistent branches
+          target_branches: ["persistent/**"]
+          rules: [deletion]
 
   # --- this repo, managing itself. Previously absent from this list entirely --
   #     not even as an excluded element -- so the repo that holds the
@@ -700,12 +723,17 @@ repos:
   - name: Adam-S-Daniel/SonosAmpJuicePi
     manage: []
 
-  # --- cms-platform + consumers: owned by the platform's OWN settings-as-code
-  #     (repo-settings.yml manifest + rulesets). Excluded to avoid a competing
-  #     source of truth (GitHub enforces the union of rulesets). ---
+  # --- cms-platform + consumers: cms-platform owns every other surface through
+  #     its OWN settings-as-code (repo-settings.yml manifest + rulesets), so a
+  #     competing source of truth is excluded (GitHub enforces the union of
+  #     rulesets). Labels only here, and the engine refuses any label name that
+  #     is not on CMS_LABEL_ALLOWLIST or that cms-platform owns
+  #     (scripts/repo_settings.py, docs/decisions/0016).
+  # why: so the fleet-wide `agent-authored` label (_agent-guidance ADR 0023)
+  #     exists there and agents can apply it (issue #88). ---
   - name: Adam-S-Daniel/cms-platform
-    manage: []
+    manage: ["labels"]
   - name: Adam-S-Daniel/adamdaniel.ai
-    manage: []
+    manage: ["labels"]
   - name: jodidaniel/jodidaniel.com
-    manage: []
+    manage: ["labels"]

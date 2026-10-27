@@ -362,10 +362,53 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertNotIn("if", gate, "the self-check must never be skipped")
         self.assertFalse(gate.get("continue-on-error"), "the self-check must fail the job")
         apply_indexes = [i for i, s in enumerate(steps) if runs_apply(s)]
-        # One: a dry run is the plan alone now, never a gated step (#116).
-        self.assertEqual(len(apply_indexes), 1, "expected exactly one apply step")
+        # Two: the admin Apply and the cms-platform labels-only Apply (#88). A
+        # dry run is the plan alone now, never a gated step (#116).
+        self.assertEqual(len(apply_indexes), 2, "expected exactly two apply steps")
         for i in apply_indexes:
             self.assertLess(gate_index, i, steps[i].get("name"))
+
+    def _apply_steps(self):
+        steps = [s for s in self.apply["steps"] if runs_apply(s)]
+        by_mode = {}
+        for s in steps:
+            argv = shlex.split(s["run"])
+            self.assertIn("--cms-label-only", argv, s.get("name"))
+            by_mode[argv[argv.index("--cms-label-only") + 1]] = s
+        return by_mode
+
+    def test_every_apply_step_says_which_side_of_the_cms_split_it_is(self):
+        by_mode = self._apply_steps()
+        self.assertEqual(set(by_mode), {"skip", "only"})
+        self.assertEqual(by_mode["skip"]["env"]["GH_TOKEN"], "${{ steps.token.outputs.token }}")
+        self.assertEqual(by_mode["only"]["env"]["GH_TOKEN"],
+                         "${{ steps.token_labels.outputs.token }}")
+
+    def test_labels_token_is_narrowed_to_issues_write_on_the_cms_repos(self):
+        step = next(s for s in self.apply["steps"] if s.get("id") == "token_labels")
+        self.assertTrue(step["uses"].startswith(MINT_ACTION))
+        with_ = step["with"]
+        self.assertEqual(set(with_), {"client-id", "private-key", "owner",
+                                      "repositories", "permission-issues"})
+        self.assertEqual(with_["permission-issues"], "write")
+        self.assertEqual(with_["repositories"], "${{ steps.cms_label_repos.outputs.repos }}")
+
+    def test_admin_token_mint_is_not_narrowed_or_changed(self):
+        step = next(s for s in self.apply["steps"] if s.get("id") == "token")
+        self.assertEqual(set(step["with"]), {"client-id", "private-key", "owner"})
+
+    def test_label_leg_runs_after_an_admin_failure_but_never_past_the_gate(self):
+        steps = {s.get("id"): s for s in self.apply["steps"] if s.get("id")}
+        leg = [steps["cms_label_repos"], steps["token_labels"], self._apply_steps()["only"]]
+        for step in leg:
+            cond = str(step.get("if"))
+            with self.subTest(step=step.get("name")):
+                self.assertIn("steps.environment_gate.outcome == 'success'",
+                              top_level_conjuncts(cond))
+                self.assertNotIn("always()", cond)
+        for step in leg[1:]:
+            self.assertIn("steps.cms_label_repos.outputs.repos != ''",
+                          top_level_conjuncts(str(step["if"])))
 
     def test_self_check_asks_about_this_repo_and_environment(self):
         env = next(s for s in self.apply["steps"] if s.get("id") == GATE_STEP_ID)["env"]
@@ -533,12 +576,13 @@ def apply_scenarios():
 
 
 def apply_should_run(sc):
-    """Issue #116's three conditions. Schedule is the backstop and runs even
-    when the plan failed; everything else needs a successful plan."""
+    """Issue #116's three conditions, with schedule narrowed by PR #113: it
+    applies on planned drift, or when the plan did not succeed (fail closed);
+    everything else needs a successful plan."""
     if sc["run_cancelled"] or not sc["client_id"] or sc["event"] == "pull_request":
         return False
     if sc["event"] == "schedule":
-        return True
+        return sc["result"] != "success" or sc["needs_apply"] == "true"
     if sc["result"] != "success":
         return False
     if sc["event"] == "push":
@@ -586,11 +630,14 @@ class ApplyConditionTests(unittest.TestCase):
                 with self.subTest(**sc):
                     self.assertFalse(apply_runs(self.apply, sc))
 
-    def test_schedule_always_reaches_apply(self):
-        for sc in apply_scenarios():
-            if sc["event"] == "schedule" and sc["client_id"] and not sc["run_cancelled"]:
-                with self.subTest(**sc):
-                    self.assertTrue(apply_runs(self.apply, sc))
+    def test_schedule_asks_for_approval_only_on_drift_or_a_failed_plan(self):
+        base = {"event": "schedule", "client_id": "x", "dry_run": None,
+                "force_apply": None, "run_cancelled": False}
+        self.assertFalse(apply_runs(self.apply, dict(base, result="success", needs_apply="false")))
+        self.assertTrue(apply_runs(self.apply, dict(base, result="success", needs_apply="true")))
+        for result in ("failure", "skipped", "cancelled"):
+            with self.subTest(result=result):
+                self.assertTrue(apply_runs(self.apply, dict(base, result=result, needs_apply="")))
 
     def test_push_applies_only_on_planned_drift(self):
         base = {"event": "push", "client_id": "x", "result": "success",
