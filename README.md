@@ -159,7 +159,7 @@ configured, the workflow **skips itself** (guarded on
    `REPO_SETTINGS_READ_APP_CLIENT_ID` and secret
    `REPO_SETTINGS_READ_APP_PRIVATE_KEY` (repo level). Until the variable
    exists, `drift` is skipped, and `plan` fails, which withholds the apply
-   except on the weekly schedule. Reads that need write come back as skips,
+   except on the weekly schedule, where a failed plan still asks for it. Reads that need write come back as skips,
    never drift.
 
 After that, every push to `main` (config/script changes), weekly schedule and
@@ -172,10 +172,16 @@ only when:
 - the plan found drift, on a push or on a dispatch that is not a dry run;
 - a dispatch that is not a dry run sets `force_apply`, for an apply the plan
   saw no reason for;
-- the run is the weekly schedule, always, even after a failed plan. The read
-  token cannot see ruleset `bypass_actors` or the repo merge flags (both are
-  skips), so drift there never shows in the plan; this backstop costs one
-  approval a week.
+- the run is the weekly schedule and the plan found drift, or the plan
+  failed (a run that cannot rule drift out still asks).
+
+The read token cannot see ruleset `bypass_actors`, Actions policies or the
+repo merge flags (all are skips), so drift confined to those never shows in
+the plan, on schedule included. That is a deliberate trade
+([#113](https://github.com/Adam-S-Daniel/repo-settings/pull/113)): no weekly
+approval for a run that changes nothing, in exchange for no weekly backstop on
+those three. A push or dispatch that applies for other drift still converges
+them, and so does a dispatch with `force_apply`.
 
 A dry-run dispatch is the plan alone and asks for no approval. On pull
 requests, the workflow reports drift only and fails the `drift` check if there

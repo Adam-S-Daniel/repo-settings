@@ -533,12 +533,13 @@ def apply_scenarios():
 
 
 def apply_should_run(sc):
-    """Issue #116's three conditions. Schedule is the backstop and runs even
-    when the plan failed; everything else needs a successful plan."""
+    """Issue #116's three conditions, with schedule narrowed by PR #113: it
+    applies on planned drift, or when the plan did not succeed (fail closed);
+    everything else needs a successful plan."""
     if sc["run_cancelled"] or not sc["client_id"] or sc["event"] == "pull_request":
         return False
     if sc["event"] == "schedule":
-        return True
+        return sc["result"] != "success" or sc["needs_apply"] == "true"
     if sc["result"] != "success":
         return False
     if sc["event"] == "push":
@@ -586,11 +587,14 @@ class ApplyConditionTests(unittest.TestCase):
                 with self.subTest(**sc):
                     self.assertFalse(apply_runs(self.apply, sc))
 
-    def test_schedule_always_reaches_apply(self):
-        for sc in apply_scenarios():
-            if sc["event"] == "schedule" and sc["client_id"] and not sc["run_cancelled"]:
-                with self.subTest(**sc):
-                    self.assertTrue(apply_runs(self.apply, sc))
+    def test_schedule_asks_for_approval_only_on_drift_or_a_failed_plan(self):
+        base = {"event": "schedule", "client_id": "x", "dry_run": None,
+                "force_apply": None, "run_cancelled": False}
+        self.assertFalse(apply_runs(self.apply, dict(base, result="success", needs_apply="false")))
+        self.assertTrue(apply_runs(self.apply, dict(base, result="success", needs_apply="true")))
+        for result in ("failure", "skipped", "cancelled"):
+            with self.subTest(result=result):
+                self.assertTrue(apply_runs(self.apply, dict(base, result=result, needs_apply="")))
 
     def test_push_applies_only_on_planned_drift(self):
         base = {"event": "push", "client_id": "x", "result": "success",
