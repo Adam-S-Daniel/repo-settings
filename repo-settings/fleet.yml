@@ -39,9 +39,9 @@ defaults:
     # is the only form that works anywhere in the fleet.
     #
     # NOT fleet-wide in practice: the three cms-platform-managed repos
-    # (cms-platform, adamdaniel.ai, jodidaniel.com) carry `manage: []`
-    # below, so this never reaches them. That is deliberate and load-bearing,
-    # not an oversight — their Decap publish chain arms SQUASH auto-merge on
+    # (cms-platform, adamdaniel.ai, jodidaniel.com) carry
+    # `manage: ["labels"]` below, so this (a `repo:` key) still never reaches
+    # them. That is deliberate and load-bearing, not an oversight — their Decap publish chain arms SQUASH auto-merge on
     # every editorial PR, and squash is what collapses an editor's many
     # per-save commits into one `publish: <title>` commit. They keep squash on,
     # governed by cms-platform's own repo-settings.yml.
@@ -68,7 +68,7 @@ defaults:
     # 2026-09-15). Its merge subjects switch from `Merge pull request` to PR
     # titles between 2026-04-29 and 2026-05-11, before this file existed, and no
     # reason is recorded in its docs, its history or here. Every other repo --
-    # the three `manage: []` cms-platform repos included, which this never
+    # the three `manage: ["labels"]` cms-platform repos included, which this never
     # reaches -- was already on MERGE_MESSAGE/PR_TITLE, so declaring it changes
     # agentskills alone.
     #
@@ -105,8 +105,9 @@ defaults:
     #
     # NOT plan-gated, unlike allow_auto_merge above: GitHub honours this on
     # private repos too, so no downgrade/skip handling is needed. It does NOT
-    # reach the three cms-platform-managed repos, which carry `manage: []`
-    # below and are governed by cms-platform's own repo-settings.yml.
+    # reach the three cms-platform-managed repos, which carry
+    # `manage: ["labels"]` below and are governed by cms-platform's own
+    # repo-settings.yml.
     delete_branch_on_merge: true
   actions:
     sha_pinning_required: true
@@ -703,12 +704,17 @@ repos:
   - name: Adam-S-Daniel/SonosAmpJuicePi
     manage: []
 
-  # --- cms-platform + consumers: owned by the platform's OWN settings-as-code
-  #     (repo-settings.yml manifest + rulesets). Excluded to avoid a competing
-  #     source of truth (GitHub enforces the union of rulesets). ---
+  # --- cms-platform + consumers: cms-platform owns every other surface through
+  #     its OWN settings-as-code (repo-settings.yml manifest + rulesets), so a
+  #     competing source of truth is excluded (GitHub enforces the union of
+  #     rulesets). Labels only here, and the engine refuses any label name that
+  #     is not on CMS_LABEL_ALLOWLIST or that cms-platform owns
+  #     (scripts/repo_settings.py, docs/decisions/0016).
+  # why: so the fleet-wide `agent-authored` label (_agent-guidance ADR 0023)
+  #     exists there and agents can apply it (issue #88). ---
   - name: Adam-S-Daniel/cms-platform
-    manage: []
+    manage: ["labels"]
   - name: Adam-S-Daniel/adamdaniel.ai
-    manage: []
+    manage: ["labels"]
   - name: jodidaniel/jodidaniel.com
-    manage: []
+    manage: ["labels"]

@@ -52,9 +52,12 @@ Per repo, according to `fleet.yml`:
 Private repos get SHA pinning + `repo.allow_auto_merge` — the API rejects
 fork-PR approval (422) and rulesets (403, needs GitHub Pro); the engine logs an
 explicit skip for those two only. `cms-platform` + its consumer sites are
-excluded (`manage: []`) — they own their settings via the platform's own
+`manage: ["labels"]` — they own every other setting via the platform's own
 manifest, and two ruleset controllers on one repo would fight (GitHub enforces
-the union).
+the union). Only label names on the engine's `CMS_LABEL_ALLOWLIST` (today
+`agent-authored`) may reach them, never a name cms-platform owns, and the apply
+writes them under a token narrowed to Issues write on those repos
+([ADR 0016](docs/decisions/0016-cms-platform-repos-take-allowlisted-labels-only.md)).
 
 ## Policy: bot writes vs the PR-only ruleset
 
