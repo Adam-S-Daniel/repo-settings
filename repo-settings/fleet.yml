@@ -175,6 +175,15 @@ defaults:
     # which is the truth. This is the one line in `defaults:` that a run can
     # never make converge; see docs/decisions/0002 for the reasoning in full.
     grouped_security_updates: true
+    # Secret scanning and push protection: a pasted token is caught at scan
+    # time, and push protection refuses the push before it lands in public
+    # history. Both are free on public repos. The engine skips them on a
+    # private or archived repo, and `manage: []` repos are never planned, so
+    # this reaches only managed public repos (issue #102). On 2026-10-27 that
+    # turned on four: _agent-guidance, rss-inator, squarespacetemp and
+    # scratch-claude-002. Every other managed public repo already had both on.
+    secret_scanning: true
+    secret_scanning_push_protection: true
   ruleset:
     enabled: true
     name: "default branch protection"
@@ -338,9 +347,7 @@ repos:
   # Secret scanning + push protection: already enabled on this repo
   # (`security_and_analysis.secret_scanning.status` /
   # `.secret_scanning_push_protection.status`, both "enabled", checked
-  # 2026-09-24) but NOT declared here. The engine manages both keys since
-  # issue #102, but that issue was narrowed to _agent-guidance alone, so
-  # declaring them here is a separate decision.
+  # 2026-09-24); managed through `defaults:` since issue #102.
   #
   # Fourth check, `plugin-runtime-approval` (added 2026-10-08): the job in
   # .github/workflows/plugin-runtime-review.yml that holds a PR changing a
@@ -578,14 +585,6 @@ repos:
     overrides:
       ruleset:
         required_status_checks: [test, agent-checks]
-      # why: a public repo of agent instructions and evidence, written mostly
-      # by agents, so a pasted token is the likeliest leak in the fleet. Both
-      # were disabled (read 2026-10-23) and are free on a public repo. Declared
-      # here only, not in `defaults:`: issue #102 was narrowed to this repo on
-      # 2026-10-27, so no other repo is managed for these yet.
-      security:
-        secret_scanning: true
-        secret_scanning_push_protection: true
       # why: the changelog routine accumulates on `persistent/vendor-changelog`
       # across PRs. Only deletion is blocked, with no bypass actors: bots and
       # humans still push, and delete_branch_on_merge silently skips the
@@ -596,6 +595,12 @@ repos:
           target_branches: ["persistent/**"]
           rules: [deletion]
 
+  # Public (read 2026-10-27; listed with the private repos below until then).
+  # The engine reads visibility live, so the ruleset and fork-PR approval
+  # already applied here; only this file's grouping was stale.
+  - name: Adam-S-Daniel/rss-inator
+    manage: ["all"]
+
   # --- private: only SHA pinning applies. fork-PR approval (422), rulesets
   #     (403, needs Pro) and allow_auto_merge are all auto-skipped by the engine
   #     with an explicit reason.
@@ -603,11 +608,10 @@ repos:
   #     allow_auto_merge is the non-obvious one: auto-merge is Pro/Team/
   #     Enterprise-only on private repos, and below that the PATCH returns 200
   #     and is silently ignored -- so it looked like it applied. Measured
-  #     2026-08-11: these four went `CHANGED -> True` on the apply and read back
+  #     2026-08-11: the four private repos of the time (4A, rss-inator, jc,
+  #     agentskills-private) went `CHANGED -> True` on the apply and read back
   #     False seven minutes later, while a public repo in the same run stuck.
   #     See schema.md, "Downgrade behavior". ---
-  - name: Adam-S-Daniel/rss-inator
-    manage: ["all"]
   - name: Adam-S-Daniel/jc
     manage: ["all"]
   # Renamed from Adam-S-Daniel/agentskills-private 2026-09-24 (companion

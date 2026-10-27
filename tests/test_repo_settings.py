@@ -2385,18 +2385,27 @@ class SecretScanningTests(unittest.TestCase):
     def test_keys_pass_the_unknown_key_check(self):
         rs.validate_surfaces("defaults", {"security": dict(self.CFG)})
 
-    def test_fleet_declares_them_on_agent_guidance_only(self):
-        # Issue #102 was narrowed to _agent-guidance on 2026-10-27; any other
-        # repo gaining these is a new decision, not drift from this one.
+    def test_archived_repo_is_a_skip(self):
+        repo = dict(self._repo(), archived=True)
+        records = self._plan(repo)
+        self.assertEqual([r["status"] for r in records], ["skipped", "skipped"])
+        for r in records:
+            self.assertIn("archived", r["note"])
+            self.assertNotIn("_writer", r)
+
+    def test_fleet_defaults_turn_both_on_for_every_managed_repo(self):
+        # Declared once in defaults (issue #102); the engine's private and
+        # archived skips, and `manage`, decide which repos it reaches.
         cfg = rs.load_config(str(SecurityFleetConfigTests.FLEET))
-        declaring = []
+        self.assertIs(cfg["defaults"]["security"]["secret_scanning"], True)
+        self.assertIs(cfg["defaults"]["security"]["secret_scanning_push_protection"], True)
         for target in rs.resolve_targets(cfg, None):
-            security = target["effective"].get("security") or {}
-            if any(k in security for k in rs.SECRET_SCANNING_KEYS):
-                declaring.append(target["repo"])
-                self.assertIs(security["secret_scanning"], True)
-                self.assertIs(security["secret_scanning_push_protection"], True)
-        self.assertEqual(declaring, ["Adam-S-Daniel/_agent-guidance"])
+            if not rs.manages(target, "security"):
+                continue
+            security = target["effective"]["security"]
+            self.assertIs(security["secret_scanning"], True, msg=target["repo"])
+            self.assertIs(security["secret_scanning_push_protection"], True,
+                          msg=target["repo"])
 
 
 class WorkflowPermissionsTests(unittest.TestCase):

@@ -60,7 +60,7 @@ Managed settings:
     security.secret_scanning_push_protection  `security_and_analysis`, one call
                                                for the pair -- see
                                                write_secret_scanning; skipped
-                                               on private repos)
+                                               on private and archived repos)
   * security.grouped_security_updates      -> NOT APPLYABLE. No REST endpoint
                                                exists at any scope; declared
                                                and always reported `skipped`
@@ -1885,8 +1885,8 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
 
     # -- secret scanning + push protection ----------------------------------- #
     # Free on public repos. On a private repo without GitHub Secret Protection
-    # (Advanced Security) the API refuses them, so plan a skip rather than a
-    # write that can only fail.
+    # (Advanced Security) the API refuses them, and an archived repo is
+    # read-only, so both plan a skip rather than a write that can only fail.
     ss_wanted = {
         key: bool(security_cfg[key])
         for key in SECRET_SCANNING_KEYS
@@ -1908,33 +1908,43 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
                 for key, desired in ss_wanted.items():
                     records.append(_err(f"security.{key}", desired, e))
             else:
-                # Read defensively, like the repo-field blocks below:
-                # `security_and_analysis` is returned only to a token that may
-                # administer the repo, and a KeyError here would escape
-                # plan_repo_records' GhError-only guard.
-                saa = repo_obj.get("security_and_analysis")
-                for key, desired in ss_wanted.items():
-                    entry = saa.get(key) if isinstance(saa, dict) else None
-                    status = entry.get("status") if isinstance(entry, dict) else None
-                    if status not in ("enabled", "disabled"):
+                if repo_obj.get("archived"):
+                    # An archived repo is read-only: the PATCH would fail, and
+                    # nothing new can be pushed to it to leak a secret.
+                    for key, desired in ss_wanted.items():
                         records.append(
                             _skip(f"security.{key}", desired,
-                                  f"GitHub did not return security_and_analysis.{key} "
-                                  "for this repo (token scope or payload shape) -- "
-                                  "leaving it unmanaged")
+                                  "archived repo -- read-only, nothing to protect")
                         )
-                        continue
-                    current = status == "enabled"
-                    records.append(
-                        {
-                            "setting": f"security.{key}",
-                            "status": "match" if current == desired else "drift",
-                            "current": current,
-                            "desired": desired,
-                            # The WHOLE declared pair: see write_secret_scanning.
-                            "_writer": ("secret_scanning", None, ss_wanted),
-                        }
-                    )
+                else:
+                    # Read defensively, like the repo-field blocks below:
+                    # `security_and_analysis` is returned only to a token that
+                    # may administer the repo, and a KeyError here would
+                    # escape plan_repo_records' GhError-only guard.
+                    saa = repo_obj.get("security_and_analysis")
+                    for key, desired in ss_wanted.items():
+                        entry = saa.get(key) if isinstance(saa, dict) else None
+                        status = entry.get("status") if isinstance(entry, dict) else None
+                        if status not in ("enabled", "disabled"):
+                            records.append(
+                                _skip(f"security.{key}", desired,
+                                      f"GitHub did not return "
+                                      f"security_and_analysis.{key} for this repo "
+                                      "(token scope or payload shape) -- leaving "
+                                      "it unmanaged")
+                            )
+                            continue
+                        current = status == "enabled"
+                        records.append(
+                            {
+                                "setting": f"security.{key}",
+                                "status": "match" if current == desired else "drift",
+                                "current": current,
+                                "desired": desired,
+                                # The WHOLE declared pair: see write_secret_scanning.
+                                "_writer": ("secret_scanning", None, ss_wanted),
+                            }
+                        )
 
     # -- ruleset ------------------------------------------------------------ #
     def plan_ruleset(name: str, body: dict, normalize) -> None:

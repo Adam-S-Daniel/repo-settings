@@ -493,8 +493,10 @@ is never asked for on a repo whose scanning is still off.
   returned only to a token that may administer the repo. Below that the key is
   absent, and the engine records a skip, the same handling as the merge-setting
   fields.
-- **Declared only on `Adam-S-Daniel/_agent-guidance` so far** (issue #102),
-  not in `defaults:`.
+- **Archived repos are skipped.** An archived repo is read-only, so the PATCH
+  would fail.
+- **Declared in `defaults:`** (issue #102), so every managed public repo gets
+  both.
 
 ## Fleet / fan-out shape
 
@@ -621,6 +623,7 @@ logging a `skip` with the reason:
 | Private repo without GitHub Pro | `ruleset` | 403 "Upgrade to GitHub Pro" |
 | Private repo without GitHub Pro | `repo.allow_auto_merge` | **none -- 200, then silently ignored** |
 | Private repo | `security.secret_scanning`, `security.secret_scanning_push_protection` | refused without GitHub Secret Protection (skipped before asking) |
+| Archived repo | `security.secret_scanning`, `security.secret_scanning_push_protection` | read-only repo (skipped before asking) |
 
 That third row is the dangerous one, because it is the only downgrade with **no
 error to catch**. GitHub offers auto-merge on private repos only on
