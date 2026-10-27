@@ -2283,6 +2283,122 @@ class SecurityFleetConfigTests(unittest.TestCase):
             self.assertIs(security["grouped_security_updates"], True, msg=target["repo"])
 
 
+class SecretScanningTests(unittest.TestCase):
+    """`security.secret_scanning` and `security.secret_scanning_push_protection`
+    (issue #102): read from the repo object's `security_and_analysis`, written
+    together in one PATCH, skipped on private repos."""
+
+    CFG = {"secret_scanning": True, "secret_scanning_push_protection": True}
+
+    def _repo(self, private=False, scanning="disabled", push="disabled"):
+        saa = {}
+        if scanning is not None:
+            saa["secret_scanning"] = {"status": scanning}
+        if push is not None:
+            saa["secret_scanning_push_protection"] = {"status": push}
+        return {"private": private, "security_and_analysis": saa}
+
+    def _plan(self, repo_obj, cfg=None):
+        with patch.object(rs, "get_repo", return_value=repo_obj):
+            return rs.plan_repo("o/r", {"security": dict(cfg or self.CFG)})
+
+    def test_drift_when_both_disabled_on_a_public_repo(self):
+        records = self._plan(self._repo())
+        self.assertEqual(
+            [r["setting"] for r in records],
+            ["security.secret_scanning", "security.secret_scanning_push_protection"],
+        )
+        for r in records:
+            self.assertEqual(r["status"], "drift")
+            self.assertIs(r["current"], False)
+            self.assertIs(r["desired"], True)
+            self.assertEqual(r["_writer"], ("secret_scanning", None, self.CFG))
+
+    def test_match_when_both_enabled(self):
+        records = self._plan(self._repo(scanning="enabled", push="enabled"))
+        self.assertEqual([r["status"] for r in records], ["match", "match"])
+
+    def test_private_repo_is_a_skip_and_never_reads_the_field(self):
+        records = self._plan(self._repo(private=True))
+        self.assertEqual([r["status"] for r in records], ["skipped", "skipped"])
+        for r in records:
+            self.assertIn("private repo", r["note"])
+            self.assertNotIn("_writer", r)
+
+    def test_absent_security_and_analysis_is_a_skip_not_drift(self):
+        # A token that may not administer the repo gets no
+        # security_and_analysis at all; that must not read as "disabled".
+        records = self._plan({"private": False})
+        self.assertEqual([r["status"] for r in records], ["skipped", "skipped"])
+        self.assertIn("did not return", records[0]["note"])
+
+    def test_absent_single_key_skips_only_that_key(self):
+        records = self._plan(self._repo(push=None))
+        by_setting = {r["setting"]: r["status"] for r in records}
+        self.assertEqual(by_setting["security.secret_scanning"], "drift")
+        self.assertEqual(by_setting["security.secret_scanning_push_protection"], "skipped")
+
+    def test_read_failure_is_an_error_record(self):
+        with patch.object(rs, "get_repo", side_effect=[
+            {"private": False}, rs.GhError(500, "boom"),
+        ]):
+            records = rs.plan_repo("o/r", {"security": dict(self.CFG)})
+        self.assertEqual([r["status"] for r in records], ["error", "error"])
+
+    def test_omitted_and_null_keys_are_unmanaged(self):
+        with patch.object(rs, "get_repo") as get:
+            self.assertEqual(rs.plan_repo("o/r", {"security": {}}), [])
+            self.assertEqual(
+                rs.plan_repo("o/r", {"security": {"secret_scanning": None}}), []
+            )
+        get.assert_not_called()
+
+    def test_writer_patches_both_keys_in_one_call(self):
+        with patch.object(rs, "gh_api") as api:
+            rs.write_secret_scanning("o/r", self.CFG)
+        api.assert_called_once_with(
+            "repos/o/r",
+            method="PATCH",
+            body={"security_and_analysis": {
+                "secret_scanning": {"status": "enabled"},
+                "secret_scanning_push_protection": {"status": "enabled"},
+            }},
+        )
+
+    def test_writer_disables_with_disabled_status(self):
+        with patch.object(rs, "gh_api") as api:
+            rs.write_secret_scanning("o/r", {"secret_scanning_push_protection": False})
+        self.assertEqual(
+            api.call_args.kwargs["body"],
+            {"security_and_analysis": {
+                "secret_scanning_push_protection": {"status": "disabled"}}},
+        )
+
+    def test_end_to_end_apply_record_reaches_gh_api(self):
+        rec = self._plan(self._repo())[0]
+        with patch.object(rs, "gh_api") as api:
+            rs.apply_record("o/r", rec)
+        api.assert_called_once()
+        self.assertEqual(api.call_args.args, ("repos/o/r",))
+        self.assertEqual(api.call_args.kwargs["method"], "PATCH")
+
+    def test_keys_pass_the_unknown_key_check(self):
+        rs.validate_surfaces("defaults", {"security": dict(self.CFG)})
+
+    def test_fleet_declares_them_on_agent_guidance_only(self):
+        # Issue #102 was narrowed to _agent-guidance on 2026-10-27; any other
+        # repo gaining these is a new decision, not drift from this one.
+        cfg = rs.load_config(str(SecurityFleetConfigTests.FLEET))
+        declaring = []
+        for target in rs.resolve_targets(cfg, None):
+            security = target["effective"].get("security") or {}
+            if any(k in security for k in rs.SECRET_SCANNING_KEYS):
+                declaring.append(target["repo"])
+                self.assertIs(security["secret_scanning"], True)
+                self.assertIs(security["secret_scanning_push_protection"], True)
+        self.assertEqual(declaring, ["Adam-S-Daniel/_agent-guidance"])
+
+
 class WorkflowPermissionsTests(unittest.TestCase):
     """Settings -> Actions -> General -> Workflow permissions: the GITHUB_TOKEN
     default scope and "Allow GitHub Actions to create and approve pull

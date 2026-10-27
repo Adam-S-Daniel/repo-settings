@@ -95,6 +95,11 @@ security:
   # converging it -- see "security:" below for why this repo does the latter).
   grouped_security_updates: true
 
+  # Secret scanning and push protection. Public repos only -- see "Secret
+  # scanning" below. Omit either key, or set it to null, to leave it unmanaged.
+  secret_scanning: true
+  secret_scanning_push_protection: true
+
 ruleset:
   # Omit the whole block, or set enabled: false, to leave protection unmanaged.
   # PUBLIC repos only -- private repos need GitHub Pro (API 403); the engine
@@ -362,11 +367,13 @@ and put the map form (above) in the file's `repo:` key. This collision
 does not exist in the fleet/fan-out shape below, where the identifier always
 comes from each element's `name:` and `repo:` is free to be a settings map.
 
-### `security:` -- Dependabot alerts and security updates
+### `security:` -- Dependabot alerts, security updates and secret scanning
 
-Three leaves, two of them applyable. Like `repo:` above these are ordinary
-per-repo toggles, not Actions-specific and not the ruleset -- but unlike
-`repo:`, two of the three DO need downgrade handling, because the read (not
+Five leaves. The three Dependabot leaves are below, two of them applyable; the
+two secret-scanning leaves are under "Secret scanning" at the end of this
+section. Like `repo:` above, the Dependabot leaves are ordinary per-repo
+toggles, not Actions-specific and not the ruleset -- but unlike `repo:`, two
+of the three DO need downgrade handling, because the read (not
 the write) can fail on a scope the fan-out App's grant does not cover on every
 installation.
 
@@ -470,6 +477,24 @@ as "forgotten"; a declared one that always reports `skipped` reads as "known,
 blocked, and here is why" -- which is the true state. See
 [docs/decisions/0002](../docs/decisions/0002-declare-dependabot-security-settings-including-the-unenforceable-one.md)
 for the full reasoning.
+
+#### Secret scanning
+
+`secret_scanning` and `secret_scanning_push_protection` live on the repository
+object, under `security_and_analysis.<key>.status` (`"enabled"` or
+`"disabled"`). The engine reads them from `GET repos/{repo}` and writes them
+with one `PATCH repos/{repo}` carrying every declared key, so push protection
+is never asked for on a repo whose scanning is still off.
+
+- **Private repos are skipped.** Both are free on public repos; on a private
+  repo they need GitHub Secret Protection (Advanced Security), and the API
+  refuses them without it.
+- **A missing field is a skip, never drift.** `security_and_analysis` is
+  returned only to a token that may administer the repo. Below that the key is
+  absent, and the engine records a skip, the same handling as the merge-setting
+  fields.
+- **Declared only on `Adam-S-Daniel/_agent-guidance` so far** (issue #102),
+  not in `defaults:`.
 
 ## Fleet / fan-out shape
 
@@ -581,6 +606,7 @@ logging a `skip` with the reason:
 | Private repo | `actions.fork_pr_approval` | 422 "not allowed for private repositories" |
 | Private repo without GitHub Pro | `ruleset` | 403 "Upgrade to GitHub Pro" |
 | Private repo without GitHub Pro | `repo.allow_auto_merge` | **none -- 200, then silently ignored** |
+| Private repo | `security.secret_scanning`, `security.secret_scanning_push_protection` | refused without GitHub Secret Protection (skipped before asking) |
 
 That third row is the dangerous one, because it is the only downgrade with **no
 error to catch**. GitHub offers auto-merge on private repos only on

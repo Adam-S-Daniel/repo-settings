@@ -337,12 +337,9 @@ repos:
   # Secret scanning + push protection: already enabled on this repo
   # (`security_and_analysis.secret_scanning.status` /
   # `.secret_scanning_push_protection.status`, both "enabled", checked
-  # 2026-09-24) but NOT declared here -- the engine's `security:` group
-  # covers only Dependabot alerts/security-updates
-  # (repo-settings/schema.md); there is no `secret_scanning` /
-  # `secret_scanning_push_protection` key anywhere in
-  # scripts/repo_settings.py, so adding one here would be inert config the
-  # engine silently never reads. Revisit if the engine ever grows that field.
+  # 2026-09-24) but NOT declared here. The engine manages both keys since
+  # issue #102, but that issue was narrowed to _agent-guidance alone, so
+  # declaring them here is a separate decision.
   #
   # Fourth check, `plugin-runtime-approval` (added 2026-10-08): the job in
   # .github/workflows/plugin-runtime-review.yml that holds a PR changing a
@@ -580,6 +577,14 @@ repos:
     overrides:
       ruleset:
         required_status_checks: [test, agent-checks]
+      # why: a public repo of agent instructions and evidence, written mostly
+      # by agents, so a pasted token is the likeliest leak in the fleet. Both
+      # were disabled (read 2026-10-23) and are free on a public repo. Declared
+      # here only, not in `defaults:`: issue #102 was narrowed to this repo on
+      # 2026-10-27, so no other repo is managed for these yet.
+      security:
+        secret_scanning: true
+        secret_scanning_push_protection: true
       # why: the changelog routine accumulates on `persistent/vendor-changelog`
       # across PRs. Only deletion is blocked, with no bypass actors: bots and
       # humans still push, and delete_branch_on_merge silently skips the

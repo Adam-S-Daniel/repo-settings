@@ -56,6 +56,11 @@ Managed settings:
   * actions_policies (per-repo only)       -> repos/{repo}/actions/policies  (idempotent
                                                BY NAME; never edits or deletes an
                                                undeclared policy)
+  * security.secret_scanning               -> repos/{repo}  (PATCH
+    security.secret_scanning_push_protection  `security_and_analysis`, one call
+                                               for the pair -- see
+                                               write_secret_scanning; skipped
+                                               on private repos)
   * security.grouped_security_updates      -> NOT APPLYABLE. No REST endpoint
                                                exists at any scope; declared
                                                and always reported `skipped`
@@ -250,6 +255,31 @@ def write_merge_commit_message(repo: str, desired: dict) -> None:
     PATCH carries both keys.
     """
     gh_api(f"repos/{repo}", method="PATCH", body=dict(desired))
+
+
+# The two secret-scanning toggles under `security_and_analysis`, always
+# written together.
+SECRET_SCANNING_KEYS = ("secret_scanning", "secret_scanning_push_protection")
+
+
+def write_secret_scanning(repo: str, desired: dict) -> None:
+    """PATCH every declared secret-scanning toggle in ONE call.
+
+    Push protection depends on secret scanning, so a per-toggle apply that
+    enables both would ask for push protection on a repo whose scanning is
+    still off whenever the records happen to come in that order. One PATCH
+    carrying the whole declared group never passes through that state.
+    """
+    gh_api(
+        f"repos/{repo}",
+        method="PATCH",
+        body={
+            "security_and_analysis": {
+                key: {"status": "enabled" if on else "disabled"}
+                for key, on in desired.items()
+            }
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1267,6 +1297,7 @@ SURFACE_KEYS = {
         "vulnerability_alerts",
         "automated_security_fixes",
         "grouped_security_updates",
+        *SECRET_SCANNING_KEYS,
     ),
 }
 
@@ -1782,6 +1813,59 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
             )
         )
 
+    # -- secret scanning + push protection ----------------------------------- #
+    # Free on public repos. On a private repo without GitHub Secret Protection
+    # (Advanced Security) the API refuses them, so plan a skip rather than a
+    # write that can only fail.
+    ss_wanted = {
+        key: bool(security_cfg[key])
+        for key in SECRET_SCANNING_KEYS
+        if security_cfg.get(key) is not None
+    }
+    if ss_wanted:
+        if is_private():
+            for key, desired in ss_wanted.items():
+                records.append(
+                    _skip(f"security.{key}", desired,
+                          "private repo -- secret scanning needs GitHub Secret "
+                          "Protection (Advanced Security), which the API refuses "
+                          "without")
+                )
+        else:
+            try:
+                repo_obj = get_repo(repo)
+            except GhError as e:
+                for key, desired in ss_wanted.items():
+                    records.append(_err(f"security.{key}", desired, e))
+            else:
+                # Read defensively, like the repo-field blocks below:
+                # `security_and_analysis` is returned only to a token that may
+                # administer the repo, and a KeyError here would escape
+                # plan_repo_records' GhError-only guard.
+                saa = repo_obj.get("security_and_analysis")
+                for key, desired in ss_wanted.items():
+                    entry = saa.get(key) if isinstance(saa, dict) else None
+                    status = entry.get("status") if isinstance(entry, dict) else None
+                    if status not in ("enabled", "disabled"):
+                        records.append(
+                            _skip(f"security.{key}", desired,
+                                  f"GitHub did not return security_and_analysis.{key} "
+                                  "for this repo (token scope or payload shape) -- "
+                                  "leaving it unmanaged")
+                        )
+                        continue
+                    current = status == "enabled"
+                    records.append(
+                        {
+                            "setting": f"security.{key}",
+                            "status": "match" if current == desired else "drift",
+                            "current": current,
+                            "desired": desired,
+                            # The WHOLE declared pair: see write_secret_scanning.
+                            "_writer": ("secret_scanning", None, ss_wanted),
+                        }
+                    )
+
     # -- ruleset ------------------------------------------------------------ #
     def plan_ruleset(name: str, body: dict, normalize) -> None:
         try:
@@ -2249,6 +2333,8 @@ def apply_record(repo: str, rec: dict) -> None:
         write_vulnerability_alerts(repo, b)
     elif kind == "auto_sec_fixes":
         write_automated_security_fixes(repo, b)
+    elif kind == "secret_scanning":
+        write_secret_scanning(repo, b)
 
 
 # --------------------------------------------------------------------------- #
