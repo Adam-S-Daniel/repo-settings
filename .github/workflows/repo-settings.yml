@@ -56,9 +56,10 @@
 #   * then the `repo-settings` apply job, which waits for the owner's approval
 #     in `fleet-apply`, checks that the gate is still configured, and applies.
 #     It runs only when the plan found drift (push, or a non-dry-run dispatch),
-#     when a non-dry-run dispatch sets `force_apply`, or on the weekly schedule,
-#     which always goes through as the backstop. A dry-run dispatch is the plan
-#     alone and asks for no approval.
+#     when a non-dry-run dispatch sets `force_apply`, or on the weekly schedule
+#     when the plan found drift or failed. A dry-run dispatch is the plan alone
+#     and asks for no approval. The cms-platform repos' labels are applied by
+#     a separate step under an issues-only token (docs/decisions/0016).
 #   * pull_request touching config/script -> `drift` job: drift report only
 #     (fails on drift), under a token from the same READ-ONLY App. Skipped
 #     until that App's `REPO_SETTINGS_READ_APP_CLIENT_ID` variable exists.
@@ -106,10 +107,12 @@ jobs:
   # finish wins, so one owner's drift could be overwritten by the other's
   # "none". Each owner gets its own mint and diff step and its own output.
   #
-  # The read token cannot see ruleset `bypass_actors` or the repo merge flags
-  # (both come back as skips, #97), so drift on those never sets
-  # `needs_apply`. The weekly schedule therefore always runs the gated apply,
-  # which sees everything.
+  # The read token cannot see ruleset `bypass_actors`, Actions policies or the
+  # repo merge flags (all come back as skips, #97), so drift confined to those
+  # never sets `needs_apply`, on schedule either: the owner chose (PR #113) to
+  # stop approving weekly applies that change nothing over keeping a blind
+  # weekly backstop for those. A settings push that finds other drift, or a
+  # `force_apply` dispatch, still converges them.
   #
   # Not gated on the read App's variable, on purpose: a plan that skipped
   # would read as "nothing to apply" on push. A missing App fails the mint and
@@ -309,9 +312,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: plan
     # Runs only when (issue #116):
-    #   * the event is `schedule` -- the weekly backstop, whatever the plan
-    #     said, and even when the plan failed (say the read App is broken):
-    #     the gated apply sees what the read token cannot;
+    #   * the event is `schedule` and the plan found drift, or the plan did
+    #     not succeed (say the read App is broken): a weekly run that cannot
+    #     rule drift out still applies, failing closed;
     #   * the plan succeeded and found drift, on push or on a dispatch that is
     #     not a dry run;
     #   * the plan succeeded and a dispatch that is not a dry run sets
@@ -320,7 +323,7 @@ jobs:
     # schedule, a failed or skipped plan never triggers an apply.
     #
     # `!cancelled()` because GitHub skips a dependent job whose `needs` failed
-    # unless `if:` calls a status function; the schedule backstop needs that,
+    # unless `if:` calls a status function; the failed-plan schedule case needs that,
     # and every other branch requires `needs.plan.result == 'success'`. Not
     # `always()`: a run someone cancelled should not go on to ask for an apply.
     #
@@ -331,7 +334,8 @@ jobs:
       ${{ !cancelled()
       && vars.REPO_SETTINGS_APP_CLIENT_ID != ''
       && github.event_name != 'pull_request'
-      && (github.event_name == 'schedule'
+      && ((github.event_name == 'schedule'
+      && (needs.plan.result != 'success' || needs.plan.outputs.needs_apply == 'true'))
       || (needs.plan.result == 'success'
       && ((github.event_name == 'push' && needs.plan.outputs.needs_apply == 'true')
       || (github.event_name == 'workflow_dispatch' && !inputs.dry_run
@@ -413,10 +417,51 @@ jobs:
           private-key: ${{ secrets.REPO_SETTINGS_APP_PRIVATE_KEY }}
           owner: ${{ matrix.owner }}
 
+      # The cms-platform repos are applied below, under their own token.
       - name: Apply
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
-        run: python scripts/repo_settings.py apply --config repo-settings/fleet.yml --owner ${{ matrix.owner }}
+          OWNER: ${{ matrix.owner }}
+        run: python scripts/repo_settings.py apply --config repo-settings/fleet.yml --owner "$OWNER" --cms-label-only skip
+
+      # Least privilege for the cms-platform-managed repos (docs/decisions/0016).
+      # They are labels-only, so their writes run under a token minted with
+      # only `issues: write`, narrowed to those repos: an engine bug cannot
+      # make an Administration write there. The App key itself can mint
+      # anything, so this narrows the engine's reach, not the job's.
+      #
+      # `!cancelled()` and the gate's outcome, not `always()`: an admin error
+      # elsewhere must not withhold these labels, but a failed environment
+      # gate must never let this run. The engine's own list of the repos
+      # (cms-label-repos) feeds the mint, so the set is defined once.
+      - name: Which cms-platform repos get labels?
+        id: cms_label_repos
+        if: ${{ !cancelled() && steps.environment_gate.outcome == 'success' }}
+        env:
+          OWNER: ${{ matrix.owner }}
+        run: |
+          set -euo pipefail
+          repos=$(python scripts/repo_settings.py cms-label-repos --config repo-settings/fleet.yml --owner "$OWNER")
+          echo "repos=$repos" >> "$GITHUB_OUTPUT"
+
+      # Only `permission-issues: write` (see the least-privilege note above).
+      - name: Mint labels-only GitHub App token for ${{ matrix.owner }}
+        id: token_labels
+        if: ${{ !cancelled() && steps.environment_gate.outcome == 'success' && steps.cms_label_repos.outputs.repos != '' }}
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          client-id: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REPO_SETTINGS_APP_PRIVATE_KEY }}
+          owner: ${{ matrix.owner }}
+          repositories: ${{ steps.cms_label_repos.outputs.repos }}
+          permission-issues: write
+
+      - name: Apply labels to the cms-platform repos
+        if: ${{ !cancelled() && steps.environment_gate.outcome == 'success' && steps.cms_label_repos.outputs.repos != '' }}
+        env:
+          GH_TOKEN: ${{ steps.token_labels.outputs.token }}
+          OWNER: ${{ matrix.owner }}
+        run: python scripts/repo_settings.py apply --config repo-settings/fleet.yml --owner "$OWNER" --cms-label-only only
 
   # The pull_request drift report. It never touches the admin key: a PR branch
   # controls its own copy of this workflow, so any job that can run on a PR

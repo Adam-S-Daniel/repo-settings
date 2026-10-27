@@ -105,3 +105,4 @@ Optional sections for high-impact decisions:
 | [0013](0013-lesson-check-prs-auto-merge-in-agent-guidance.md) | Lesson-check PRs in _agent-guidance auto-merge under ADR 0012 | Accepted |
 | [0014](0014-guidance-loop-prs-use-the-eval-improve-app.md) | Guidance-loop PRs in _agent-guidance use the eval-improve App | Accepted |
 | [0015](0015-changelog-routine-prs-merge-through-a-workflow-gate.md) | The changelog routine's PRs merge through a workflow running its gate | Accepted |
+| [0016](0016-cms-platform-repos-take-allowlisted-labels-only.md) | The cms-platform repos take allowlisted labels only, under a narrowed token | Accepted |

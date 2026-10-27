@@ -540,6 +540,20 @@ surface reaches the planner only when `manage` names it, so the filter fails
 closed. `diff`, `apply` and `coverage` print each repo's scope as `managed:
 all`, `managed: labels, security` or `excluded (manage: [])`.
 
+**The cms-platform-managed repos** (`CMS_LABEL_ONLY_REPOS` in the engine:
+`Adam-S-Daniel/cms-platform`, `Adam-S-Daniel/adamdaniel.ai`,
+`jodidaniel/jodidaniel.com`) accept only `[]` or `["labels"]`, because
+cms-platform owns every other surface. When they manage labels, every label
+reaching them, defaults included, must be on `CMS_LABEL_ALLOWLIST` (today
+`agent-authored`) and must match none of `CMS_OWNED_LABELS` (`ci`, `cms/*`,
+`decap-cms/*`, `not-decap-created`, `content-guard/override`, ...), compared
+case-insensitively. Anything else refuses the whole config, naming every
+offending label (docs/decisions/0016). A new fleet-wide default label therefore
+needs a deliberate allowlist change before it can land. `apply
+--cms-label-only skip` leaves these repos out and `--cms-label-only only` applies
+just them; the workflow runs the second under a token minted with only Issues
+write, and `cms-label-repos --owner <owner>` prints the names it narrows to.
+
 ```yaml
 defaults:
   repo:
