@@ -392,7 +392,25 @@ security:
   # can never apply it (see "grouped_security_updates has no API" below).
   # Omit the key to leave it undeclared instead of declared-and-skipped.
   grouped_security_updates: true
+
+  # Secret scanning and push protection (push protection needs secret
+  # scanning on). Omit a key to leave it unmanaged.
+  secret_scanning: true
+  secret_scanning_push_protection: true
+  # CodeQL default setup, and optionally its query suite (default | extended).
+  codeql_default_setup: true
+  codeql_query_suite: extended
 ```
+
+**CodeQL default setup.** Read from `GET repos/{repo}/code-scanning/default-setup`
+(`state == "configured"`, plus `query_suite`) and written in one
+`PATCH` of the same endpoint with `{"state": "configured" | "not-configured"}`
+and, when declared, `query_suite`. `languages` is never sent, so GitHub keeps
+choosing them and a repo that gains a language picks it up. On a **private**
+repo both keys are a `skipped` record (CodeQL there needs GitHub Code
+Security); a 403/404 on the read is a skip too, never drift.
+`codeql_query_suite` is ignored when `codeql_default_setup` is `false`, and
+any value other than `default` or `extended` is a config error.
 
 **Endpoints, and the PUT/DELETE-carries-the-value shape.** Both applyable
 leaves are read and written through a pair of GitHub endpoints that take
@@ -624,6 +642,7 @@ logging a `skip` with the reason:
 | Private repo without GitHub Pro | `repo.allow_auto_merge` | **none -- 200, then silently ignored** |
 | Private repo | `security.secret_scanning`, `security.secret_scanning_push_protection` | refused without GitHub Secret Protection (skipped before asking) |
 | Archived repo | `security.secret_scanning`, `security.secret_scanning_push_protection` | read-only repo (skipped before asking) |
+| Private repo | `security.codeql_default_setup`, `security.codeql_query_suite` | needs GitHub Code Security (skipped before asking) |
 
 That third row is the dangerous one, because it is the only downgrade with **no
 error to catch**. GitHub offers auto-merge on private repos only on

@@ -4229,3 +4229,84 @@ class CmsLabelOnlyTests(unittest.TestCase):
             self.assertEqual(planned, want)
             if mode == "skip":
                 self.assertIn("label-only step", out)
+
+
+class CodeqlDefaultSetupTests(unittest.TestCase):
+    """`security.codeql_default_setup` / `codeql_query_suite`: read from
+    code-scanning/default-setup, written as one PATCH, skipped on private
+    repos and on a read the token cannot make."""
+
+    CFG = {"codeql_default_setup": True}
+
+    def _plan(self, cfg, private=False, live=None, read_error=None):
+        def api(path, **kw):
+            if path.endswith("/code-scanning/default-setup"):
+                if read_error:
+                    raise read_error
+                return live
+            raise AssertionError(f"unexpected call {path}")
+        with patch.object(rs, "get_repo", return_value={"private": private}), \
+             patch.object(rs, "gh_api", side_effect=api):
+            return rs.plan_repo("o/r", {"security": dict(cfg)})
+
+    def test_drift_when_not_configured(self):
+        records = self._plan(self.CFG, live={"state": "not-configured", "query_suite": "default"})
+        self.assertEqual(len(records), 1)
+        r = records[0]
+        self.assertEqual((r["setting"], r["status"], r["current"]), ("security.codeql_default_setup", "drift", False))
+        self.assertEqual(r["_writer"], ("codeql", None, self.CFG))
+
+    def test_match_when_configured(self):
+        records = self._plan(self.CFG, live={"state": "configured", "query_suite": "default"})
+        self.assertEqual([r["status"] for r in records], ["match"])
+
+    def test_query_suite_drift(self):
+        cfg = {"codeql_default_setup": True, "codeql_query_suite": "extended"}
+        records = self._plan(cfg, live={"state": "configured", "query_suite": "default"})
+        by = {r["setting"]: r["status"] for r in records}
+        self.assertEqual(by, {"security.codeql_default_setup": "match", "security.codeql_query_suite": "drift"})
+
+    def test_bad_query_suite_is_a_config_error(self):
+        with self.assertRaises(rs.ConfigError):
+            self._plan({"codeql_default_setup": True, "codeql_query_suite": "security-and-quality"},
+                       live={"state": "configured", "query_suite": "default"})
+
+    def test_private_repo_is_a_skip_and_never_read(self):
+        records = self._plan(self.CFG, private=True, read_error=AssertionError("read on a private repo"))
+        self.assertEqual([r["status"] for r in records], ["skipped"])
+        self.assertIn("Code Security", records[0]["note"])
+        self.assertNotIn("_writer", records[0])
+
+    def test_unreadable_is_a_skip_not_drift(self):
+        records = self._plan(self.CFG, read_error=rs.GhError(403, "Resource not accessible by integration"))
+        self.assertEqual([r["status"] for r in records], ["skipped"])
+
+    def test_other_read_errors_are_errors(self):
+        records = self._plan(self.CFG, read_error=rs.GhError(500, "boom"))
+        self.assertEqual([r["status"] for r in records], ["error"])
+
+    def test_answer_without_state_is_an_error_not_drift(self):
+        records = self._plan(self.CFG, live={"languages": []})
+        self.assertEqual([r["status"] for r in records], ["error"])
+
+    def test_write_is_one_patch_and_leaves_languages_to_github(self):
+        with patch.object(rs, "gh_api") as api:
+            rs.write_codeql_default_setup("o/r", {"codeql_default_setup": True, "codeql_query_suite": "extended"})
+        api.assert_called_once_with("repos/o/r/code-scanning/default-setup", method="PATCH",
+                                    body={"state": "configured", "query_suite": "extended"})
+
+    def test_write_off(self):
+        with patch.object(rs, "gh_api") as api:
+            rs.write_codeql_default_setup("o/r", {"codeql_default_setup": False})
+        api.assert_called_once_with("repos/o/r/code-scanning/default-setup", method="PATCH",
+                                    body={"state": "not-configured"})
+
+    def test_apply_record_routes_to_the_writer(self):
+        with patch.object(rs, "write_codeql_default_setup") as w:
+            rs.apply_record("o/r", {"_writer": ("codeql", None, dict(self.CFG))})
+        w.assert_called_once_with("o/r", self.CFG)
+
+    def test_fleet_defaults_turn_it_on(self):
+        import yaml
+        fleet = yaml.safe_load((Path(__file__).resolve().parent.parent / "repo-settings" / "fleet.yml").read_text())
+        self.assertIs(fleet["defaults"]["security"]["codeql_default_setup"], True)

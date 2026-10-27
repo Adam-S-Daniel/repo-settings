@@ -184,6 +184,16 @@ defaults:
     # scratch-claude-002. Every other managed public repo already had both on.
     secret_scanning: true
     secret_scanning_push_protection: true
+    # CodeQL default setup (owner, 2026-10-26: "turn on codeql for all public
+    # repos"). Free on public repos; private repos are skipped because CodeQL
+    # there needs GitHub Code Security. GitHub picks the languages itself
+    # (GitHub Actions workflows count, so every repo here has one), and
+    # `codeql_query_suite` is left unmanaged: `default` is GitHub's own
+    # default, and a repo that wants `extended` can declare it in overrides.
+    # Forks and the cms-platform trio are not managed here (see their
+    # entries); before this, all 19 public repos had code scanning never run
+    # (security-alerts snapshot, 2026-10-26).
+    codeql_default_setup: true
   ruleset:
     enabled: true
     name: "default branch protection"
