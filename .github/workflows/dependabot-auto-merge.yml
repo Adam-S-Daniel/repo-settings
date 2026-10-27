@@ -70,16 +70,15 @@
 # negligible against that; a security-update PR (which bypasses the cooldown)
 # can wait up to a day for the scheduled sweep unless merged by hand.
 #
-# A CONSEQUENCE WORTH NAMING: the `repo-settings` drift-report job runs on any
-# PR touching `.github/workflows/repo-settings.yml` and FAILS on Dependabot
-# PRs, because Dependabot-triggered workflow runs receive no Actions secrets
-# (the App private key is empty) -- that is what actually failed on #41, one
-# and twenty seconds after the PR had already merged. Under this gate such a
-# PR is never merged unattended: `sweep` sees an unfinished, still-red check
-# and skips the PR, naming it in its log, until a human looks at it. That is
-# the gate doing its job. Whether to exempt that job for Dependabot PRs
-# specifically is a separate decision for the owner to make -- it is not made
-# here.
+# A CONSEQUENCE WORTH NAMING: the `repo-settings` drift-report job used to run
+# on Dependabot PRs touching `.github/workflows/repo-settings.yml` and FAIL,
+# because Dependabot-triggered workflow runs receive no Actions secrets (the
+# App private key is empty) -- that is what actually failed on #41, one and
+# twenty seconds after the PR had already merged, and again on #78. The owner
+# decided (2026-10-27, #78) to skip that job on Dependabot and fork PRs rather
+# than leave a red check no push could clear; see its `if:`. The sweep's floor
+# is unchanged: a skipped job is not a green check from outside this
+# workflow, so `unit` and `agent-checks` still have to supply that.
 #
 # DO NOT generalise the paragraph above -- the one beginning "BUT NONE OF THE
 # ABOVE IS WHY" -- into "no required check is why Dependabot PRs don't land."
@@ -157,7 +156,8 @@ jobs:
       - name: Verify only manifest paths changed
         id: paths
         # Path allowlist: dependency manifests/lockfiles (any directory) plus
-        # workflow YAML. Dependabot never touches anything else, so a diff
+        # workflow YAML and the workflows' actions.lock, which Dependabot
+        # rewrites alongside every `uses:` bump it makes. Dependabot never touches anything else, so a diff
         # outside this list means either a misconfiguration or a tampered
         # branch — either way, refuse to auto-merge. Inline port of
         # cms-platform's scripts/check-dependabot-manifest-paths.sh; keep in
@@ -179,6 +179,7 @@ jobs:
               pyproject.toml|*/pyproject.toml|poetry.lock|*/poetry.lock) ;;
               requirements*.txt|*/requirements*.txt) ;;
               .github/workflows/*.yml|.github/workflows/*.yaml) ;;
+              .github/workflows/actions.lock) ;;
               *)
                 echo "::error file=$f::Dependabot PR touches non-manifest path: $f"
                 REJECT=1
@@ -366,6 +367,7 @@ jobs:
                 pyproject.toml|*/pyproject.toml|poetry.lock|*/poetry.lock) ;;
                 requirements*.txt|*/requirements*.txt) ;;
                 .github/workflows/*.yml|.github/workflows/*.yaml) ;;
+                .github/workflows/actions.lock) ;;
                 *)
                   echo "::warning::#${num} touches non-manifest path on re-check: $f"
                   REJECT=1

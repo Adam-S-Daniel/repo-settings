@@ -473,11 +473,18 @@ jobs:
   # repo-level variable `REPO_SETTINGS_READ_APP_CLIENT_ID` (and secret
   # `REPO_SETTINGS_READ_APP_PRIVATE_KEY`) is unset (issue #90). Reads that need write (the Actions
   # policies endpoints, GET included) come back as informational skips, never
-  # drift (#97). Dependabot and fork PRs get no secrets, so it fails to mint
-  # there; it is advisory and not a required check (AGENTS.md).
+  # drift (#97). Dependabot and fork PRs get no secrets, so it could never mint
+  # there; it is skipped for them instead of failing (#78). It is advisory and
+  # not a required check (AGENTS.md).
   drift:
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'pull_request' && vars.REPO_SETTINGS_READ_APP_CLIENT_ID != '' }}
+    if: >-
+      ${{
+        github.event_name == 'pull_request'
+        && vars.REPO_SETTINGS_READ_APP_CLIENT_ID != ''
+        && github.actor != 'dependabot[bot]'
+        && github.event.pull_request.head.repo.full_name == github.repository
+      }}
     permissions:
       contents: read
     strategy:
