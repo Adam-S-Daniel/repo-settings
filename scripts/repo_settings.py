@@ -2839,8 +2839,11 @@ def _annotation_escape(text: str) -> str:
 
 
 def changes_markdown(changes: list[dict]) -> str:
-    """The job summary: one row per planned change, errors included."""
-    drift = [c for c in changes if c["status"] == "drift"]
+    """The job summary: one row per planned change, errors included. Rows sort
+    by setting, then repo, so one setting's changes across the fleet read as a
+    block."""
+    drift = sorted((c for c in changes if c["status"] == "drift"),
+                   key=lambda c: (c["setting"], c["repo"].lower()))
     errors = [c for c in changes if c["status"] == "error"]
     lines = ["## Planned changes", ""]
     if not changes:
