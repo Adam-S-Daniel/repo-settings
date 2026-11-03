@@ -8,7 +8,9 @@
 - **Amended:** 2026-10-26 by [ADR 0013](0013-lesson-check-prs-auto-merge-in-agent-guidance.md),
   which adds a fourth row: lesson-check PRs in _agent-guidance's agent-checks
   runner; 2026-10-27 by [ADR 0014](0014-guidance-loop-prs-use-the-eval-improve-app.md),
-  which has the eval-improve App open the _agent-guidance guidance-loop PRs
+  which has the eval-improve App open the _agent-guidance guidance-loop PRs;
+  2026-11-03 by [ADR 0017](0017-eval-scope-prs-auto-merge-under-adr-0012.md),
+  which adds a skills-evals row for eval-scope PRs (the fixture schedule files)
 
 ## Context
 
