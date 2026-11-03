@@ -1,10 +1,10 @@
 # 0018. Fleet worker fixture PRs in skills-evals auto-merge under ADR 0012
 
-- **Status:** Proposed
+- **Status:** Accepted (on merge of repo-settings#162)
 - **Date:** 2026-11-03
 - **Deciders:** Adam Daniel (standing decisions of 2026-10-26: "closed loop
   with no human in the loop", and loop changes that pass evals or checks
-  auto-merge); to be accepted by his merge of this ADR
+  auto-merge); accepted by his merge of repo-settings#162
 - **Amends:** [ADR 0012](0012-eval-loop-prs-auto-merge-as-a-declared-exception.md)
 
 ## Context
