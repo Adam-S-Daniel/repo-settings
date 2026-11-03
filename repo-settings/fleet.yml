@@ -558,6 +558,17 @@ repos:
     overrides:
       ruleset:
         required_status_checks: [test, self-verify, agent-checks]
+  # acsi-kit: the public adoption kit, moved out of _agent-guidance on
+  # 2026-10-30 (https://github.com/Adam-S-Daniel/acsi-kit) so outside issues
+  # and pull requests never touch the repo that feeds the fleet's guidance.
+  # Excluded from _agent-guidance's AGENTS.md sync, so agent-checks was added
+  # by hand, as for verify-actions-lock above. `test` (ci.yml) runs on every
+  # pull request with no on.paths, no matrix, name or concurrency group.
+  - name: Adam-S-Daniel/acsi-kit
+    manage: ["all"]
+    overrides:
+      ruleset:
+        required_status_checks: [test, agent-checks]
 
   # --- GHA-bench: migrated from classic branch protection to a ruleset (the
   #     fleet standard). Now managed like the other public repos. ---

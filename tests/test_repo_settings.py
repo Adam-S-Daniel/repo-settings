@@ -686,6 +686,7 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         "Adam-S-Daniel/wsl-automation": ["shell", "test", "test-linux", "agent-checks"],
         "Adam-S-Daniel/repo-settings": ["agent-checks", "unit"],
         "Adam-S-Daniel/verify-actions-lock": ["test", "self-verify", "agent-checks"],
+        "Adam-S-Daniel/acsi-kit": ["test", "agent-checks"],
         "Adam-S-Daniel/security-alerts": ["agent-checks", "unit"],
     }
     PRE_EXISTING = {
@@ -1511,7 +1512,7 @@ class AdminBypassFleetConfigTests(unittest.TestCase):
                     {k: v for k, v in none.items() if k != "bypass_actors"},
                 )
             checked += 1
-        self.assertEqual(checked, 22)
+        self.assertEqual(checked, 23)
 
 
 class BypassUnknownTests(unittest.TestCase):
@@ -4070,7 +4071,7 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
         self.assertEqual(set(by_value), {("all",), (), ("labels",)})
         self.assertEqual(by_value[()], self.WERE_FALSE)
         self.assertEqual(by_value[("labels",)], self.LABELS_ONLY)
-        self.assertEqual(len(by_value[("all",)]), 19)
+        self.assertEqual(len(by_value[("all",)]), 20)
 
     def test_diff_output_is_unchanged_apart_from_the_scope_strings(self):
         cfg = rs.load_config(str(self.FLEET))
