@@ -101,8 +101,10 @@ Optional sections for high-impact decisions:
 | [0009](0009-allow-pull-request-target-with-a-workflow-scoped-policy-owned-by-name.md) | Allow pull_request_target with a workflow-scoped Actions event policy the engine owns by name | Accepted |
 | [0010](0010-labels-may-be-declared-fleet-wide-and-merge-by-name.md) | Labels may be declared fleet-wide and merge with per-repo labels by name | Accepted |
 | [0011](0011-make-manage-a-required-array-of-surfaces.md) | Make `manage` a required array of surfaces | Accepted |
-| [0012](0012-eval-loop-prs-auto-merge-as-a-declared-exception.md) | Eval-loop PRs auto-merge as a declared exception | Accepted; amended by 0013 (2026-10-26) and 0014 (2026-10-27) |
+| [0012](0012-eval-loop-prs-auto-merge-as-a-declared-exception.md) | Eval-loop PRs auto-merge as a declared exception | Accepted; amended by 0013 (2026-10-26), 0014 (2026-10-27), 0017 (2026-11-03) and 0018 (2026-11-03) |
 | [0013](0013-lesson-check-prs-auto-merge-in-agent-guidance.md) | Lesson-check PRs in _agent-guidance auto-merge under ADR 0012 | Accepted |
 | [0014](0014-guidance-loop-prs-use-the-eval-improve-app.md) | Guidance-loop PRs in _agent-guidance use the eval-improve App | Accepted |
 | [0015](0015-changelog-routine-prs-merge-through-a-workflow-gate.md) | The changelog routine's PRs merge through a workflow running its gate | Accepted |
 | [0016](0016-cms-platform-repos-take-allowlisted-labels-only.md) | The cms-platform repos take allowlisted labels only, under a narrowed token | Accepted |
+| [0017](0017-eval-scope-prs-auto-merge-under-adr-0012.md) | Eval-scope PRs in skills-evals auto-merge under ADR 0012 | Accepted |
+| [0018](0018-fleet-worker-fixture-prs-auto-merge-under-adr-0012.md) | Fleet worker fixture PRs in skills-evals auto-merge under ADR 0012 | Accepted |

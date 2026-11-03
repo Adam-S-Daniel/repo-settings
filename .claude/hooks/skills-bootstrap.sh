@@ -93,7 +93,10 @@
 # never by "delete whatever I do not recognise": that directory is the user's
 # own, and the claude.ai account-sync channel writes into it too. See "skills
 # that have LEFT the lock" near the bottom for the four conditions a removal
-# needs and the one contention case this deliberately does not resolve.
+# needs and the one contention case this deliberately does not resolve. Each
+# entry also carries `ref`, the commit its source resolved to (null when
+# unknown), and the record lists the distinct (registry, ref) pairs as
+# `sources`; both are informational and no removal reads them.
 #
 # Fails SOFT within its own execution: every failure path below emits a verdict
 # naming the exact file or binary at fault and exits 0, because a hook that
@@ -1984,11 +1987,13 @@ for lock_index, lock_path in enumerate(lock_paths):
 # owner. Three sub-cases, and conflating them breaks the ordinary input:
 #
 #   (a) benign     same name, same digest, DIFFERENT locks -> ONE install row
-#   (b) conflict   same name, DIFFERENT digests            -> install NEITHER
+#   (b) conflict   same name, DIFFERENT digests            -> install NEITHER,
+#                  unless every row is one registry's      -> `contest` (b')
 #   (c) intra-lock one lock contributed two rows for it    -> as today, `dup`
 #
 # Formally: a name installs iff every row naming it agrees on one normalised
-# digest AND no single lock contributed more than one row for it.
+# digest AND no single lock contributed more than one row for it -- or, since
+# ADR 0022, iff it is a (b') contest that bash resolves to one descendant pin.
 #
 # (a) IS THE COMMON CASE — the fleet's locks largely declare the same `adam`
 # bundle at the same ref — so collapsing has to happen BEFORE anything counts
@@ -2003,6 +2008,27 @@ for lock_index, lock_path in enumerate(lock_paths):
 # Failing closed is PER NAME, so when two refs differ only in the skills that
 # actually changed, every unchanged skill still unions cleanly — and it never
 # regresses, because today a multi-repo session delivers nothing at all.
+#
+# (b') AMENDS THAT "NEITHER" FOR ONE SHAPE ONLY (ADR 0022). When every row for
+# the name has the same `<bundle>/<skill>` key AND the same path inside the
+# registry (a lock`s own `layout` decides that path, so one key can name two
+# directories), comes from the same normalized
+# registry URL, and pins at least two DIFFERENT 40-hex commits of it, the
+# disagreement is usually one lock lagging the other: the registry re-pins its
+# own lock the moment a skill changes, and consumer locks catch up only when a
+# bumper re-pins them, so for hours or days every session attaching both got
+# NEITHER copy. The registry`s own history can order those two pins, which is
+# a tiebreak nobody invented. This reader cannot see that history -- nothing is
+# fetched yet -- so it does not decide: it emits every row with status
+# `contest`, exactly the rows (b) would have emitted as `dup`, and bash decides
+# after the fetch. If the descendant is unique, provable, on the registry`s
+# default branch, and holds the default branch`s current copy of the skill, its
+# row installs
+# and is verified against ITS OWN lock`s digest; anything else (diverged,
+# undeterminable, two newest) turns the rows back into `dup` and the outcome is
+# (b) to the byte. A different registry, a different key, a non-sha ref, or a
+# single shared pin never becomes a contest at all.
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
 by_name = {}
 for row in staged:
     by_name.setdefault(row[5], []).append(row)
@@ -2020,11 +2046,28 @@ for name in sorted(by_name):
         # (b) additionally emits a notice naming the locks that disagree and the
         # verdict reports the two apart; (c) is one lock to correct, (b) is two
         # to reconcile.
+        contest = (not intra
+                   and len({row[1] for row in group}) == 1
+                   and len({row[4] for row in group}) == 1
+                   and len({sources[row[3]]["url"] for row in group}) == 1
+                   and len({row[3] for row in group}) > 1
+                   and all(FULL_SHA.fullmatch(sources[row[3]]["ref"]) for row in group))
         if not intra:
-            notices.append(("conflict", name,
+            # The same notice text either way: a contest bash cannot resolve
+            # must report exactly what (b) reports, so the kind is the only
+            # difference and bash drops the notice for a contest it resolves.
+            notices.append(("contest" if contest else "conflict", name,
                             ", ".join(sorted({lock_labels[row[0]] for row in group}))))
+        if contest:
+            # Which lock pinned which source, for the verdict`s note only. The
+            # subject is `<source index>/<name>`: NAME admits no `/`, so bash
+            # splits it unambiguously. Advisory, like every notice -- the
+            # decision itself is driven by the counted `skills.nul` rows.
+            for row in group:
+                notices.append(("pin", "%d/%s" % (row[3], name), lock_labels[row[0]]))
         for row in group:
-            emitted.append(((row[1], row[0]), (row[1], row[2], str(row[3]), row[4], "dup")))
+            emitted.append(((row[1], row[0]), (row[1], row[2], str(row[3]), row[4],
+                                               "contest" if contest else "dup")))
     else:
         # Case (a): one row, the first in (lock_index, key) order.
         first = group[0]
@@ -2331,6 +2374,24 @@ fetch_source () {
   fi
 }
 
+# source_commit <checkout> <ref> — the commit a fetched source resolved to, for
+# the install record: 40 lowercase hex, or empty when it cannot be shown.
+# A full-SHA ref is what was checked out, so it needs no git process. Otherwise
+# HEAD is read with an explicit `--git-dir`, which turns off repository
+# discovery, so a checkout missing its `.git` fails rather than resolving an
+# enclosing repository's HEAD; GIT_CEILING_DIRECTORIES is only a second guard.
+source_commit () {
+  local dest="$1" ref="$2" commit=""
+  if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+    commit="$ref"
+  else
+    commit="$(GIT_CEILING_DIRECTORIES="${dest%/*}" run_git --git-dir="$dest/.git" \
+      rev-parse --verify -q 'HEAD^{commit}' 2>>"$LOG" </dev/null)" || commit=""
+  fi
+  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || commit=""
+  printf '%s' "$commit"
+}
+
 # --- read the framed source + skill records --------------------------------
 # Records are NUL-delimited (never split on a field's own bytes) and python
 # states its record counts in `meta` up front, so bash can DETECT a desync
@@ -2381,13 +2442,20 @@ fi
 CONFLICT_NAME=()
 CONFLICT_LOCKS=()
 DROPPED_ROW=()
+# A `contest` notice is entered as a conflict UNTIL bash proves otherwise (see
+# "cross-lock contests" below), so an unresolved contest reports in exactly the
+# position and words a conflict always has; `pin` says which lock pinned which
+# source, for the note a resolved contest earns.
+PIN_SUBJECT=()
+PIN_LOCK=()
 if [ -f "$tmp/notices.nul" ]; then
   while IFS= read -r -d '' notice_kind \
      && IFS= read -r -d '' notice_subject \
      && IFS= read -r -d '' notice_detail; do
     case "$notice_kind" in
-      conflict) CONFLICT_NAME+=("$notice_subject"); CONFLICT_LOCKS+=("$notice_detail") ;;
+      conflict|contest) CONFLICT_NAME+=("$notice_subject"); CONFLICT_LOCKS+=("$notice_detail") ;;
       dropped)  DROPPED_ROW+=("$notice_subject (from $notice_detail)") ;;
+      pin)      PIN_SUBJECT+=("$notice_subject"); PIN_LOCK+=("$notice_detail") ;;
     esac
   done < "$tmp/notices.nul"
 fi
@@ -2514,6 +2582,7 @@ fi
 
 SRC_SHORT=()
 SRC_OK=()
+SRC_COMMIT=()    # resolved commit per source, "" when failed or unknown
 SRC_LOST=()      # ", "-joined skill names a failed source could not supply
 SRC_LOST_N=()
 fetched=0
@@ -2529,9 +2598,11 @@ while [ "$index" -lt "${#SRC_NAME[@]}" ]; do
   SRC_SHORT+=("$short"); SRC_LOST+=(""); SRC_LOST_N+=(0)
   if fetch_source "$tmp/reg-$index" "$url" "$ref"; then
     SRC_OK+=(1)
+    SRC_COMMIT+=("$(source_commit "$tmp/reg-$index" "$ref")")
     fetched=$((fetched + 1))
   else
     SRC_OK+=(0)
+    SRC_COMMIT+=("")
     unreachable+=("${name}@${ref}")
   fi
   echo "source[$index] name=$name ref=$ref layout=$layout ok=${SRC_OK[$index]}" >>"$LOG"
@@ -2545,6 +2616,379 @@ done
 if [ "$fetched" -eq 0 ]; then
   purge_locked_destinations
   emit "skills: DEGRADED — could not fetch $(join_names "${unreachable[@]}") (network, or a bad ref in $LOCK_LABEL; see $LOG)"
+fi
+
+# --- cross-lock contests: the newer pin of one registry (ADR 0022) ---------
+# The reader marks a name `contest` when two or more locks name it at different
+# digests but every row is the same `<bundle>/<skill>` from the same registry,
+# pinned at different full commit SHAs. Usually that is one lock lagging the
+# other: the registry re-pins its own lock the moment a skill changes and the
+# consumer locks catch up later. Now that every source is fetched, the
+# registry's own history can say which pin is newer, and that is the only
+# tiebreak taken: the row from the lock whose ref DESCENDS from every other
+# contesting ref installs, verified against that lock's own digest by the
+# ordinary install path. No digest from a losing lock is used for the name.
+#
+# Everything this cannot PROVE stays the conflict it was before ADR 0022, with
+# the same notice, the same `dup` arm and the same removal: a source that did
+# not fetch, a ref that is not 40-hex, one source pinning two digests for the
+# name, refs that have diverged, two incomparable "newest" refs, or ancestry
+# that cannot be established inside the bounded history or the fetch budget.
+# "Not shown to be an ancestor" never means "pick something else".
+#
+# HOW ANCESTRY IS FETCHED, AND BOUNDED. Every source is a `--depth 1` clone, so
+# the history needed is not on disk. For a candidate descendant W, its own
+# checkout is deepened with `--shallow-since` set to the OLDEST other
+# contesting commit's committer time minus $CONTEST_MARGIN, through `run_git`,
+# so it spends the same 60-second budget and gets the same process-group kill
+# as the first fetch. The server sends only commits reachable from W, so an
+# older pin that is present afterwards is reachable from it, and `merge-base
+# --is-ancestor` confirms that locally. A pin outside that window -- a commit on
+# the path dated before the cutoff -- is simply absent, `merge-base` exits 128,
+# and the contest fails closed. The margin absorbs ordinary clock skew between
+# committers; it is not a correctness bound, and getting it wrong can only cost
+# an install, never choose the wrong one. A gap wider than $CONTEST_WINDOW
+# between the candidate and the oldest other pin is not fetched across at all.
+#
+# DESCENT ALONE DOES NOT WIN. The winner must also be reachable from the
+# registry's DEFAULT BRANCH (see `on_default_branch`): GitHub serves fork and
+# pull-request commits by SHA through the upstream URL, so an unmerged commit
+# whose parent is the honest pin would otherwise descend from it and win.
+#
+# NOR DOES BEING MERGED. The winner's tree at the skill's path must be the very
+# tree the default branch's tip has there now (see `matches_default_head`), so a
+# merged change the registry later reverted cannot win with withdrawn bytes.
+#
+# Every ref handed to git here is re-validated as 40 lowercase hex first, so no
+# lock-supplied string can be read as an option. The reads (`log`, `merge-base`)
+# are local and touch no network, so they call git directly; the one network
+# call, the deepen, goes through `run_git`.
+CONTEST_MARGIN=86400
+# The widest gap, in seconds, between the newest candidate's commit time and the
+# oldest other pin that this run will fetch history across. Committer dates are
+# whatever the author wrote, so an older pin carrying a forged ancient date would
+# otherwise turn the deepen into a full-history fetch; past this window the
+# contest fails closed instead. Ninety days is far beyond any real bumper lag.
+CONTEST_WINDOW=$(( 90 * 86400 ))
+CT_NAME=()
+CT_KEY=()
+CT_RELPATH=()
+CT_DIGEST=()
+CT_INDEX=()
+if [ -f "$tmp/skills.nul" ]; then
+  while IFS= read -r -d '' key \
+     && IFS= read -r -d '' want \
+     && IFS= read -r -d '' index \
+     && IFS= read -r -d '' relpath \
+     && IFS= read -r -d '' status; do
+    if [ "$status" = "contest" ]; then
+      CT_NAME+=("${key##*/}"); CT_KEY+=("$key"); CT_RELPATH+=("$relpath")
+      CT_DIGEST+=("$want"); CT_INDEX+=("$index")
+    fi
+  done < "$tmp/skills.nul"
+fi
+
+# Resolved contests: the name, the winning source index and the winning
+# digest, plus whether the install loop has consumed the winning row yet (two
+# locks at the newest pin are one install, as in case (a)).
+WON_NAME=()
+WON_INDEX=()
+WON_DIGEST=()
+WON_SEEN=()
+WON_OK=()
+# Sources already deepened, and the cutoff each was deepened to, so a second
+# contested name between the same two pins costs no second fetch.
+DEEP_INDEX=()
+DEEP_CUT=()
+DEFAULT_DIR=""
+DEFAULT_HEAD=""
+# The registry's DEFAULT BRANCH, fetched per registry URL into its own scratch
+# repository: the URL, the directory, and the cutoff it was fetched to.
+DEF_URL=()
+DEF_DIR=()
+DEF_CUT=()
+
+# commit_time <source index> — the committer time of that source's pinned
+# commit, as digits, or nothing.
+commit_time () {
+  local out
+  out="$(git "${GIT_VERBATIM[@]}" -C "$tmp/reg-$1" log -1 --format=%ct "${SRC_REF[$1]}" -- 2>>"$LOG" </dev/null)" || return 1
+  # 1-12 digits: a commit time, not an arbitrarily long number for $(( )).
+  [[ "$out" =~ ^[0-9]{1,12}$ ]] || return 1
+  printf '%s' "$out"
+}
+
+# deepen_to <source index> <epoch> — make that checkout's history reach back to
+# <epoch>. Fails closed when the budget is spent.
+deepen_to () {
+  local at=0
+  while [ "$at" -lt "${#DEEP_INDEX[@]}" ]; do
+    if [ "${DEEP_INDEX[$at]}" = "$1" ] && [ "${DEEP_CUT[$at]}" -le "$2" ]; then return 0; fi
+    at=$((at + 1))
+  done
+  if [ $(( fetch_deadline - SECONDS )) -lt 1 ]; then
+    echo "contest: fetch budget spent before deepening source[$1]" >>"$LOG"
+    return 1
+  fi
+  run_git -C "$tmp/reg-$1" fetch -q --shallow-since="@$2" origin "${SRC_REF[$1]}" \
+    >>"$LOG" 2>&1 </dev/null || return 1
+  DEEP_INDEX+=("$1"); DEEP_CUT+=("$2")
+}
+
+# on_default_branch <source index> <epoch> — is that source's pinned commit
+# reachable from its registry's DEFAULT BRANCH (the remote's HEAD)?
+#
+# Descending from the honest pin is not enough on its own. GitHub serves every
+# object in a repository's fork network by SHA through the upstream URL, so a
+# lock pinning an unmerged pull-request or fork commit whose parent is the
+# honest pin fetches cleanly, descends from it, and would otherwise WIN. A
+# commit the registry has actually merged is reachable from its default branch;
+# an unmerged one is not. So the remote's `HEAD` -- asked for by name, never a
+# hardcoded `main` -- is fetched into a SEPARATE scratch repository, bounded by
+# `--shallow-since` at the winner's commit time minus the margin, and the
+# winner must be an ancestor of what came back. A separate repository, because
+# only objects reachable from that HEAD arrive there: the winner being present
+# at all is what reachability means, and an absent winner makes `merge-base`
+# exit 128, which fails closed like every other undetermined case.
+on_default_branch () {
+  local src="$1" cut="$2" url="${SRC_URL[$1]}" at=0 dir="" fetched_cut="" head
+  if [ "$cut" -lt 1 ]; then cut=1; fi
+  while [ "$at" -lt "${#DEF_URL[@]}" ]; do
+    if [ "${DEF_URL[$at]}" = "$url" ]; then dir="${DEF_DIR[$at]}"; fetched_cut="${DEF_CUT[$at]}"; break; fi
+    at=$((at + 1))
+  done
+  if [ -z "$dir" ]; then
+    dir="$tmp/default-${#DEF_URL[@]}"
+    { run_git init -q "$dir" && run_git -C "$dir" remote add origin "$url"; } \
+      >>"$LOG" 2>&1 </dev/null || return 1
+    DEF_URL+=("$url"); DEF_DIR+=("$dir"); DEF_CUT+=("")
+  fi
+  if [ -z "$fetched_cut" ] || [ "$fetched_cut" -gt "$cut" ]; then
+    if [ $(( fetch_deadline - SECONDS )) -lt 1 ]; then
+      echo "contest: fetch budget spent before fetching the default branch of source[$src]" >>"$LOG"
+      return 1
+    fi
+    run_git -C "$dir" fetch -q --shallow-since="@$cut" origin HEAD \
+      >>"$LOG" 2>&1 </dev/null || return 1
+    DEF_CUT[at]="$cut"
+  fi
+  head="$(git "${GIT_VERBATIM[@]}" -C "$dir" rev-parse --verify --quiet FETCH_HEAD 2>>"$LOG" </dev/null)" || return 1
+  [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 1
+  DEFAULT_DIR="$dir"; DEFAULT_HEAD="$head"
+  git "${GIT_VERBATIM[@]}" -C "$dir" merge-base --is-ancestor "${SRC_REF[$src]}" "$head" \
+    >>"$LOG" 2>&1 </dev/null
+}
+
+# matches_default_head <source index> <relpath> — does that source's pinned
+# commit hold the SAME tree at <relpath> as the default branch's tip, fetched by
+# the `on_default_branch` call just before this one?
+#
+# Being merged is not being current. A newer commit that the registry later
+# REVERTED descends from the honest pin and sits on the default branch, and would
+# otherwise win with exactly the bytes the registry withdrew. So the winner wins
+# only if its copy of the skill is what the registry ships TODAY: the tree object
+# id at <relpath> must be identical in both. Missing on either side, or a path
+# that is not a plain relative one, fails closed.
+matches_default_head () {
+  local mine theirs
+  case "/$2/" in */../*|*/./*|*//*) return 1 ;; esac
+  [[ "$2" =~ ^[A-Za-z0-9._/-]+$ ]] || return 1
+  mine="$(git "${GIT_VERBATIM[@]}" -C "$tmp/reg-$1" rev-parse --verify --quiet "${SRC_REF[$1]}:$2" 2>>"$LOG" </dev/null)" || return 1
+  theirs="$(git "${GIT_VERBATIM[@]}" -C "$DEFAULT_DIR" rev-parse --verify --quiet "$DEFAULT_HEAD:$2" 2>>"$LOG" </dev/null)" || return 1
+  [[ "$mine" =~ ^[0-9a-f]{40}$ ]] && [ "$mine" = "$theirs" ] || return 1
+  # THE SAME TREE IS NOT YET THE SAME BYTES. A `.gitattributes` at the root or
+  # in any parent directory of <relpath> (eol=crlf, working-tree-encoding,
+  # ident) changes what checkout writes, and the tree id above cannot see it --
+  # a merged-then-reverted root `.gitattributes` would otherwise install bytes
+  # today`s default branch does not produce. So each of those files must be the
+  # same blob on both sides, or absent on both. One inside <relpath> is part of
+  # its tree, so it is already covered.
+  # The root `.lfsconfig` the same way: it can point a checkout at different
+  # LFS content without touching the tree either.
+  mine="$(git "${GIT_VERBATIM[@]}" -C "$tmp/reg-$1" rev-parse --verify --quiet "${SRC_REF[$1]}:.lfsconfig" 2>>"$LOG" </dev/null)" || mine=""
+  theirs="$(git "${GIT_VERBATIM[@]}" -C "$DEFAULT_DIR" rev-parse --verify --quiet "$DEFAULT_HEAD:.lfsconfig" 2>>"$LOG" </dev/null)" || theirs=""
+  [ "$mine" = "$theirs" ] || return 1
+  local dir="" rest="$2" attr
+  while :; do
+    attr="${dir}.gitattributes"
+    mine="$(git "${GIT_VERBATIM[@]}" -C "$tmp/reg-$1" rev-parse --verify --quiet "${SRC_REF[$1]}:$attr" 2>>"$LOG" </dev/null)" || mine=""
+    theirs="$(git "${GIT_VERBATIM[@]}" -C "$DEFAULT_DIR" rev-parse --verify --quiet "$DEFAULT_HEAD:$attr" 2>>"$LOG" </dev/null)" || theirs=""
+    [ "$mine" = "$theirs" ] || return 1
+    case "$rest" in */*) ;; *) break ;; esac
+    dir="$dir${rest%%/*}/"
+    rest="${rest#*/}"
+  done
+}
+
+# resolve_contest <name> — record the winning row for <name> in WON_*, or fail.
+resolve_contest () {
+  local subject="$1" at=0 idx url="" key0="" rel0="" d seen i ids=() digs=() times=() t
+  local cand best best_t oldest other ok tried=()
+  while [ "$at" -lt "${#CT_NAME[@]}" ]; do
+    if [ "${CT_NAME[$at]}" = "$subject" ]; then
+      idx="${CT_INDEX[$at]}"
+      [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -lt "${#SRC_NAME[@]}" ] || return 1
+      [ "${SRC_OK[$idx]}" -eq 1 ] || return 1
+      [[ "${SRC_REF[$idx]}" =~ ^[0-9a-f]{40}$ ]] || return 1
+      if [ -z "$url" ]; then url="${SRC_URL[$idx]}"; fi
+      [ "${SRC_URL[$idx]}" = "$url" ] || return 1
+      # One `<bundle>/<skill>` key, as the reader already required: the same
+      # skill name from two bundles is two different skills, not two pins.
+      if [ -z "$key0" ]; then key0="${CT_KEY[$at]}"; fi
+      [ "${CT_KEY[$at]}" = "$key0" ] || return 1
+      # One path inside the registry, as the reader already required: a lock`s
+      # own `layout` can route the same key to a different directory.
+      if [ -z "$rel0" ]; then rel0="${CT_RELPATH[$at]}"; fi
+      [ "${CT_RELPATH[$at]}" = "$rel0" ] || return 1
+      seen=0
+      i=0
+      while [ "$i" -lt "${#ids[@]}" ]; do
+        if [ "${ids[$i]}" = "$idx" ]; then
+          seen=1
+          # One source naming two digests for one name has nothing to order.
+          [ "${digs[$i]}" = "${CT_DIGEST[$at]}" ] || return 1
+        fi
+        i=$((i + 1))
+      done
+      if [ "$seen" -eq 0 ]; then ids+=("$idx"); digs+=("${CT_DIGEST[$at]}"); fi
+    fi
+    at=$((at + 1))
+  done
+  [ "${#ids[@]}" -ge 2 ] || return 1
+  for d in "${ids[@]}"; do
+    t="$(commit_time "$d")" || return 1
+    times+=("$t")
+  done
+  # Candidates newest-first by committer time; at most one can descend from all
+  # the others, so the first that is proven wins and the rest are not tried.
+  while [ "${#tried[@]}" -lt "${#ids[@]}" ]; do
+    best=""; best_t=-1
+    i=0
+    while [ "$i" -lt "${#ids[@]}" ]; do
+      cand=0
+      if [ "${#tried[@]}" -gt 0 ]; then
+        for d in "${tried[@]}"; do if [ "$d" = "$i" ]; then cand=1; fi; done
+      fi
+      if [ "$cand" -eq 0 ] && [ "${times[$i]}" -gt "$best_t" ]; then best="$i"; best_t="${times[$i]}"; fi
+      i=$((i + 1))
+    done
+    tried+=("$best")
+    oldest=""
+    i=0
+    while [ "$i" -lt "${#ids[@]}" ]; do
+      if [ "$i" != "$best" ] && { [ -z "$oldest" ] || [ "${times[$i]}" -lt "$oldest" ]; }; then
+        oldest="${times[$i]}"
+      fi
+      i=$((i + 1))
+    done
+    # Dates must run forward: a candidate older than another pin cannot be its
+    # descendant in any history this hook is willing to believe.
+    if [ "$best_t" -lt "$oldest" ]; then
+      echo "contest: $subject candidate source[${ids[$best]}] is dated before another pin" >>"$LOG"
+      continue
+    fi
+    if [ $(( best_t - oldest )) -gt "$CONTEST_WINDOW" ]; then
+      echo "contest: $subject spans more than the $CONTEST_WINDOW-second window from source[${ids[$best]}]" >>"$LOG"
+      continue
+    fi
+    oldest=$(( oldest - CONTEST_MARGIN ))
+    if [ "$oldest" -lt 1 ]; then oldest=1; fi
+    deepen_to "${ids[$best]}" "$oldest" || continue
+    ok=1
+    i=0
+    while [ "$i" -lt "${#ids[@]}" ]; do
+      if [ "$i" != "$best" ]; then
+        other="${ids[$i]}"
+        if ! git "${GIT_VERBATIM[@]}" -C "$tmp/reg-${ids[$best]}" merge-base --is-ancestor \
+             "${SRC_REF[$other]}" "${SRC_REF[${ids[$best]}]}" >>"$LOG" 2>&1 </dev/null; then
+          ok=0
+          break
+        fi
+      fi
+      i=$((i + 1))
+    done
+    if [ "$ok" -eq 1 ] && ! on_default_branch "${ids[$best]}" $(( best_t - CONTEST_MARGIN )); then
+      echo "contest: $subject pin at source[${ids[$best]}] is not on the registry's default branch" >>"$LOG"
+      ok=0
+    fi
+    if [ "$ok" -eq 1 ] && ! matches_default_head "${ids[$best]}" "$rel0"; then
+      echo "contest: $subject pin at source[${ids[$best]}] differs from the default branch tip at $rel0" >>"$LOG"
+      ok=0
+    fi
+    if [ "$ok" -eq 1 ]; then
+      WON_NAME+=("$subject"); WON_INDEX+=("${ids[$best]}")
+      WON_DIGEST+=("${digs[$best]}"); WON_SEEN+=(0); WON_OK+=(0)
+      echo "contest: $subject resolved to source[${ids[$best]}], which descends from every other pin" >>"$LOG"
+      return 0
+    fi
+  done
+  echo "contest: $subject left in conflict (no pin provably descends from every other)" >>"$LOG"
+  return 1
+}
+
+if [ "${#CT_NAME[@]}" -gt 0 ]; then
+  contest_done=()
+  at=0
+  while [ "$at" -lt "${#CT_NAME[@]}" ]; do
+    subject="${CT_NAME[$at]}"
+    seen=0
+    if [ "${#contest_done[@]}" -gt 0 ]; then
+      for done_name in "${contest_done[@]}"; do
+        if [ "$done_name" = "$subject" ]; then seen=1; break; fi
+      done
+    fi
+    if [ "$seen" -eq 0 ]; then
+      contest_done+=("$subject")
+      resolve_contest "$subject" || true
+    fi
+    at=$((at + 1))
+  done
+fi
+
+# classify_contest_row <name> <index> <digest> — sets $contest_role for one `contest`
+# row: `winner` (install it), `loser` (another row of a resolved contest, so
+# skip it without touching the destination), or `conflict` (unresolved). For a
+# winner, $contest_won_at is its WON_* slot, so a verified install can be noted.
+classify_contest_row () {
+  local at=0
+  contest_role="conflict"
+  contest_won_at=""
+  while [ "$at" -lt "${#WON_NAME[@]}" ]; do
+    if [ "${WON_NAME[$at]}" = "$1" ]; then
+      contest_role="loser"
+      if [ "${WON_SEEN[$at]}" -eq 0 ] && [ "${WON_INDEX[$at]}" = "$2" ] \
+         && [ "${WON_DIGEST[$at]}" = "$3" ]; then
+        WON_SEEN[at]=1
+        contest_role="winner"
+        contest_won_at="$at"
+      fi
+      return 0
+    fi
+    at=$((at + 1))
+  done
+}
+
+# A resolved contest is not a conflict: drop its provisional conflict entry,
+# keeping every other entry in its original order.
+if [ "${#WON_NAME[@]}" -gt 0 ]; then
+  kept_name=()
+  kept_locks=()
+  at=0
+  while [ "$at" -lt "${#CONFLICT_NAME[@]}" ]; do
+    won=0
+    for won_name in "${WON_NAME[@]}"; do
+      if [ "$won_name" = "${CONFLICT_NAME[$at]}" ]; then won=1; break; fi
+    done
+    if [ "$won" -eq 0 ]; then
+      kept_name+=("${CONFLICT_NAME[$at]}"); kept_locks+=("${CONFLICT_LOCKS[$at]}")
+    fi
+    at=$((at + 1))
+  done
+  CONFLICT_NAME=()
+  CONFLICT_LOCKS=()
+  if [ "${#kept_name[@]}" -gt 0 ]; then
+    CONFLICT_NAME=("${kept_name[@]}"); CONFLICT_LOCKS=("${kept_locks[@]}")
+  fi
 fi
 
 # --- the digest ------------------------------------------------------------
@@ -2645,13 +3089,23 @@ RECORD="$DEST/.skills-bootstrap-installed.json"
 # the loop below may `rm -rf`, so a `json.py` or `re.py` in the project dir must
 # not be what reads and validates it.
 RECORD_PATH="$RECORD" TMP_DIR="$tmp" python3 -I - >>"$LOG" 2>&1 <<'RECORDED_PY'
-import json, os, re, sys
+import json, os, re, stat, sys
 
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 DIGEST = re.compile(r"[0-9a-f]{64}")
 
+
+def open_nonblocking(path, flags):
+    # A FIFO left at the record's path would block a plain open until a writer
+    # appeared; non-blocking, it opens at once and the fstat below refuses it.
+    return os.open(path, flags | getattr(os, "O_NONBLOCK", 0))
+
+
 try:
-    with open(os.environ["RECORD_PATH"], encoding="utf-8") as handle:
+    with open(os.environ["RECORD_PATH"], encoding="utf-8",
+              opener=open_nonblocking) as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            sys.exit(3)
         record = json.load(handle)
 except FileNotFoundError:
     record = {"installed": []}          # first run: nothing was ever recorded
@@ -2730,6 +3184,7 @@ may_replace () {
 }
 
 total=0
+rows_read=0
 ok=0
 mismatch=()
 collision=()
@@ -2751,6 +3206,21 @@ while IFS= read -r -d '' key \
    && IFS= read -r -d '' index \
    && IFS= read -r -d '' relpath \
    && IFS= read -r -d '' status; do
+  rows_read=$((rows_read + 1))
+  contest_won_at=""
+  # A `contest` row (ADR 0022) becomes an ordinary row before anything else
+  # here looks at it: the winner of a resolved contest is an `install` row,
+  # every other row of that contest is skipped BEFORE the may_replace gate and
+  # every removal -- it neither counts nor touches the destination the winner
+  # owns -- and an unresolved contest is `dup`, which is case (b) exactly.
+  if [ "$status" = "contest" ]; then
+    classify_contest_row "${key##*/}" "$index" "$want"
+    case "$contest_role" in
+      loser)  continue ;;
+      winner) status="install" ;;
+      *)      status="dup" ;;
+    esac
+  fi
   total=$((total + 1))
   name="${key##*/}"
 
@@ -2903,6 +3373,10 @@ while IFS= read -r -d '' key \
     # the lock stops naming it) from "somebody else's, or edited" (never).
     printf '%s\0%s\0%s\0%s\0' \
       "$name" "${SRC_URL[$index]}" "${key%%/*}" "$want" >>"$tmp/installed.nul"
+    # Its source commit, in a stream of its own that only the record writer
+    # reads: a short or missing one can drop refs and nothing else.
+    printf '%s\0%s\0' "$name" "${SRC_COMMIT[$index]}" >>"$tmp/installed_refs.nul"
+    if [ -n "$contest_won_at" ]; then WON_OK[contest_won_at]=1; fi
   else
     # Integrity FAILED: leave nothing behind. The unverified bytes must not
     # stay in ~/.claude/skills for the model to load on turn one.
@@ -2913,11 +3387,13 @@ done < "$tmp/skills.nul"
 
 # The other half of the framing contract: python said how many skill rows it
 # wrote; bash must have processed exactly that many complete 5-field records.
-if [ "$total" -ne "$NSKILLS" ]; then
+# `rows_read`, not `total`: a resolved contest's losing rows are read but not
+# counted as skills, so only the raw count can be held to the declared one.
+if [ "$rows_read" -ne "$NSKILLS" ]; then
   # Including whatever this run just installed: the framing is what says which
   # rows were even meant to exist, so none of it is trustworthy now.
   purge_locked_destinations
-  emit "skills: DEGRADED — could not read $LOCK_LABEL (skill framing mismatch: $NSKILLS declared, $total read; see $LOG)"
+  emit "skills: DEGRADED — could not read $LOCK_LABEL (skill framing mismatch: $NSKILLS declared, $rows_read read; see $LOG)"
 fi
 
 # --- skills that have LEFT the lock ----------------------------------------
@@ -3005,7 +3481,7 @@ record_unwritable=0
 # in the project directory would otherwise be what decides which of the user's
 # directories this hook is about to `rm -rf`.
 if ! RECORD_PATH="$RECORD" TMP_DIR="$tmp" python3 -I - >>"$LOG" 2>&1 <<'PLAN_PY'
-import json, os, re, sys
+import json, os, re, stat, sys
 
 record_path = os.environ["RECORD_PATH"]
 tmp_dir = os.environ["TMP_DIR"]
@@ -3043,8 +3519,15 @@ locked = {key.rsplit("/", 1)[-1]
           in read_records(os.path.join(tmp_dir, "skills.nul"), 5)}
 claims = set(read_records(os.path.join(tmp_dir, "claims.nul"), 2))
 
+def open_nonblocking(path, flags):
+    # As in the install-record reader: a FIFO opens at once and is refused.
+    return os.open(path, flags | getattr(os, "O_NONBLOCK", 0))
+
+
 try:
-    with open(record_path, encoding="utf-8") as handle:
+    with open(record_path, encoding="utf-8", opener=open_nonblocking) as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            sys.exit(3)
         record = json.load(handle)
 except FileNotFoundError:
     record = {"installed": []}          # first run: nothing was ever recorded
@@ -3152,11 +3635,18 @@ fi
 # sharing a destination an error — and this run's install wins the key, since it
 # is what just wrote those bytes.
 #
+# Each entry also records `ref`: for this run's installs, the commit its source
+# resolved to (installed_refs.nul); for a carried-forward entry, the previous
+# record's ref for that same name AND digest; otherwise null. `sources` lists
+# the distinct (registry, ref) pairs behind non-null refs. Refs are
+# informational, so any failure reading them drops refs and nothing else.
+#
 # Staged in $DEST and moved into place with os.replace: a crashed or half-written
 # run leaves the PREVIOUS record intact rather than a truncated one, and the
 # write can never follow a symlink left at that path. Carries no timestamp —
-# two runs installing the same thing must produce a byte-identical file, or
-# every session start would rewrite it for nothing.
+# two runs installing the same thing must produce a byte-identical file — and
+# when the existing record is a regular file with exactly those bytes it is
+# left untouched, so its mtime and inode do not move on an unchanged run.
 #
 # It is rewritten even when the record could not be READ, which is what makes
 # that state self-healing in one run. The cost is that entries from before the
@@ -3164,10 +3654,12 @@ fi
 # left alone forever rather than removed — the safe direction of the same rule:
 # what this hook cannot show it installed, it does not delete.
 if ! RECORD_PATH="$RECORD" TMP_DIR="$tmp" python3 -I - >>"$LOG" 2>&1 <<'RECORD_PY'
-import json, os, tempfile
+import json, os, re, stat, tempfile
 
 record_path = os.environ["RECORD_PATH"]
 tmp_dir = os.environ["TMP_DIR"]
+COMMIT = re.compile(r"[0-9a-f]{40}")
+PREVIOUS_LIMIT = 1024 * 1024
 
 
 def read_records(path, width):
@@ -3183,24 +3675,85 @@ def read_records(path, width):
             for at in range(0, len(fields) - width + 1, width)]
 
 
+def read_regular(path, limit):
+    """`path`'s bytes if it is a regular file of at most `limit` bytes, else None.
+
+    lstat first, so a FIFO is never opened and a symlink never followed; the
+    non-blocking open and the fstat after it cover a swap between the two.
+    """
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            return None
+        flags = (os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+        with os.fdopen(os.open(path, flags), "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None
+            data = handle.read(limit + 1)
+    except OSError:
+        return None
+    return data if len(data) <= limit else None
+
+
+# This run's source commit per installed name, from complete NUL-terminated
+# (name, ref) pairs only: an unterminated trailing field is dropped.
+try:
+    with open(os.path.join(tmp_dir, "installed_refs.nul"), encoding="utf-8") as handle:
+        fields = handle.read().split("\0")[:-1]
+    refs = {fields[at]: fields[at + 1] for at in range(0, len(fields) - 1, 2)
+            if COMMIT.fullmatch(fields[at + 1])}
+except Exception:
+    refs = {}
+
+# The previous record's refs, keyed by (name, digest), for carried-forward
+# entries. Any failure here means no carry-over, never a failed write.
+carried = {}
+try:
+    previous = read_regular(record_path, PREVIOUS_LIMIT)
+    if previous is not None:
+        for entry in json.loads(previous)["installed"]:
+            if not isinstance(entry, dict):
+                continue
+            name, digest, ref = entry.get("name"), entry.get("digest"), entry.get("ref")
+            if (isinstance(name, str) and isinstance(digest, str)
+                    and isinstance(ref, str) and COMMIT.fullmatch(ref)):
+                carried[(name, digest)] = ref
+except Exception:
+    carried = {}
+
 entries = {}
 # Carried-forward first, this run's installs second, so a name claimed by both
 # resolves to the run that actually wrote the directory.
-for name, registry, bundle, digest in (
-        read_records(os.path.join(tmp_dir, "keep.nul"), 4)
-        + read_records(os.path.join(tmp_dir, "installed.nul"), 4)):
-    entries[name] = {"name": name, "registry": registry,
-                     "bundle": bundle, "digest": digest}
+for name, registry, bundle, digest in read_records(
+        os.path.join(tmp_dir, "keep.nul"), 4):
+    entries[name] = {"name": name, "registry": registry, "bundle": bundle,
+                     "digest": digest, "ref": carried.get((name, digest))}
+for name, registry, bundle, digest in read_records(
+        os.path.join(tmp_dir, "installed.nul"), 4):
+    entries[name] = {"name": name, "registry": registry, "bundle": bundle,
+                     "digest": digest, "ref": refs.get(name)}
 
-payload = {"version": 1, "installed": [entries[name] for name in sorted(entries)]}
+installed = [entries[name] for name in sorted(entries)]
+sources = sorted({(entry["registry"], entry["ref"])
+                  for entry in installed if entry["ref"] is not None})
+payload = {"version": 1, "installed": installed,
+           "sources": [{"registry": registry, "ref": ref}
+                       for registry, ref in sources]}
+# LF only: the install record is a JSON artifact a human reads and another
+# run parses. Its bytes should not depend on which platform wrote it.
+data = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+
+# Unchanged: leave the existing file alone rather than replace it with a copy.
+if read_regular(record_path, len(data)) == data:
+    raise SystemExit(0)
+
 directory = os.path.dirname(record_path) or "."
 staged_fd, staged = tempfile.mkstemp(
     dir=directory, prefix=".skills-bootstrap-installed.", suffix=".tmp")
 try:
-    # LF only: the install record is a JSON artifact a human reads and another
-    # run parses. Its bytes should not depend on which platform wrote it.
-    with os.fdopen(staged_fd, "w", encoding="utf-8", newline="") as handle:
-        handle.write(json.dumps(payload, indent=2) + "\n")
+    with os.fdopen(staged_fd, "wb") as handle:
+        handle.write(data)
     os.replace(staged, record_path)
 except BaseException:
     try:
@@ -3356,9 +3909,45 @@ fi
 # after the OK/DEGRADED word, and only when non-empty, so the ordinary all-clear
 # case — nothing removed, nothing narrowed — still ends at `— OK` with nothing
 # extra to read.
+# The note a resolved contest earns -- only for a winner that actually
+# installed and verified. One that failed its own digest is a mismatch, and is
+# reported as one, not as an install.
+RESOLVED=()
+at=0
+while [ "$at" -lt "${#WON_NAME[@]}" ]; do
+  if [ "${WON_OK[$at]}" -ne 1 ]; then
+    at=$((at + 1))
+    continue
+  fi
+  newer=()
+  behind=()
+  i=0
+  while [ "$i" -lt "${#PIN_SUBJECT[@]}" ]; do
+    if [ "${PIN_SUBJECT[$i]#*/}" = "${WON_NAME[$at]}" ]; then
+      pin_dir="${PIN_LOCK[$i]%/*}"
+      pin_repo="$(clamp "${pin_dir##*/}")"
+      if [ "${PIN_SUBJECT[$i]%%/*}" = "${WON_INDEX[$at]}" ]; then
+        newer+=("$pin_repo")
+      else
+        behind+=("$pin_repo")
+      fi
+    fi
+    i=$((i + 1))
+  done
+  if [ "${#newer[@]}" -gt 0 ] && [ "${#behind[@]}" -gt 0 ]; then
+    RESOLVED+=("${WON_NAME[$at]} from $(join_names "${newer[@]}") over $(join_names "${behind[@]}")")
+  else
+    RESOLVED+=("${WON_NAME[$at]}")
+  fi
+  at=$((at + 1))
+done
+
 notes=()
 if [ "${#removed[@]}" -gt 0 ]; then
   notes+=("removed ${#removed[@]} $(plural "${#removed[@]}" skill skills) no longer in the lock ($(join_names "${removed[@]}"))")
+fi
+if [ "${#RESOLVED[@]}" -gt 0 ]; then
+  notes+=("installed the newer pin of ${#RESOLVED[@]} $(plural "${#RESOLVED[@]}" skill skills) where one lock is behind another on the same registry ($(join_names "${RESOLVED[@]}"))")
 fi
 if [ "${#narrowed[@]}" -gt 0 ]; then
   notes+=("AGENTSKILLS_BUNDLE narrowed this run to one bundle, leaving ${#narrowed[@]} other-bundle $(plural "${#narrowed[@]}" skill skills) alone ($(join_names "${narrowed[@]}"))")

@@ -66,10 +66,41 @@
 # A developer's own global instructions are theirs; everything outside the
 # markers is preserved. Normal mode orders deliveries by the payload's last
 # commit time (or its mtime when dirty) so an older checkout cannot replace a
-# newer version. The `fleet-guidance-delivered` marker records that integer
-# epoch beside the version in normal-mode blocks. A tie favors this checkout;
-# the same hash only refreshes an older stamp. Replacements are atomic and
-# follow destination symlinks.
+# newer version. A caller whose payload has no checkout passes the time of the
+# commit the payload was taken from (a plugin passes the committer time of the
+# `main` commit it downloaded base.md from) as FLEET_GUIDANCE_PAYLOAD_STAMP
+# (decimal epoch seconds) beside FLEET_GUIDANCE_PAYLOAD. A value that is not
+# decimal, has more than 10 digits, or is more than a day in the future is
+# ignored, and so is the stamp when --workspace picked another payload. The
+# `fleet-guidance-delivered` marker records that integer epoch beside the
+# version in normal-mode blocks. A tie favors this checkout; the same hash only
+# refreshes an older stamp. Replacements are atomic and follow destination
+# symlinks.
+#
+# CHECK VALUE
+# -----------
+# Every block this hook writes ends with one plain-text line just before the
+# END marker:
+#   fleet-guidance check value: <8 hex>
+# It lets a session's report of what loaded be checked. The repo stub
+# (agents-md/stub.md) asks the session to quote the value in its first reply,
+# and the guidance-load Stop hook (guidance-load-record.sh) compares that quote
+# with the value in the memory file the session actually loaded.
+#
+# Why plain text: Claude Code strips HTML comments from memory files before the
+# model sees them, so a comment such as the version id could not be quoted.
+#
+# Why the LAST 8 hex of the payload's sha256: the value rotates with every
+# payload change and needs no edit of base.md (the version id, and so the
+# verdict, is the FIRST 8 hex, which the hook prints whether or not memory
+# loaded; these are never printed). It exists only in the block this hook
+# writes. base.md and every repo copy of it lack it, so a session that only
+# read base.md by hand cannot quote it. Nothing on stdout, in the workspace line
+# or in the delivery receipt carries it. With no working digest tool the
+# version is `unknown` and no line is written. An installed block of the same
+# version that lacks the line is rewritten with it, keeping the higher of the
+# two delivery stamps. --codex-cloud mode writes the same line from the same
+# payload bytes.
 #
 # CODEX CLOUD MODE
 # ----------------
@@ -441,6 +472,9 @@ normalize_stamp() {
         NORMAL_STAMP="${NORMAL_STAMP:1}"
     done
 }
+# A payload with no checkout stamps zero here; the caller can supply the time of
+# the commit the payload was taken from as FLEET_GUIDANCE_PAYLOAD_STAMP (see
+# the normal-path use below).
 payload_stamp() {
     local source="$1" source_dir source_name git_worktree status stamp=0
     source_dir="$(dirname "$source")"
@@ -601,7 +635,12 @@ try:
         )
         verdict = f"fleet-guidance: skipped (FLEET_GUIDANCE_SKIP set) — persisted in {label}"
     else:
-        version = hashlib.sha256(payload).hexdigest()[:8]
+        digest = hashlib.sha256(payload).hexdigest()
+        version = digest[:8]
+        # The check value: the LAST 8 hex of the digest, as the normal path
+        # computes it (see CHECK VALUE above). The block is always rebuilt
+        # whole and compared below, so one that lacks the line is rewritten.
+        check = digest[56:]
         payload_body = payload[len(repo_header):] if payload.startswith(repo_header) else payload
         payload_body = payload_body if payload_body.endswith(b"\n") else payload_body + b"\n"
         persisted = (
@@ -613,6 +652,7 @@ try:
             + persisted
             + b"\n"
             + payload_body
+            + f"fleet-guidance check value: {check}\n".encode()
         )
     block = begin + b"\n" + body + end + b"\n"
 
@@ -926,10 +966,15 @@ esac
 
 # Short content id, so the verdict names WHICH guidance landed. Any of these
 # three digest tools may be absent; a missing one is cosmetic, never fatal.
-version="$( { sha256sum "$PAYLOAD" 2>/dev/null || shasum -a 256 "$PAYLOAD" 2>/dev/null || openssl dgst -sha256 "$PAYLOAD" 2>/dev/null; } \
-            | tr ' ' '\n' | grep -oE '^[0-9a-f]{64}$' | head -1 )"
-version="${version:0:8}"
+# The full digest is kept: `version` is its first 8 hex and `check` (see CHECK
+# VALUE in the header) its last 8. Without a digest both are empty, `version`
+# reads `unknown`, and no check line is written.
+digest="$( { sha256sum "$PAYLOAD" 2>/dev/null || shasum -a 256 "$PAYLOAD" 2>/dev/null || openssl dgst -sha256 "$PAYLOAD" 2>/dev/null; } \
+           | tr ' ' '\n' | grep -oE '^[0-9a-f]{64}$' | head -1 )"
+version="${digest:0:8}"
+check="${digest:56:8}"
 [ -n "$version" ] || version="unknown"
+CHECK_PREFIX='fleet-guidance check value: '
 
 bytes="$(wc -c < "$PAYLOAD" 2>/dev/null | tr -d ' ')"
 
@@ -945,23 +990,77 @@ emit_payload() {
     fi
 }
 
+# The check line (see CHECK VALUE in the header), written straight after the
+# payload. A payload that does not end in a newline gets one first, so the line
+# stands alone; the ending is read with an appended x that command substitution
+# cannot strip, and with cat alone, a tool the hook needs anyway. No check, no
+# line.
+emit_check_line() {
+    local tail_probe
+    [ -n "$check" ] || return 0
+    tail_probe="$(cat "$PAYLOAD"; printf x)"
+    case "$tail_probe" in
+        *$'\n'x) ;;
+        *) printf '\n' || return 1 ;;
+    esac
+    printf '%s%s\n' "$CHECK_PREFIX" "$check"
+}
+
 # See docs/decisions/0016-the-freshest-delivery-wins-the-shared-global-block.md.
-payload_stamp "$PAYLOAD"
-delivered="$PAYLOAD_STAMP"
+# A caller whose payload has no checkout supplies the time of the commit the
+# payload was taken from. The stamp describes the caller's file, so it applies
+# only when that file is the payload in use (--workspace did not pick a child),
+# only when it is all ASCII digits, and only when it is plausible: the installed
+# stamp never decreases, so one implausible value (a millisecond epoch, a
+# YYYYMMDDhhmmss date) would keep every later delivery out. Epoch seconds are
+# 10 digits, and a stamp later than now + 86400 is not a commit time. A rejected
+# value, or a clock that cannot be read, behaves exactly as an unset stamp.
+caller_stamp="${FLEET_GUIDANCE_PAYLOAD_STAMP:-}"
+case "$caller_stamp" in ""|*[!0-9]*) caller_stamp="" ;; esac
+if [ -n "$caller_stamp" ] && [ -n "${FLEET_GUIDANCE_PAYLOAD:-}" ] &&
+    [ "$PAYLOAD" = "${FLEET_GUIDANCE_PAYLOAD:-}" ]; then
+    normalize_stamp "$caller_stamp"
+    caller_stamp="$NORMAL_STAMP"
+    stamp_now="$(date +%s 2>/dev/null)" || stamp_now=""
+    case "$stamp_now" in ""|*[!0-9]*) stamp_now="" ;; esac
+    # Both sides are at most 10 digits before any arithmetic, so it cannot
+    # overflow, and 10# keeps a padded clock value from reading as octal.
+    if [ "${#caller_stamp}" -gt 10 ] || [ -z "$stamp_now" ] ||
+        [ "${#stamp_now}" -gt 10 ] ||
+        stamp_gt "$caller_stamp" "$((10#$stamp_now + 86400))"; then
+        caller_stamp=""
+    fi
+else
+    caller_stamp=""
+fi
+if [ -n "$caller_stamp" ]; then
+    delivered="$caller_stamp"
+else
+    payload_stamp "$PAYLOAD"
+    delivered="$PAYLOAD_STAMP"
+fi
 
 # Read metadata from inside the managed block only. A developer's own prose
-# may mention either marker text without being delivery metadata.
+# may mention either marker text without being delivery metadata. The third
+# line awk prints is 1 when the block holds the exact check line for this
+# payload (see CHECK VALUE in the header), else 0; with no check to write, there
+# is no line to miss.
 read_installed_metadata() {
-    local dest="$1" raw
-    raw="$(awk -v b="$BEGIN_MARK" -v e="$END_MARK" '
+    local dest="$1" raw rest
+    raw="$(awk -v b="$BEGIN_MARK" -v e="$END_MARK" -v c="${check:+$CHECK_PREFIX$check}" '
         $0 == b { inside=1; next }
         $0 == e { inside=0 }
         inside && /^<!-- fleet-guidance-version: / && !v { v=$0 }
         inside && /^<!-- fleet-guidance-delivered: / && !d { d=$0 }
-        END { print v; print d }
+        inside && c != "" && $0 == c { k=1 }
+        END { print v; print d; print (k ? 1 : 0) }
     ' "$dest" 2>/dev/null)" || raw=""
     existing_version="${raw%%$'\n'*}"
-    existing_delivered="${raw#*$'\n'}"
+    rest="${raw#*$'\n'}"
+    existing_delivered="${rest%%$'\n'*}"
+    existing_check_present=0
+    [ "${rest#*$'\n'}" != 1 ] || existing_check_present=1
+    [ -n "$check" ] || existing_check_present=1
     if [[ "$existing_version" == '<!-- fleet-guidance-version: '*" -->" ]]; then
         existing_version="${existing_version#<!-- fleet-guidance-version: }"
         existing_version="${existing_version% -->}"
@@ -1004,7 +1103,7 @@ update_stamp_only() {
 # the reason and returns non-zero, having
 # changed nothing at that destination.
 install_to() {
-    local dest="$1" label="$2" tmp dir target
+    local dest="$1" label="$2" tmp dir target block_stamp="$delivered"
     INSTALL_STATE=""
     RECEIPT_SOURCE=""
 
@@ -1036,7 +1135,7 @@ install_to() {
             return 1
         fi
         read_installed_metadata "$target"
-        if [ "$existing_version" = "$version" ]; then
+        if [ "$existing_version" = "$version" ] && [ "$existing_check_present" -eq 1 ]; then
             if ! stamp_gt "$delivered" "$existing_delivered"; then
                 INSTALL_STATE="current"
                 return 0
@@ -1055,8 +1154,14 @@ install_to() {
             fi
             record_failure "could not write $dest"
             return 1
-        fi
-        if ! stamp_ge "$delivered" "$existing_delivered"; then
+        elif [ "$existing_version" = "$version" ]; then
+            # Same content, but the block lacks this payload's check line (a
+            # hook without the line wrote it). Rewrite it whole, and never lower
+            # the ordering key: the higher of the two stamps is recorded.
+            if stamp_gt "$existing_delivered" "$delivered"; then
+                block_stamp="$existing_delivered"
+            fi
+        elif ! stamp_ge "$delivered" "$existing_delivered"; then
             INSTALL_STATE="kept"
             KEPT="${KEPT:+$KEPT, }v${existing_version:-unknown} at $label"
             return 0
@@ -1076,8 +1181,9 @@ install_to() {
     {
         printf '%s\n' "$BEGIN_MARK" &&
         printf '<!-- fleet-guidance-version: %s -->\n' "$version" &&
-        printf '<!-- fleet-guidance-delivered: %s -->\n' "$delivered" &&
+        printf '<!-- fleet-guidance-delivered: %s -->\n' "$block_stamp" &&
         emit_payload &&
+        emit_check_line &&
         printf '%s\n' "$END_MARK"
     } >> "$tmp" 2>/dev/null || {
         record_failure "could not assemble the guidance block for $dest"

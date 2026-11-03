@@ -9,6 +9,8 @@
 > Edit only below the `## Repo-specific additions` header.
 > Everything above it will be overwritten on the next sync.
 
+guidance-marker: fleet-stub (transcript counts use this line; keep it)
+
 ## Fleet guidance is delivered once per session — not by this file
 
 The account's full guidance — incidents, fleet policy, machine layout, the
@@ -34,6 +36,14 @@ line:
   would when degraded — just don't report it as a problem or try to "fix" it.
 
 No verdict at all means the hook never ran — treat that as DEGRADED.
+
+**Say what loaded, in your first reply to the user in a session.** The
+installed guidance ends with a line `fleet-guidance check value: <8 hex>`.
+Begin that reply with `fleet-guidance check: <the value>`, copied from that
+line, or `fleet-guidance check: none` when no such line is in your context.
+Never guess a value or copy one from anywhere else: the session's record
+compares it with what actually loaded. Only in replies to the user — never in
+commits, PR or issue text, files or prompts for other agents.
 
 ## Codex reads the same block, from `~/.codex/AGENTS.md`
 
