@@ -697,7 +697,7 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         # this "allowed but not asserted exactly by the other tests" bucket
         # rather than EXPECTED. `plugin-runtime-approval` (2026-10-08) is its
         # owner-approval gate for plugin runtime changes (its ADR 0016/0017).
-        "Adam-S-Daniel/adam-agentskills": ["privacy", "pytest", "pytest-windows", "plugin-runtime-approval", "agent-checks"],
+        "Adam-S-Daniel/adam-agentskills": ["privacy", "pytest", "pytest-windows", "plugin-runtime-approval", "agent-checks", "merge-gate"],
     }
     # The fleet default (_agent-guidance ADR 0021): every other managed repo
     # with a ruleset requires the delivered agent-checks job and nothing else.

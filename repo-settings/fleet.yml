@@ -380,11 +380,25 @@ repos:
   # triggers only on `pull_request_target`. If that workflow ever gains a
   # trigger, list it here too or its runs are blocked. Why, and the fallback if
   # GitHub still shows the warning: docs/decisions/0009.
+  #
+  # Sixth check, `merge-gate` (added 2026-11-10, adam-agentskills#137): required
+  # checks belong to a head commit, not to one pull request, so a second pull
+  # request from the same head into a branch with an older ci.yml could report
+  # `pytest` green for the pull request into main. `merge-gate`'s job DOES
+  # carry a `name:`, on purpose: an expression that is `merge-gate` only on a
+  # pull request whose base is the default branch, and another name on any
+  # other base or event. It needs `privacy`, `pytest` and `pytest-windows`,
+  # runs under `always()` (so it is never skipped on a pull request), and has
+  # no matrix, `concurrency:` or `paths:`. Verified on adam-agentskills#139:
+  # the context landed as `merge-gate` on the PR head sha
+  # (https://github.com/Adam-S-Daniel/adam-agentskills/actions/runs/42750280532/job/129616044077).
+  # Do not drop it in favor of the three jobs it needs: they stay listed so a
+  # reader sees them, but only `merge-gate` cannot be reported from elsewhere.
   - name: Adam-S-Daniel/adam-agentskills
     manage: ["all"]
     overrides:
       ruleset:
-        required_status_checks: [privacy, pytest, pytest-windows, plugin-runtime-approval, agent-checks]
+        required_status_checks: [privacy, pytest, pytest-windows, plugin-runtime-approval, agent-checks, merge-gate]
       actions_policies:
         - name: "plugin-runtime-review: allow pull_request_target"
           enforcement: active
