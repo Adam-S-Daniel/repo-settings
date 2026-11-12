@@ -237,7 +237,8 @@ defaults:
       # why: false -- the fleet deliberately built an unattended
       # dependency-merge path and this one parameter silently vetoes it. The
       # path is not unguarded: Dependabot waits out a cooldown before a PR
-      # even opens (`default-days: 7`, `semver-major-days: 30` -- see
+      # even opens (`default-days: 7`, plus `semver-major-days: 30` where the
+      # ecosystem supports it, not github-actions -- see
       # .github/dependabot.yml), the sweep in
       # .github/workflows/dependabot-auto-merge.yml re-checks a
       # manifest-path allowlist against the PR's own diff and refuses

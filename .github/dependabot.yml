@@ -34,9 +34,8 @@ updates:
     # '#/updates/0/cooldown/semver-major-days' is not supported for the
     # package ecosystem 'github-actions'", and no update job ever ran until
     # the key was removed (#35). That check only runs once the file is on
-    # main, so a PR never shows it: tests/test_dependabot_config.py is the
-    # pre-merge guard. dependabot/dependabot-core#14628 is the open upstream
-    # request to add the support.
+    # main, so a PR never shows it. dependabot/dependabot-core#14628 is the
+    # open upstream request to add the support.
     cooldown:
       default-days: 7
       # cms-platform releases are this account's own code, gated by its own
