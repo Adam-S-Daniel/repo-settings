@@ -54,13 +54,14 @@ protected branches).
   escapes both `plan_repo`'s `GhError` guard and `plan_repo_records`, taking the
   whole fleet run down over one repo's payload. Never "fix" it by promoting an
   absent key to drift.
-- Consequence for CI: while the fan-out App is scoped Administration + Actions +
-  Issues + Metadata, with no Contents (README, "CI fan-out" step 1), the
-  scheduled run cannot audit or reconcile the merge-method policy — those
-  records come back as skips, and
-  merge-method drift is caught only by an operator `apply` under ambient
-  `gh auth`. Accept that gap knowingly, or widen the App and **verify** the keys
-  actually appear before trusting the audit again.
+- Consequence for CI: the scheduled plan reads under a read-only token with no
+  Contents permission (README, "CI fan-out"), so it skips these records by
+  design and cannot audit the merge-method policy. Drift confined to them (and
+  to ruleset `bypass_actors` and Actions policies) is converged only by an
+  apply that runs for other drift, by a `force_apply` dispatch, or by an
+  operator `apply` under ambient `gh auth`; the README's "CI fan-out" section
+  records that trade (PR #113). Widening the read App to add Contents is the
+  alternative: **verify** the keys appear before trusting the audit again.
 - Never probe a read-scoped token by asking for `.delete_branch_on_merge` — an
   absent key reads exactly like a dead token. Probe with
   `gh api repos/<owner>/<repo>/actions/permissions --jq .enabled`.
