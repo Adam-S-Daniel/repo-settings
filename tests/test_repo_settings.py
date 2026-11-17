@@ -686,7 +686,7 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         "Adam-S-Daniel/wsl-automation": ["shell", "test", "test-linux", "agent-checks"],
         "Adam-S-Daniel/repo-settings": ["agent-checks", "unit"],
         "Adam-S-Daniel/verify-actions-lock": ["test", "self-verify", "agent-checks"],
-        "Adam-S-Daniel/acsi-kit": ["test", "agent-checks"],
+        "Adam-S-Daniel/acsi-kit": ["test", "agent-checks", "starter-suites"],
         "Adam-S-Daniel/security-alerts": ["agent-checks", "unit"],
     }
     PRE_EXISTING = {
