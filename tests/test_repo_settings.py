@@ -2491,8 +2491,10 @@ class ChangesReportTests(unittest.TestCase):
                 self.assertEqual(rs.cmd_diff(args), 1)
             with open(out) as fh:
                 written = json.load(fh)
-        self.assertEqual(written, [{"repo": "o/r", "setting": "a", "status": "drift",
-                                    "current": 1, "desired": 2, "note": None}])
+        self.assertEqual(written, [{
+            "repo": "o/r", "setting": "a", "status": "drift", "current": 1,
+            "desired": 2, "note": None, "risk": "gated",
+            "risk_reason": "not a planned write this classifier can read"}])
 
 
 class WorkflowPermissionsTests(unittest.TestCase):
