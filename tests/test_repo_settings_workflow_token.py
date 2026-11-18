@@ -1071,6 +1071,10 @@ class AutoDecideScriptTests(_ScriptCase):
         cases = {
             "the admin apply wrote no result": {"ADMIN_RC": ""},
             "the labels apply wrote no result": {"admin": [CHANGED], "LABEL_REPOS": "site"},
+            # Ended after writing its file and before recording its code.
+            "the admin apply recorded no exit code": {"admin": [CHANGED], "ADMIN_RC": ""},
+            "the labels apply recorded no exit code": {
+                "admin": [CHANGED], "labels": [], "LABEL_REPOS": "site", "LABELS_RC": ""},
             "the cms repo list step failed": {"admin": [CHANGED],
                                               "LABEL_REPOS_OUTCOME": "failure"},
             "the cms repo list step never ran": {"admin": [CHANGED],

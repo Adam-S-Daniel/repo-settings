@@ -592,6 +592,10 @@ jobs:
             elif [[ -n "$LABEL_REPOS" ]]; then
               if [[ -f "$labels" ]]; then files+=("$labels"); else complete=false; fi
             fi
+            # A step that should have run but recorded no code was ended
+            # partway, perhaps after it wrote its file.
+            if [[ -z "$ADMIN_RC" ]]; then complete=false; fi
+            if [[ -n "$LABEL_REPOS" && -z "$LABELS_RC" ]]; then complete=false; fi
             # 0: nothing left. 3: something left. 2: a write or a read failed,
             # and the results say which. Any other code is a crash, and what
             # is on disk is then not this run's answer.
