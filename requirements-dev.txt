@@ -10,6 +10,6 @@
 
 # tests/test_required_checks.py parses AGENTS.md with it. 4.2.0 was uploaded
 # 2026-05-07.
-markdown-it-py==4.2.0
+markdown-it-py==4.3.0
 # markdown-it-py's only dependency. 0.1.2 was uploaded 2022-08-14.
 mdurl==0.1.2
