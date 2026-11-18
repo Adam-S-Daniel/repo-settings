@@ -153,6 +153,15 @@ configured, the workflow **skips itself** (guarded on
    the environment, and only after approval. An environment secret also
    [takes precedence](https://docs.github.com/en/actions/reference/security/secrets)
    over a repo secret of the same name.
+   Optional: **`fleet-apply-auto` lets tightening changes apply with no
+   approval** ([ADR 0019](docs/decisions/0019-apply-tightening-changes-with-no-approval.md)).
+   Create that environment with no required reviewer, set its deployment
+   branches to "Selected branches" with exactly `main`, and add
+   `REPO_SETTINGS_APP_PRIVATE_KEY` to it (the same key). The `apply-auto` job
+   then makes the writes the engine can show cannot reduce protection, and
+   the reviewed job is asked for only for what is left. Until all three are
+   true, `apply-auto` applies nothing. To turn it off, delete the secret from
+   that environment.
 6. **A read-only App for the plan and the pull-request drift preview**
    (`repo-settings-drift-read`). The `plan` job and the pull-request `drift`
    job never get the admin key; they mint from a second App with only
@@ -168,15 +177,27 @@ configured, the workflow **skips itself** (guarded on
 After that, every push to `main` (config/script changes), weekly schedule and
 manual dispatch first runs the `plan` job, with no approval: `diff` per owner
 under the read-only token
-([#116](https://github.com/Adam-S-Daniel/repo-settings/issues/116)). The gated
-apply, and so the owner's approval of the `fleet-apply` deployment, follows
-only when:
+([#116](https://github.com/Adam-S-Daniel/repo-settings/issues/116)). An apply
+follows only when:
 
 - the plan found drift, on a push or on a dispatch that is not a dry run;
 - a dispatch that is not a dry run sets `force_apply`, for an apply the plan
   saw no reason for;
 - the run is the weekly schedule and the plan found drift, or the plan
   failed (a run that cannot rule drift out still asks).
+
+The apply is two jobs
+([ADR 0019](docs/decisions/0019-apply-tightening-changes-with-no-approval.md)).
+`apply-auto` runs first, with no approval, and makes only the writes that
+cannot reduce protection: an added required check, a setting switched on, a
+new ruleset. The reviewed `repo-settings` job, and so the owner's approval of
+the `fleet-apply` deployment, follows only when `apply-auto` left something:
+a removed check, an added bypass actor, anything it could not classify or
+read. Neither job applies from a commit `main` has moved past: approve the
+newest run. The
+`apply-auto` job summary lists what it applied and what it left, with the
+reason. Locally, `apply --refuse-weakening` does the same and exits 3 when it
+left something.
 
 The read token cannot see ruleset `bypass_actors`, Actions policies or the
 repo merge flags (all are skips), so drift confined to those never shows in

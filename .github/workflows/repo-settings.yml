@@ -28,6 +28,13 @@
 #      it on both owners, and set the repo-level variable
 #      `REPO_SETTINGS_READ_APP_CLIENT_ID` and secret
 #      `REPO_SETTINGS_READ_APP_PRIVATE_KEY`. The `plan` and `drift` jobs use it.
+#   5. Optional, and what lets tightening changes apply with no approval
+#      (docs/decisions/0019): create the environment `fleet-apply-auto` with
+#      NO required reviewer, set its deployment branches to "Selected
+#      branches" with exactly `main`, and add `REPO_SETTINGS_APP_PRIVATE_KEY`
+#      to it as an environment secret (the same key as in `fleet-apply`).
+#      Until all three are true the `apply-auto` job applies nothing and
+#      every change waits for the reviewed apply, as before.
 #
 # Use the App's CLIENT ID, not its numeric App ID: the action's `app-id` input
 # is deprecated in favour of `client-id`. The two are the same input under the
@@ -53,13 +60,18 @@
 #     environment and no approval: mints a READ-ONLY token per owner from the
 #     read App, runs `diff` for each, and sets `needs_apply`. It also runs the
 #     coverage audit and files the undeclared-repo nudge.
-#   * then the `repo-settings` apply job, which waits for the owner's approval
-#     in `fleet-apply`, checks that the gate is still configured, and applies.
-#     It runs only when the plan found drift (push, or a non-dry-run dispatch),
-#     when a non-dry-run dispatch sets `force_apply`, or on the weekly schedule
-#     when the plan found drift or failed. A dry-run dispatch is the plan alone
-#     and asks for no approval. The cms-platform repos' labels are applied by
-#     a separate step under an issues-only token (docs/decisions/0016).
+#   * then the `apply-auto` job (docs/decisions/0019), with no approval: it
+#     re-plans under the admin token and makes only the writes the engine can
+#     show cannot reduce protection (`apply --refuse-weakening`). It runs when
+#     the plan found drift (push, or a non-dry-run dispatch), when a
+#     non-dry-run dispatch sets `force_apply`, or on the weekly schedule when
+#     the plan found drift or failed. A dry-run dispatch is the plan alone.
+#   * then the `repo-settings` apply job, only when `apply-auto` left a change
+#     behind or could not say that it left none. It waits for the owner's
+#     approval in `fleet-apply`, checks that the gate is still configured, and
+#     applies everything. In both apply jobs the cms-platform repos' labels
+#     are applied by a separate step under an issues-only token
+#     (docs/decisions/0016).
 #   * pull_request touching config/script -> `drift` job: drift report only
 #     (fails on drift), under a token from the same READ-ONLY App. Skipped
 #     until that App's `REPO_SETTINGS_READ_APP_CLIENT_ID` variable exists.
@@ -343,10 +355,284 @@ jobs:
             nudge "$OWNER" "${!rc_var:-}"
           done
 
-  repo-settings:
+  # The unreviewed apply (docs/decisions/0019). The owner used to approve every
+  # apply, and almost every plan he approved only added protection. This job
+  # makes those writes with no approval, and nothing else: `--refuse-weakening`
+  # has the engine classify each planned write and make only the ones it can
+  # show cannot leave a repo with fewer constraints. Everything else is left
+  # for the reviewed `repo-settings` job below, which this job's outputs
+  # decide whether to run.
+  #
+  # It holds the admin key, so the same rules as the reviewed job apply: never
+  # on pull_request, and the key comes from an environment only `main` may
+  # deploy to. That environment, `fleet-apply-auto`, has no reviewer; the
+  # control is the classifier, enforced at the write and not only in the
+  # routing here. If the environment is not set up (no key, or not main-only)
+  # the job applies nothing, says so, and asks for the review as before.
+  #
+  # It re-plans instead of reading the `plan` job's answer: the plan's token is
+  # read-only and cannot see bypass actors, Actions policies or merge flags,
+  # and a verdict needs them.
+  #
+  # A matrix, with one output per owner: each leg sets only its own, so the
+  # legs cannot overwrite each other. `false` is the only value that withholds
+  # the review; an empty output (a leg that died first) asks for it.
+  #
+  # Its own concurrency group, not the reviewed job's: a reviewed leg waiting
+  # for approval holds its group, and this job must not queue behind it.
+  apply-auto:
     runs-on: ubuntu-latest
     needs: plan
-    # Runs only when (issue #116):
+    # The same conditions the reviewed apply had before this job existed (issue
+    # #116); tests/test_repo_settings_workflow_token.py holds the two together.
+    if: >-
+      ${{ !cancelled()
+      && vars.REPO_SETTINGS_APP_CLIENT_ID != ''
+      && github.event_name != 'pull_request'
+      && ((github.event_name == 'schedule'
+      && (needs.plan.result != 'success' || needs.plan.outputs.needs_apply == 'true'))
+      || (needs.plan.result == 'success'
+      && ((github.event_name == 'push' && needs.plan.outputs.needs_apply == 'true')
+      || (github.event_name == 'workflow_dispatch' && !inputs.dry_run
+      && (needs.plan.outputs.needs_apply == 'true' || inputs.force_apply))))) }}
+    environment: fleet-apply-auto
+    concurrency:
+      group: repo-settings-auto-${{ matrix.owner }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        owner: [Adam-S-Daniel, jodidaniel]
+    outputs:
+      review_ADAM_S_DANIEL: ${{ steps.decide.outputs.review_ADAM_S_DANIEL }}
+      review_JODIDANIEL: ${{ steps.decide.outputs.review_JODIDANIEL }}
+    steps:
+      # Naming an environment that does not exist creates it, with no rules and
+      # no secrets. So ask what `fleet-apply-auto` is before using it: it must
+      # hold the key and let only `main` deploy. Not set up is not a failure:
+      # the job applies nothing and the reviewed apply takes the whole plan.
+      # The key behind an environment any branch may deploy to IS a failure,
+      # because a workflow on any branch could then read it.
+      - name: Is the unreviewed lane set up?
+        id: auto_gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ENVIRONMENT: fleet-apply-auto
+          HAS_KEY: ${{ secrets.REPO_SETTINGS_APP_PRIVATE_KEY != '' }}
+          # The files an apply reads: this workflow's own `on.push.paths`
+          # (tests/test_repo_settings_workflow_token.py holds the two equal).
+          APPLY_INPUTS: repo-settings/fleet.yml scripts/repo_settings.py .github/workflows/repo-settings.yml requirements.txt
+        run: |
+          set -uo pipefail
+          provisioned=false
+          main_only=false
+          why=""
+          if ! env_json=$(gh api "repos/$REPO/environments/$ENVIRONMENT"); then
+            why="it could not be read"
+          elif ! policies_json=$(gh api "repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies"); then
+            why="its deployment-branch policies could not be read"
+          elif ! jq -e '.deployment_branch_policy.custom_branch_policies == true' <<<"$env_json" >/dev/null; then
+            why="it does not restrict deployments to selected branches"
+          elif ! jq -e '.total_count == 1 and ([.branch_policies[]? | [.name, (.type // "branch")]] == [["main", "branch"]])' \
+              <<<"$policies_json" >/dev/null; then
+            why="its deployment-branch policies are not exactly the branch main"
+          else
+            main_only=true
+          fi
+          if [[ "$main_only" == "true" && "$HAS_KEY" == "true" ]]; then
+            provisioned=true
+          elif [[ "$main_only" == "true" ]]; then
+            why="it has no REPO_SETTINGS_APP_PRIVATE_KEY secret"
+          fi
+          # An apply converges the fleet on the commit it runs from. A run
+          # main has moved past (a queued or re-run job) would apply an older
+          # config over a newer one, so it applies nothing: the push that
+          # changed those files started its own run.
+          stale=""
+          if [[ "$provisioned" == "true" ]]; then
+            if ! compare_json=$(gh api "repos/$REPO/compare/$GITHUB_SHA...main"); then
+              stale="this commit could not be compared with main"
+            elif ! jq -e --arg inputs "$APPLY_INPUTS" '
+              ($inputs | split(" ")) as $p
+              | .behind_by == 0
+              and (.files | type) == "array"
+              and (.files | length) < 300
+              and (.files | all((.filename | type) == "string"))
+              and ([.files[] | .filename, (.previous_filename // empty)]
+                   | all(. as $n | $p | index($n) == null))' <<<"$compare_json" >/dev/null; then
+              stale="main has moved past this commit and changed a file an apply reads"
+            fi
+            if [[ -n "$stale" ]]; then provisioned=false; fi
+          fi
+          echo "provisioned=$provisioned" >> "$GITHUB_OUTPUT"
+          if [[ -n "$stale" ]]; then
+            echo "::error::Nothing applied: $stale. The run on main's newest commit applies the current settings."
+            exit 1
+          elif [[ "$provisioned" == "true" ]]; then
+            echo "Environment $ENVIRONMENT holds the key, only main may deploy, and this commit's settings are main's."
+          elif [[ "$HAS_KEY" == "true" ]]; then
+            echo "::error::Environment $ENVIRONMENT holds the admin key but $why. Allow only main, or remove the key."
+            exit 1
+          else
+            echo "::notice title=repo-settings unreviewed apply::Not used: environment $ENVIRONMENT is not set up ($why). Every change waits for the reviewed apply."
+          fi
+
+      - name: Checkout
+        if: ${{ steps.auto_gate.outputs.provisioned == 'true' }}
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Python
+        if: ${{ steps.auto_gate.outputs.provisioned == 'true' }}
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        if: ${{ steps.auto_gate.outputs.provisioned == 'true' }}
+        run: python3 -m pip install -r requirements.txt
+
+      - name: Mint GitHub App token for ${{ matrix.owner }}
+        id: token
+        if: ${{ steps.auto_gate.outputs.provisioned == 'true' }}
+        uses: actions/create-github-app-token@v3.3.0
+        with:
+          client-id: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REPO_SETTINGS_APP_PRIVATE_KEY }}
+          owner: ${{ matrix.owner }}
+
+      # Exit 0 (nothing left) and 3 (something left for review) both let the
+      # labels leg run; the last step reads the code and fails the job on any
+      # other. `|| rc=$?` because GitHub runs this under `bash -e`.
+      - name: Apply what cannot reduce protection
+        id: apply
+        if: ${{ steps.auto_gate.outputs.provisioned == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          OWNER: ${{ matrix.owner }}
+        run: |
+          set -uo pipefail
+          # Under RUNNER_TEMP, never the checkout: the last step must only
+          # ever read a result this step wrote.
+          rm -f "$RUNNER_TEMP/result-admin.json"
+          rc=0
+          python scripts/repo_settings.py apply --config repo-settings/fleet.yml --owner "$OWNER" \
+            --cms-label-only skip --refuse-weakening --result-json "$RUNNER_TEMP/result-admin.json" || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      # The cms-platform repos' labels, under the same issues-only token as in
+      # the reviewed job (docs/decisions/0016).
+      - name: Which cms-platform repos get labels?
+        id: cms_label_repos
+        if: ${{ !cancelled() && steps.auto_gate.outputs.provisioned == 'true' }}
+        env:
+          OWNER: ${{ matrix.owner }}
+        run: |
+          set -euo pipefail
+          repos=$(python scripts/repo_settings.py cms-label-repos --config repo-settings/fleet.yml --owner "$OWNER")
+          echo "repos=$repos" >> "$GITHUB_OUTPUT"
+
+      - name: Mint labels-only GitHub App token for ${{ matrix.owner }}
+        id: token_labels
+        if: ${{ !cancelled() && steps.auto_gate.outputs.provisioned == 'true' && steps.cms_label_repos.outputs.repos != '' }}
+        uses: actions/create-github-app-token@v3.3.0
+        with:
+          client-id: ${{ vars.REPO_SETTINGS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REPO_SETTINGS_APP_PRIVATE_KEY }}
+          owner: ${{ matrix.owner }}
+          repositories: ${{ steps.cms_label_repos.outputs.repos }}
+          permission-issues: write
+
+      - name: Apply labels to the cms-platform repos
+        id: apply_labels
+        if: ${{ !cancelled() && steps.auto_gate.outputs.provisioned == 'true' && steps.cms_label_repos.outputs.repos != '' }}
+        env:
+          GH_TOKEN: ${{ steps.token_labels.outputs.token }}
+          OWNER: ${{ matrix.owner }}
+        run: |
+          set -uo pipefail
+          rm -f "$RUNNER_TEMP/result-labels.json"
+          rc=0
+          python scripts/repo_settings.py apply --config repo-settings/fleet.yml --owner "$OWNER" \
+            --cms-label-only only --refuse-weakening --result-json "$RUNNER_TEMP/result-labels.json" || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      # Writes the summary the reviewer reads, and this owner's `review_*`
+      # output. `false` only when the lane is set up, every apply step wrote
+      # its result file and exited 0, 2 or 3 (the engine's own codes), and no
+      # result is a change left behind or a setting it could not read.
+      # Anything else, a step that died included, leaves the output `true`.
+      # Then it fails the job if a write failed.
+      - name: Summarize, and say whether a review is still needed
+        id: decide
+        if: ${{ !cancelled() }}
+        env:
+          OWNER: ${{ matrix.owner }}
+          PROVISIONED: ${{ steps.auto_gate.outputs.provisioned }}
+          ADMIN_RC: ${{ steps.apply.outputs.rc }}
+          LABEL_REPOS_OUTCOME: ${{ steps.cms_label_repos.outcome }}
+          LABEL_REPOS: ${{ steps.cms_label_repos.outputs.repos }}
+          LABELS_RC: ${{ steps.apply_labels.outputs.rc }}
+        run: |
+          set -uo pipefail
+          key=$(tr 'a-z-' 'A-Z_' <<<"$OWNER")
+          review=true
+          failed=0
+          if [[ "$PROVISIONED" == "true" ]]; then
+            files=()
+            complete=true
+            admin="$RUNNER_TEMP/result-admin.json"
+            labels="$RUNNER_TEMP/result-labels.json"
+            if [[ -f "$admin" ]]; then files+=("$admin"); else complete=false; fi
+            if [[ "$LABEL_REPOS_OUTCOME" != "success" ]]; then
+              complete=false
+            elif [[ -n "$LABEL_REPOS" ]]; then
+              if [[ -f "$labels" ]]; then files+=("$labels"); else complete=false; fi
+            fi
+            # 0: nothing left. 3: something left. 2: a write or a read failed,
+            # and the results say which. Any other code is a crash, and what
+            # is on disk is then not this run's answer.
+            for rc in "$ADMIN_RC" "$LABELS_RC"; do
+              case "$rc" in
+                0|3|"") ;;
+                2) failed=1
+                   echo "::error::An unreviewed apply step for $OWNER exited 2: a write or a read failed." ;;
+                *) failed=1
+                   complete=false
+                   echo "::error::An unreviewed apply step for $OWNER exited $rc without finishing." ;;
+              esac
+            done
+            if (( ${#files[@]} )); then
+              python scripts/repo_settings.py apply-report "${files[@]}" --format markdown >> "$GITHUB_STEP_SUMMARY" || true
+            fi
+            if [[ "$complete" == "true" ]]; then
+              answer=$(python scripts/repo_settings.py apply-report "${files[@]}" --format needs-review) || answer=""
+              case "$answer" in
+                false) review=false ;;
+                true) ;;
+                *) failed=1
+                   echo "::error::The unreviewed apply's results for $OWNER could not be read, so the reviewed apply is asked for." ;;
+              esac
+            else
+              failed=1
+              echo "::error::The unreviewed apply for $OWNER did not finish, so the reviewed apply is asked for."
+            fi
+          else
+            printf '## Applied without review\n\nNothing for %s: the unreviewed apply did not run (its first step says why). Every change waits for the reviewed apply.\n' "$OWNER" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "review_$key=$review" >> "$GITHUB_OUTPUT"
+          echo "$OWNER: review still needed: $review"
+          exit "$failed"
+
+  repo-settings:
+    runs-on: ubuntu-latest
+    needs: [plan, apply-auto]
+    # The reviewed apply. Runs only when `apply-auto` left a change behind, or
+    # did not say `false` for every owner (not set up, or it died first), and
+    # (issue #116):
     #   * the event is `schedule` and the plan found drift, or the plan did
     #     not succeed (say the read App is broken): a weekly run that cannot
     #     rule drift out still applies, failing closed;
@@ -359,8 +645,12 @@ jobs:
     #
     # `!cancelled()` because GitHub skips a dependent job whose `needs` failed
     # unless `if:` calls a status function; the failed-plan schedule case needs that,
-    # and every other branch requires `needs.plan.result == 'success'`. Not
-    # `always()`: a run someone cancelled should not go on to ask for an apply.
+    # and so does an `apply-auto` that failed. Every other branch requires
+    # `needs.plan.result == 'success'`. Not `always()`: a run someone cancelled
+    # should not go on to ask for an apply.
+    #
+    # Both owners' legs run when either owner needs the review: a job-level
+    # `if:` cannot read the matrix, and a leg with nothing left changes nothing.
     #
     # Skip cleanly until the admin App is configured. Never on pull_request:
     # a PR branch controls its own copy of this file, so the job that holds
@@ -369,6 +659,8 @@ jobs:
       ${{ !cancelled()
       && vars.REPO_SETTINGS_APP_CLIENT_ID != ''
       && github.event_name != 'pull_request'
+      && (needs.apply-auto.outputs.review_ADAM_S_DANIEL != 'false'
+      || needs.apply-auto.outputs.review_JODIDANIEL != 'false')
       && ((github.event_name == 'schedule'
       && (needs.plan.result != 'success' || needs.plan.outputs.needs_apply == 'true'))
       || (needs.plan.result == 'success'
@@ -413,6 +705,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ENVIRONMENT: fleet-apply
+          # The files an apply reads: this workflow's own `on.push.paths`.
+          APPLY_INPUTS: repo-settings/fleet.yml scripts/repo_settings.py .github/workflows/repo-settings.yml requirements.txt
         run: |
           set -euo pipefail
           env_json=$(gh api "repos/$REPO/environments/$ENVIRONMENT")
@@ -432,6 +726,25 @@ jobs:
             exit 1
           fi
           echo "Environment $ENVIRONMENT: a required reviewer is configured and only main may deploy."
+          # An approval can arrive long after the run started. If main has
+          # since changed a file an apply reads, this job would put an older
+          # config over a newer one, undoing whatever the newer commit's
+          # unreviewed apply already tightened, and the plan the reviewer saw
+          # would not show it. Refuse; the newer commit's run is the one to
+          # approve. (ADR 0019.)
+          compare_json=$(gh api "repos/$REPO/compare/$GITHUB_SHA...main")
+          if ! jq -e --arg inputs "$APPLY_INPUTS" '
+            ($inputs | split(" ")) as $p
+            | .behind_by == 0
+            and (.files | type) == "array"
+            and (.files | length) < 300
+            and (.files | all((.filename | type) == "string"))
+            and ([.files[] | .filename, (.previous_filename // empty)]
+                 | all(. as $n | $p | index($n) == null))' <<<"$compare_json" >/dev/null; then
+            echo "::error::Not applied: main has moved past this run's commit and changed a file an apply reads. Approve the run on main's newest commit instead."
+            exit 1
+          fi
+          echo "This commit's settings are still main's."
 
       - name: Checkout
         uses: actions/checkout@v7.0.1
