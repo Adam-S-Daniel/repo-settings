@@ -114,6 +114,72 @@ def cfg_with(**changes):
     return cfg
 
 
+CS_TOOL = {"tool": "CodeQL", "alerts_threshold": "errors",
+           "security_alerts_threshold": "high_or_higher"}
+
+
+def cs_live(*tools):
+    live = live_default()
+    live["rules"].append({"type": "code_scanning",
+                          "parameters": {"code_scanning_tools": [dict(t) for t in tools]}})
+    return live
+
+
+class CodeScanningRiskTests(unittest.TestCase):
+    def risk(self, live, tools):
+        cfg = cfg_with(require_code_scanning=tools) if tools is not None else cfg_with()
+        rec = ruleset_record(live, cfg)
+        return rs.write_risk(rec, [rec])
+
+    def assertSafe(self, live, tools):
+        verdict, reason = self.risk(live, tools)
+        self.assertEqual(verdict, SAFE, reason)
+
+    def assertGated(self, live, tools, *words):
+        verdict, reason = self.risk(live, tools)
+        self.assertEqual(verdict, GATED, reason)
+        for word in words:
+            self.assertIn(word, reason)
+
+    def test_adding_the_rule_is_safe(self):
+        self.assertSafe(live_default(), [CS_TOOL])
+
+    def test_unchanged_is_safe(self):
+        self.assertSafe(cs_live(CS_TOOL), [CS_TOOL])
+
+    def test_stricter_thresholds_are_safe(self):
+        self.assertSafe(cs_live(CS_TOOL), [dict(CS_TOOL, alerts_threshold="all")])
+        self.assertSafe(cs_live(CS_TOOL), [dict(CS_TOOL, security_alerts_threshold="medium_or_higher")])
+
+    def test_adding_a_tool_is_safe(self):
+        self.assertSafe(cs_live(CS_TOOL), [CS_TOOL, dict(CS_TOOL, tool="Other")])
+
+    def test_removing_the_rule_is_gated(self):
+        self.assertGated(cs_live(CS_TOOL), None, "removed", "code_scanning")
+
+    def test_removing_a_tool_is_gated(self):
+        other = dict(CS_TOOL, tool="Other")
+        self.assertGated(cs_live(CS_TOOL, other), [CS_TOOL], "Other", "removed")
+
+    def test_loosening_a_threshold_is_gated(self):
+        self.assertGated(cs_live(CS_TOOL), [dict(CS_TOOL, alerts_threshold="none")],
+                         "alerts_threshold", "looser")
+        self.assertGated(cs_live(CS_TOOL), [dict(CS_TOOL, security_alerts_threshold="critical")],
+                         "security_alerts_threshold", "looser")
+
+    def test_an_unknown_live_tool_field_is_gated(self):
+        live = cs_live(dict(CS_TOOL, mystery=1))
+        self.assertGated(live, [CS_TOOL], "does not know")
+
+    def test_an_unknown_live_parameter_is_gated(self):
+        live = cs_live(CS_TOOL)
+        rule(live, "code_scanning")["parameters"]["new_option"] = True
+        self.assertGated(live, [CS_TOOL], "new_option")
+
+    def test_an_unrankable_live_threshold_is_gated(self):
+        self.assertGated(cs_live(dict(CS_TOOL, alerts_threshold="weird")), [CS_TOOL], "cannot rank")
+
+
 class RulesetRiskTests(unittest.TestCase):
     def risk(self, live, cfg):
         rec = ruleset_record(live, cfg)
