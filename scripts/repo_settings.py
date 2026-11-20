@@ -2803,6 +2803,20 @@ def _ruleset_put_risk(name: str, live: Any, desired: Any) -> tuple[str, str]:
     return _safe(f"{label}: no rule, check, ref or bypass actor is removed or relaxed")
 
 
+def _onboarding(records: list[dict]) -> bool:
+    """True when the same plan creates a managed ruleset that does not exist
+    yet: the repo is being onboarded, so nothing on it predates the fleet's
+    settings. The owner's rule (2026-11-20): on a newly onboarded repo,
+    turning on CodeQL default setup and auto-merge needs no review."""
+    for r in records:
+        writer = r.get("_writer")
+        if (r.get("status") == "drift" and isinstance(writer, tuple) and len(writer) == 3
+                and writer[0] == "ruleset" and writer[2] is None
+                and r.get("_live") is None and r.get("current") is None):
+            return True
+    return False
+
+
 def write_risk(rec: dict, records: list[dict]) -> tuple[str, str]:
     """(SAFE | GATED, reason) for one drift record of a repo's plan.
 
@@ -2838,10 +2852,20 @@ def write_risk(rec: dict, records: list[dict]) -> tuple[str, str]:
     if kind in SAFE_GROUP_VALUES:
         return _group_risk(kind, b, statuses)
     if kind == "codeql":
-        return _codeql_risk(b, statuses, records)
+        verdict = _codeql_risk(b, statuses, records)
+        if (verdict[0] == GATED and _onboarding(records) and isinstance(b, dict)
+                and b.get("codeql_default_setup") is True
+                and not set(b) - {"codeql_default_setup", "codeql_query_suite"}):
+            return _safe("CodeQL default setup -> on while the repo is onboarded "
+                         "(its managed ruleset is created in the same plan)")
+        return verdict
     if kind == "auto_merge":
-        return _safe("repo.allow_auto_merge -> false") if b is False else \
-            _gated("repo.allow_auto_merge -> true adds a way to merge")
+        if b is False:
+            return _safe("repo.allow_auto_merge -> false")
+        if b is True and _onboarding(records):
+            return _safe("repo.allow_auto_merge -> true while the repo is onboarded "
+                         "(its managed ruleset is created in the same plan)")
+        return _gated("repo.allow_auto_merge -> true adds a way to merge")
     if kind == "delete_branch_on_merge":
         return _safe("repo.delete_branch_on_merge -> true") if b is True else \
             _gated("repo.delete_branch_on_merge -> false")
