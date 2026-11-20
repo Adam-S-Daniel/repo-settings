@@ -456,6 +456,10 @@ repos:
   - name: Adam-S-Daniel/skills-evals
     manage: ["all"]
     overrides:
+      # Trial of the extended CodeQL suite (owner, 2026-11-20): see
+      # docs/code-scanning.md for what it found before any fleet-wide change.
+      security:
+        codeql_query_suite: extended
       ruleset:
         required_status_checks: [test, agent-checks]
       # why: skills-evals' scaffold gate opens DRAFT fixture PRs with the
@@ -507,6 +511,10 @@ repos:
   - name: Adam-S-Daniel/claude-memory-map
     manage: ["all"]
     overrides:
+      # Trial of the extended CodeQL suite (owner, 2026-11-20): see
+      # docs/code-scanning.md for what it found before any fleet-wide change.
+      security:
+        codeql_query_suite: extended
       ruleset:
         required_status_checks: [test, agent-checks]
   - name: jodidaniel/squarespacetemp
@@ -630,6 +638,10 @@ repos:
   - name: Adam-S-Daniel/_agent-guidance
     manage: ["all"]
     overrides:
+      # Trial of the extended CodeQL suite (owner, 2026-11-20): see
+      # docs/code-scanning.md for what it found before any fleet-wide change.
+      security:
+        codeql_query_suite: extended
       ruleset:
         required_status_checks: [test, agent-checks]
       # why: the changelog routine accumulates on `persistent/vendor-changelog`
