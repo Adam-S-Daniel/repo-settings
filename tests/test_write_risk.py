@@ -471,7 +471,8 @@ class SimpleWriterRiskTests(unittest.TestCase):
              rec("actions.fork_pr_approval", ("fork", None, "everyone"),
                  "first_time_contributors", "everyone"), GATED),
             ("auto-merge off", rec("repo.allow_auto_merge", ("auto_merge", None, False), True, False), SAFE),
-            ("auto-merge on", rec("repo.allow_auto_merge", ("auto_merge", None, True), False, True), GATED),
+            ("auto-merge on: it merges only what the rules allow",
+             rec("repo.allow_auto_merge", ("auto_merge", None, True), False, True), SAFE),
             ("delete branch on merge on",
              rec("repo.delete_branch_on_merge", ("delete_branch_on_merge", None, True), False, True), SAFE),
             ("delete branch on merge off",
@@ -496,7 +497,7 @@ class SimpleWriterRiskTests(unittest.TestCase):
              rec("label[agent-authored]", ("label", {"name": "agent-authored", "color": "0e8a16",
                                                      "description": "d"}, True),
                  {"name": "Agent-Authored", "color": "0e8a16", "description": "d"},
-                 {"name": "agent-authored", "color": "0e8a16", "description": "d"}), GATED),
+                 {"name": "agent-authored", "color": "0e8a16", "description": "d"}), SAFE),
             ("an existing label read without its name",
              rec("label[agent-authored]", ("label", {"name": "agent-authored", "color": "0e8a16",
                                                      "description": "d"}, True), {}, {}), GATED),
@@ -506,6 +507,10 @@ class SimpleWriterRiskTests(unittest.TestCase):
              rec("repo.merge_commit_title",
                  ("merge_commit_message", None, {"merge_commit_title": "PR_TITLE",
                                                  "merge_commit_message": "BLANK"}),
+                 "MERGE_MESSAGE", "PR_TITLE"), SAFE),
+            ("a merge commit message write with an unknown key",
+             rec("repo.merge_commit_title",
+                 ("merge_commit_message", None, {"merge_commit_title": "PR_TITLE", "x": "y"}),
                  "MERGE_MESSAGE", "PR_TITLE"), GATED),
             ("a writer added later", rec("x.y", ("something_new", None, True), False, True), GATED),
         ]
@@ -550,7 +555,8 @@ class SimpleWriterRiskTests(unittest.TestCase):
             "merge_methods", "delete_branch_on_merge", "vuln_alerts", "auto_sec_fixes",
             "secret_scanning", "codeql",
         }
-        always_gated = {"actions_policy", "merge_commit_message"}
+        has_a_safe_direction.add("merge_commit_message")
+        always_gated = {"actions_policy"}
         self.assertEqual(kinds, has_a_safe_direction | always_gated)
         for kind in always_gated:
             with self.subTest(kind):
@@ -635,14 +641,13 @@ class GroupWriterRiskTests(unittest.TestCase):
         on_default = {"codeql_default_setup": True, "codeql_query_suite": "default"}
         on_extended = {"codeql_default_setup": True, "codeql_query_suite": "extended"}
         off = {"codeql_default_setup": False}
-        with self.subTest("turning it on waits: the repo may run its own CodeQL workflow"):
+        with self.subTest("turning it on enables a security feature"):
             a, b = setup(False, on_default), suite(None, on_default)
             for record in (a, b):
                 verdict, reason = rs.write_risk(record, [a, b])
-                self.assertEqual(verdict, GATED, reason)
-                self.assertIn("CodeQL workflow", reason)
+                self.assertEqual(verdict, SAFE, reason)
             a, b = setup(False, on_extended), suite(None, on_extended)
-            self.assertEqual(rs.write_risk(a, [a, b])[0], GATED)
+            self.assertEqual(rs.write_risk(a, [a, b])[0], SAFE)
         with self.subTest("the larger suite, setup already on"):
             a = rec("security.codeql_default_setup", ("codeql", None, on_extended),
                     True, True, status="match")
@@ -652,10 +657,10 @@ class GroupWriterRiskTests(unittest.TestCase):
             only = {"codeql_query_suite": "extended"}
             b = suite("default", only)
             self.assertEqual(rs.write_risk(b, [b])[0], SAFE)
-        with self.subTest("only the suite declared, and nothing live"):
+        with self.subTest("only the suite declared, and nothing live: it turns setup on"):
             only = {"codeql_query_suite": "extended"}
             b = suite(None, only)
-            self.assertEqual(rs.write_risk(b, [b])[0], GATED)
+            self.assertEqual(rs.write_risk(b, [b])[0], SAFE)
         with self.subTest("the smaller suite"):
             b = suite("extended", on_default)
             verdict, reason = rs.write_risk(b, [b])
@@ -669,61 +674,123 @@ class GroupWriterRiskTests(unittest.TestCase):
             self.assertEqual(rs.write_risk(a, [a])[0], GATED)
 
 
-class OnboardingTests(unittest.TestCase):
-    """The owner's rule (2026-11-20): when a plan creates a repo's managed
-    ruleset from scratch, the repo is being onboarded, and turning on CodeQL
-    default setup and auto-merge there waits for no review. Everywhere else
-    both still wait."""
+class FleetStandardTests(unittest.TestCase):
+    """The owner's rule (2026-11-20): a plan that sets a repo up (it creates
+    the repo's managed ruleset) applies every write that puts a setting at the
+    fleet standard, even one that would otherwise wait. A repo's own
+    overrides, and repos already set up, keep the gate, so a loosening edit
+    to `defaults:` still waits on every existing repo."""
 
-    ON = {"codeql_default_setup": True, "codeql_query_suite": "default"}
+    DEFAULTS = {
+        "repo": {"delete_branch_on_merge": True, "merge_commit_title": "MERGE_MESSAGE",
+                 "merge_commit_message": "PR_TITLE"},
+        "actions": {"sha_pinning_required": True},
+        "ruleset": dict(RULESET_CFG),
+        "labels": [{"name": "agent-authored", "color": "d4c5f9"}],
+    }
 
-    def new_ruleset(self):
-        body = rs.build_ruleset_body(RULESET_CFG)
-        return {"setting": "ruleset[default branch protection]", "status": "drift",
+    def new_ruleset(self, name="default branch protection", first=True):
+        body = rs.build_ruleset_body(dict(RULESET_CFG, name=name))
+        return {"setting": f"ruleset[{name}]", "status": "drift",
                 "current": None, "desired": rs.normalize_ruleset(body),
-                "_writer": ("ruleset", body, None), "_live": None}
+                "_writer": ("ruleset", body, None), "_live": None,
+                "_first_ruleset": first}
 
     def existing_ruleset(self):
-        body = rs.build_ruleset_body(RULESET_CFG)
-        return {"setting": "ruleset[default branch protection]", "status": "drift",
-                "current": {}, "desired": rs.normalize_ruleset(body),
-                "_writer": ("ruleset", body, 111), "_live": live_default()}
+        return ruleset_record(live_default(), cfg_with(
+            required_status_checks=["test", "agent-checks", "more"]))
 
-    def writes(self):
-        return [rec("security.codeql_default_setup", ("codeql", None, self.ON), False, True),
-                rec("repo.allow_auto_merge", ("auto_merge", None, True), False, True)]
+    def loosening(self):
+        # Gated on its own merits: it would switch a setting off.
+        return rec("repo.delete_branch_on_merge", ("delete_branch_on_merge", None, False),
+                   True, False)
 
-    def test_onboarding_applies_both_without_review(self):
-        records = [self.new_ruleset(), *self.writes()]
-        for r in records[1:]:
-            with self.subTest(r["setting"]):
-                verdict, reason = rs.write_risk(r, records)
-                self.assertEqual(verdict, SAFE, reason)
-                self.assertIn("onboarded", reason)
+    def classify(self, records, overrides):
+        rs.classify_records(records, self.DEFAULTS, overrides)
+        return records
 
-    def test_without_a_new_ruleset_both_still_wait(self):
+    def test_setting_up_a_repo_applies_the_fleet_standard(self):
+        records = self.classify([self.new_ruleset(), self.loosening()], {})
+        self.assertEqual(records[1]["risk"], SAFE, records[1]["risk_reason"])
+        self.assertIn("fleet standard", records[1]["risk_reason"])
+
+    def test_a_repo_override_still_waits(self):
+        records = self.classify([self.new_ruleset(), self.loosening()],
+                                {"repo": {"delete_branch_on_merge": False}})
+        self.assertEqual(records[1]["risk"], GATED)
+
+    def test_a_repo_already_set_up_still_waits(self):
         for label, extra in (("no ruleset in the plan", []),
                              ("an existing ruleset changes", [self.existing_ruleset()]),
                              ("the ruleset already matches",
                               [dict(self.new_ruleset(), status="match")])):
-            records = [*extra, *self.writes()]
-            for r in self.writes():
-                with self.subTest(label, setting=r["setting"]):
-                    self.assertEqual(rs.write_risk(r, records)[0], GATED)
+            with self.subTest(label):
+                records = self.classify([*extra, self.loosening()], {})
+                self.assertEqual(records[-1]["risk"], GATED)
 
-    def test_onboarding_does_not_open_anything_else(self):
-        records = [self.new_ruleset()]
-        cases = [
-            rec("security.codeql_default_setup", ("codeql", None, {"codeql_default_setup": False}),
-                True, False),
-            rec("security.codeql_default_setup",
-                ("codeql", None, dict(self.ON, languages=["python"])), False, True),
-            rec("repo.allow_auto_merge", ("auto_merge", None, 1), False, True),
-            rec("repo.delete_branch_on_merge", ("delete_branch_on_merge", None, False), True, False),
-        ]
-        for r in cases:
-            with self.subTest(r["_writer"]):
-                self.assertEqual(rs.write_risk(r, records + [r])[0], GATED)
+    def test_a_new_ruleset_on_a_repo_that_has_one_is_not_set_up(self):
+        # Review finding: an extra ruleset, a renamed default, or a managed
+        # ruleset deleted while others remain must not open the gate.
+        for label, ruleset in (
+                ("the default ruleset, but the repo already has another",
+                 self.new_ruleset(first=False)),
+                ("an extra ruleset", self.new_ruleset(name="persistent branches")),
+                ("the first-ruleset flag missing",
+                 {k: v for k, v in self.new_ruleset().items() if k != "_first_ruleset"})):
+            with self.subTest(label):
+                records = self.classify([ruleset, self.loosening()], {})
+                self.assertEqual(records[-1]["risk"], GATED)
+
+    def test_a_group_write_carrying_an_override_still_waits(self):
+        # Review finding: a group writer sends every declared key, so a
+        # sibling from defaults must not carry the repo's own override.
+        defaults = dict(self.DEFAULTS, actions={
+            "sha_pinning_required": True, "default_workflow_permissions": "read",
+            "can_approve_pull_request_reviews": False})
+        group = {"default_workflow_permissions": "write",
+                 "can_approve_pull_request_reviews": False}
+        sibling = rec("actions.can_approve_pull_request_reviews",
+                      ("workflow_permissions", None, group), True, False)
+        records = [self.new_ruleset(), sibling]
+        overrides = {"actions": {"default_workflow_permissions": "write"}}
+        rs.classify_records(records, defaults, overrides)
+        self.assertEqual(sibling["risk"], GATED, sibling["risk_reason"])
+        with self.subTest("the same group with no override is the standard"):
+            group = {"default_workflow_permissions": "read",
+                     "can_approve_pull_request_reviews": False}
+            sibling = rec("actions.can_approve_pull_request_reviews",
+                          ("workflow_permissions", None, group), True, False)
+            records = [self.new_ruleset(), sibling]
+            rs.classify_records(records, defaults, {})
+            self.assertEqual(sibling["risk"], SAFE, sibling["risk_reason"])
+
+    def test_without_a_fleet_config_nothing_changes(self):
+        records = [self.new_ruleset(), self.loosening()]
+        rs.classify_records(records)
+        self.assertEqual(records[1]["risk"], GATED)
+
+    def test_an_unseen_bypass_list_is_never_waved_through(self):
+        loose = dict(self.loosening(), bypass_unknown=True)
+        records = self.classify([self.new_ruleset(), loose], {})
+        self.assertEqual(records[1]["risk"], GATED)
+
+    def test_fleet_standard_mapping(self):
+        d, f = self.DEFAULTS, rs.fleet_standard
+        self.assertTrue(f("repo.delete_branch_on_merge", d, {}))
+        self.assertTrue(f("repo.merge_commit_message", d, {}))
+        self.assertFalse(f("repo.merge_commit_message", d,
+                           {"repo": {"merge_commit_title": "PR_TITLE"}}))
+        self.assertTrue(f("actions.sha_pinning_required", d, {}))
+        self.assertFalse(f("actions.fork_pr_approval", d, {}), "not in defaults")
+        self.assertTrue(f("ruleset[default branch protection]", d, {}))
+        self.assertFalse(f("ruleset[default branch protection]", d,
+                           {"ruleset": {"required_status_checks": ["x"]}}))
+        self.assertFalse(f("ruleset[persistent branches]", d, {}), "an extra ruleset")
+        self.assertTrue(f("label[Agent-Authored]", d, {}))
+        self.assertFalse(f("label[agent-authored]", d, {"labels": [{"name": "agent-authored"}]}))
+        self.assertFalse(f("actions_policy[p]", d, {}))
+        self.assertFalse(f("something", d, {}))
+        self.assertFalse(f("repo.delete_branch_on_merge", None, {}))
 
 
 class PlanCarriesTheLiveRulesetTests(unittest.TestCase):
@@ -737,6 +804,16 @@ class PlanCarriesTheLiveRulesetTests(unittest.TestCase):
         self.assertIs(records[0]["_live"], live)
         rs.classify_records(records)
         self.assertEqual(records[0]["risk"], SAFE, records[0]["risk_reason"])
+
+    def test_a_missing_ruleset_records_whether_the_repo_has_any(self):
+        cfg = cfg_with(required_status_checks=["test", "agent-checks"])
+        for live_list, first in (([], True), ([{"id": 9, "name": "other"}], False)):
+            with self.subTest(first=first), \
+                 patch.object(rs, "find_ruleset", return_value=None), \
+                 patch.object(rs, "list_rulesets", return_value=live_list), \
+                 patch.object(rs, "get_repo", return_value={"private": False}):
+                records = rs.plan_repo("example/example", {"ruleset": cfg})
+            self.assertIs(records[0]["_first_ruleset"], first)
 
     def test_a_ruleset_read_without_bypass_actors_gates(self):
         cfg = cfg_with(required_status_checks=["test", "agent-checks", "starter-suites"])
@@ -757,7 +834,7 @@ class ApplyRefuseWeakeningTests(unittest.TestCase):
     def records(self):
         return [
             rec("actions.sha_pinning_required", ("sha", self.ACTIONS, True), False, True),
-            rec("repo.allow_auto_merge", ("auto_merge", None, True), False, True),
+            rec("repo.delete_branch_on_merge", ("delete_branch_on_merge", None, False), True, False),
             rec("security.vulnerability_alerts", ("vuln_alerts", None, True), True, True,
                 status="match"),
         ]
@@ -780,7 +857,7 @@ class ApplyRefuseWeakeningTests(unittest.TestCase):
     def test_without_the_flag_every_drift_is_written(self):
         code, written, _ = self.run_apply(self.records())
         self.assertEqual(code, 0)
-        self.assertEqual(written, ["actions.sha_pinning_required", "repo.allow_auto_merge"])
+        self.assertEqual(written, ["actions.sha_pinning_required", "repo.delete_branch_on_merge"])
 
     def test_with_the_flag_only_safe_writes_are_made_and_the_exit_code_says_so(self):
         records = self.records()
@@ -789,7 +866,7 @@ class ApplyRefuseWeakeningTests(unittest.TestCase):
         self.assertEqual(written, ["actions.sha_pinning_required"])
         self.assertEqual([r["status"] for r in records], ["changed", "gated", "match"])
         self.assertIn("LEFT FOR REVIEW", out)
-        self.assertIn("adds a way to merge", out)
+        self.assertIn("repo.delete_branch_on_merge -> false", out)
 
     def test_nothing_left_exits_zero(self):
         code, written, _ = self.run_apply(self.records()[:1], refuse_weakening=True)
@@ -865,11 +942,11 @@ class ApplyRefuseWeakeningTests(unittest.TestCase):
                 result = json.load(fh)
         self.assertEqual([(r["repo"], r["setting"], r["status"]) for r in result], [
             ("o/r", "actions.sha_pinning_required", "changed"),
-            ("o/r", "repo.allow_auto_merge", "gated"),
+            ("o/r", "repo.delete_branch_on_merge", "gated"),
         ])
         self.assertEqual(result[0]["risk"], SAFE)
         self.assertEqual(result[1]["risk"], GATED)
-        self.assertIn("adds a way to merge", result[1]["note"])
+        self.assertIn("repo.delete_branch_on_merge -> false", result[1]["note"])
 
     def test_the_cli_accepts_the_flags(self):
         with tempfile.TemporaryDirectory() as d:
