@@ -630,13 +630,17 @@ class GroupWriterRiskTests(unittest.TestCase):
                 self.assertEqual(rs.write_risk(bad, [bad])[0], GATED)
 
     def test_codeql(self):
-        def setup(current, wanted):
-            return rec("security.codeql_default_setup", ("codeql", None, wanted),
-                       current, wanted.get("codeql_default_setup"))
+        def setup(current, wanted, existing=()):
+            r = rec("security.codeql_default_setup", ("codeql", None, wanted),
+                    current, wanted.get("codeql_default_setup"))
+            r["codeql_existing"] = list(existing)
+            return r
 
-        def suite(current, wanted, status="drift"):
-            return rec("security.codeql_query_suite", ("codeql", None, wanted),
-                       current, wanted.get("codeql_query_suite"), status=status)
+        def suite(current, wanted, status="drift", existing=()):
+            r = rec("security.codeql_query_suite", ("codeql", None, wanted),
+                    current, wanted.get("codeql_query_suite"), status=status)
+            r["codeql_existing"] = list(existing)
+            return r
 
         on_default = {"codeql_default_setup": True, "codeql_query_suite": "default"}
         on_extended = {"codeql_default_setup": True, "codeql_query_suite": "extended"}
@@ -672,6 +676,26 @@ class GroupWriterRiskTests(unittest.TestCase):
         with self.subTest("an unknown key"):
             a = setup(False, dict(on_extended, languages=["python"]))
             self.assertEqual(rs.write_risk(a, [a])[0], GATED)
+        with self.subTest("turning it on over the repo's own CodeQL workflow"):
+            a = setup(False, on_default, existing=[".github/workflows/codeql.yml:analyze"])
+            verdict, reason = rs.write_risk(a, [a])
+            self.assertEqual(verdict, GATED, reason)
+            self.assertIn("codeql.yml", reason)
+        with self.subTest("turning it on when the plan could not check"):
+            a = setup(False, on_default)
+            a["codeql_existing"] = None
+            self.assertEqual(rs.write_risk(a, [a])[0], GATED)
+            del a["codeql_existing"]
+            self.assertEqual(rs.write_risk(a, [a])[0], GATED)
+
+    def test_codeql_over_a_workflow_waits_even_while_setting_up(self):
+        wanted = {"codeql_default_setup": True}
+        a = rec("security.codeql_default_setup", ("codeql", None, wanted), False, True)
+        a["codeql_existing"] = [".github/workflows/codeql.yml:analyze"]
+        with patch.object(rs, "_onboarding", return_value=True), \
+             patch.object(rs, "_whole_write_is_standard", return_value=True):
+            rs.classify_records([a], defaults={"security": wanted}, overrides={})
+        self.assertEqual(a["risk"], GATED, a["risk_reason"])
 
 
 class FleetStandardTests(unittest.TestCase):
