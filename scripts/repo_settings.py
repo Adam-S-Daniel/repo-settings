@@ -513,6 +513,44 @@ def read_codeql_default_setup(repo: str) -> dict | None:
     }
 
 
+def find_existing_codeql(repo: str) -> list[str] | None:
+    """What already runs CodeQL on the repo outside default setup, or None
+    when nothing could be read. Turning default setup on disables such a
+    workflow and refuses its uploads, so a non-empty answer gates the write.
+
+    The analyses list is the authority: default setup's analyses carry an
+    `analysis_key` under `dynamic/`, anything else is an advanced-setup
+    workflow or an upload from other CI. A token without code scanning read
+    falls back to the Actions workflow list (actions read), where only a
+    workflow with `codeql` in its path or name can be told apart."""
+    try:
+        data = gh_api(f"repos/{repo}/code-scanning/analyses?tool_name=CodeQL&per_page=100")
+    except GhError as e:
+        if e.status == 404 and "no analysis found" in str(e.message).lower():
+            return []
+        if e.status not in (403, 404):
+            raise
+    else:
+        if not isinstance(data, list):
+            return None
+        return sorted({a["analysis_key"] for a in data
+                       if isinstance(a, dict) and isinstance(a.get("analysis_key"), str)
+                       and not a["analysis_key"].startswith("dynamic/")})
+    try:
+        data = gh_api(f"repos/{repo}/actions/workflows?per_page=100")
+    except GhError as e:
+        if e.status in (403, 404):
+            return None
+        raise
+    flows = data.get("workflows") if isinstance(data, dict) else None
+    if not isinstance(flows, list):
+        return None
+    return sorted({w["path"] for w in flows
+                   if isinstance(w, dict) and isinstance(w.get("path"), str)
+                   and not w["path"].startswith("dynamic/") and w.get("state") == "active"
+                   and "codeql" in (w["path"] + " " + str(w.get("name", ""))).lower()})
+
+
 def write_codeql_default_setup(repo: str, desired: dict) -> None:
     """PATCH CodeQL default setup in ONE call: state plus, when declared, the
     query suite. GitHub detects the languages itself; leaving `languages` out
@@ -2018,6 +2056,14 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
             else:
                 current = {"codeql_default_setup": live["configured"],
                            "codeql_query_suite": live["query_suite"] if live["configured"] else None}
+                turns_on = (not live["configured"]
+                            and cq_wanted.get("codeql_default_setup", True) is True)
+                existing: list[str] | None = []
+                if turns_on:
+                    try:
+                        existing = find_existing_codeql(repo)
+                    except GhError:
+                        existing = None
                 for key, desired_v in cq_wanted.items():
                     if key == "codeql_query_suite" and cq_wanted.get("codeql_default_setup") is False:
                         continue  # a suite means nothing with default setup off
@@ -2029,6 +2075,8 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
                         # Every record carries the WHOLE declared group: see
                         # write_codeql_default_setup for why it is one PATCH.
                         "_writer": ("codeql", None, cq_wanted),
+                        # What default setup would replace: see _codeql_risk.
+                        "codeql_existing": existing,
                     })
 
     # -- ruleset ------------------------------------------------------------ #
@@ -2633,11 +2681,21 @@ def _codeql_risk(wanted: Any, statuses: dict[str, str],
                    and isinstance(suite_rec.get("current"), str)))
     if not live_on:
         # Turning it on enables a security feature, so it does not wait
-        # (owner's rule, 2026-11-20). A repo that runs CodeQL from its own
-        # workflow reads as "not configured" and GitHub stops taking that
-        # workflow's results once default setup is on; check for one before
-        # declaring such a repo.
-        return _safe("CodeQL default setup -> on (enables a security feature)")
+        # (owner's rule, 2026-11-20) -- unless the repo already runs CodeQL
+        # another way. Such a repo reads as "not configured", and GitHub
+        # disables that workflow and refuses its uploads once default setup
+        # is on, which can swap a broader analysis for a narrower one unseen.
+        existing = next((r["codeql_existing"] for r in records
+                         if r.get("setting", "").startswith("security.codeql_")
+                         and "codeql_existing" in r), None)
+        if existing is None:
+            return _gated("CodeQL default setup -> on, but the plan could not check "
+                          "for a CodeQL workflow it would replace")
+        if existing:
+            return _gated("CodeQL default setup -> on would disable the repo's own CodeQL "
+                          f"analysis ({', '.join(existing)})")
+        return _safe("CodeQL default setup -> on (enables a security feature; "
+                     "no CodeQL workflow to replace)")
     suite = wanted.get("codeql_query_suite")
     if suite is not None and suite != "extended" \
             and statuses.get("security.codeql_query_suite") != "match":
@@ -2975,6 +3033,7 @@ def classify_records(records: list[dict], defaults: Any = None,
     setting_up = defaults is not None and _onboarding(records, defaults)
     for rec, (verdict, reason) in verdicts:
         if (verdict == GATED and setting_up and not rec.get("bypass_unknown")
+                and rec.get("codeql_existing", []) == []
                 and _whole_write_is_standard(rec, defaults, overrides)):
             verdict, reason = SAFE, f"fleet standard on a repo being set up (was: {reason})"
         rec["risk"], rec["risk_reason"] = verdict, reason

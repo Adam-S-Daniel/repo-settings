@@ -410,7 +410,13 @@ choosing them and a repo that gains a language picks it up. On a **private**
 repo both keys are a `skipped` record (CodeQL there needs GitHub Code
 Security); a 403/404 on the read is a skip too, never drift.
 `codeql_query_suite` is ignored when `codeql_default_setup` is `false`, and
-any value other than `default` or `extended` is a config error. How this compares with GitHub's
+any value other than `default` or `extended` is a config error.
+Before turning default setup on, the plan looks for CodeQL already running
+another way (an analysis whose `analysis_key` is not under `dynamic/`; with no
+code scanning read, an active workflow with `codeql` in its path or name),
+because default setup disables that workflow and refuses its uploads. A find,
+or a check it could not make, makes the write wait for review, even on a repo
+being set up. How this compares with GitHub's
 code scanning docs, and what is worth changing:
 [`docs/code-scanning.md`](../docs/code-scanning.md).
 

@@ -4256,12 +4256,23 @@ class CodeqlDefaultSetupTests(unittest.TestCase):
 
     CFG = {"codeql_default_setup": True}
 
-    def _plan(self, cfg, private=False, live=None, read_error=None):
+    def _plan(self, cfg, private=False, live=None, read_error=None,
+              analyses=None, workflows=None):
         def api(path, **kw):
             if path.endswith("/code-scanning/default-setup"):
                 if read_error:
                     raise read_error
                 return live
+            if "/code-scanning/analyses" in path:
+                if isinstance(analyses, Exception):
+                    raise analyses
+                if analyses is None:
+                    raise rs.GhError(404, "no analysis found")
+                return analyses
+            if "/actions/workflows" in path:
+                if isinstance(workflows, Exception):
+                    raise workflows
+                return {"workflows": workflows or []}
             raise AssertionError(f"unexpected call {path}")
         with patch.object(rs, "get_repo", return_value={"private": private}), \
              patch.object(rs, "gh_api", side_effect=api):
@@ -4273,6 +4284,36 @@ class CodeqlDefaultSetupTests(unittest.TestCase):
         r = records[0]
         self.assertEqual((r["setting"], r["status"], r["current"]), ("security.codeql_default_setup", "drift", False))
         self.assertEqual(r["_writer"], ("codeql", None, self.CFG))
+
+    def test_turning_on_records_no_existing_codeql(self):
+        records = self._plan(self.CFG, live={"state": "not-configured", "query_suite": "default"})
+        self.assertEqual(records[0]["codeql_existing"], [])
+
+    def test_turning_on_finds_an_advanced_setup_analysis(self):
+        analyses = [{"analysis_key": "dynamic/github-code-scanning/codeql:analyze"},
+                    {"analysis_key": ".github/workflows/codeql.yml:analyze"}]
+        records = self._plan(self.CFG, live={"state": "not-configured", "query_suite": "default"},
+                             analyses=analyses)
+        self.assertEqual(records[0]["codeql_existing"], [".github/workflows/codeql.yml:analyze"])
+
+    def test_without_code_scanning_read_it_falls_back_to_workflow_names(self):
+        flows = [{"path": ".github/workflows/codeql-analysis.yml", "name": "CodeQL", "state": "active"},
+                 {"path": ".github/workflows/tests.yml", "name": "tests", "state": "active"},
+                 {"path": "dynamic/github-code-scanning/codeql", "name": "CodeQL", "state": "active"}]
+        records = self._plan(self.CFG, live={"state": "not-configured", "query_suite": "default"},
+                             analyses=rs.GhError(403, "Resource not accessible by integration"),
+                             workflows=flows)
+        self.assertEqual(records[0]["codeql_existing"], [".github/workflows/codeql-analysis.yml"])
+
+    def test_nothing_readable_records_unknown(self):
+        records = self._plan(self.CFG, live={"state": "not-configured", "query_suite": "default"},
+                             analyses=rs.GhError(403, "no"), workflows=rs.GhError(403, "no"))
+        self.assertIsNone(records[0]["codeql_existing"])
+
+    def test_already_on_does_not_look(self):
+        records = self._plan(self.CFG, live={"state": "configured", "query_suite": "default"},
+                             analyses=AssertionError("looked"))
+        self.assertEqual(records[0]["codeql_existing"], [])
 
     def test_match_when_configured(self):
         records = self._plan(self.CFG, live={"state": "configured", "query_suite": "default"})
