@@ -46,6 +46,14 @@ updates:
       # `Adam-S-Daniel/cms-platform/*` entry that
       # https://github.com/Adam-S-Daniel/cms-platform/issues/424 added.
       exclude: ["Adam-S-Daniel/*", "jodidaniel/*"]
+    groups:
+      actions:
+        applies-to: version-updates
+        patterns: ["*"]
+        exclude-patterns: ["Adam-S-Daniel/*", "jodidaniel/*"]
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
   # requirements.txt pins what the workflows install (PyYAML). Before this
   # entry the workflows ran an unpinned `pip install pyyaml`, which no bump
   # path could reach. Unlike github-actions, the pip ecosystem DOES support
@@ -55,6 +63,23 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+    groups:
+      pip-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      pip-security:
+        applies-to: security-updates
+        patterns: ["*"]
+  - package-ecosystem: npm
+    directory: "/.githooks/dated-phrasing"
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: "*"
     cooldown:
       default-days: 7
       semver-major-days: 30
