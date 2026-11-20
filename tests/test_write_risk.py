@@ -669,6 +669,63 @@ class GroupWriterRiskTests(unittest.TestCase):
             self.assertEqual(rs.write_risk(a, [a])[0], GATED)
 
 
+class OnboardingTests(unittest.TestCase):
+    """The owner's rule (2026-11-20): when a plan creates a repo's managed
+    ruleset from scratch, the repo is being onboarded, and turning on CodeQL
+    default setup and auto-merge there waits for no review. Everywhere else
+    both still wait."""
+
+    ON = {"codeql_default_setup": True, "codeql_query_suite": "default"}
+
+    def new_ruleset(self):
+        body = rs.build_ruleset_body(RULESET_CFG)
+        return {"setting": "ruleset[default branch protection]", "status": "drift",
+                "current": None, "desired": rs.normalize_ruleset(body),
+                "_writer": ("ruleset", body, None), "_live": None}
+
+    def existing_ruleset(self):
+        body = rs.build_ruleset_body(RULESET_CFG)
+        return {"setting": "ruleset[default branch protection]", "status": "drift",
+                "current": {}, "desired": rs.normalize_ruleset(body),
+                "_writer": ("ruleset", body, 111), "_live": live_default()}
+
+    def writes(self):
+        return [rec("security.codeql_default_setup", ("codeql", None, self.ON), False, True),
+                rec("repo.allow_auto_merge", ("auto_merge", None, True), False, True)]
+
+    def test_onboarding_applies_both_without_review(self):
+        records = [self.new_ruleset(), *self.writes()]
+        for r in records[1:]:
+            with self.subTest(r["setting"]):
+                verdict, reason = rs.write_risk(r, records)
+                self.assertEqual(verdict, SAFE, reason)
+                self.assertIn("onboarded", reason)
+
+    def test_without_a_new_ruleset_both_still_wait(self):
+        for label, extra in (("no ruleset in the plan", []),
+                             ("an existing ruleset changes", [self.existing_ruleset()]),
+                             ("the ruleset already matches",
+                              [dict(self.new_ruleset(), status="match")])):
+            records = [*extra, *self.writes()]
+            for r in self.writes():
+                with self.subTest(label, setting=r["setting"]):
+                    self.assertEqual(rs.write_risk(r, records)[0], GATED)
+
+    def test_onboarding_does_not_open_anything_else(self):
+        records = [self.new_ruleset()]
+        cases = [
+            rec("security.codeql_default_setup", ("codeql", None, {"codeql_default_setup": False}),
+                True, False),
+            rec("security.codeql_default_setup",
+                ("codeql", None, dict(self.ON, languages=["python"])), False, True),
+            rec("repo.allow_auto_merge", ("auto_merge", None, 1), False, True),
+            rec("repo.delete_branch_on_merge", ("delete_branch_on_merge", None, False), True, False),
+        ]
+        for r in cases:
+            with self.subTest(r["_writer"]):
+                self.assertEqual(rs.write_risk(r, records + [r])[0], GATED)
+
+
 class PlanCarriesTheLiveRulesetTests(unittest.TestCase):
     def test_plan_ruleset_keeps_the_live_body_and_the_new_check_is_safe(self):
         cfg = cfg_with(required_status_checks=["test", "agent-checks", "starter-suites"])

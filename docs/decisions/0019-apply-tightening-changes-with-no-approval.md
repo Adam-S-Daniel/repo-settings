@@ -69,8 +69,8 @@ list.
 |---|---|---|
 | Rulesets | A new ruleset. Added rules and required checks, removed bypass actors, enforcement to `active`, stricter pull-request parameters, fewer merge methods | A removed rule or check, an added bypass actor or a changed bypass mode, any change to which refs are covered, a live setting the write would switch off, a check pinned to an app, any field or parameter the engine does not know |
 | Actions | SHA pinning on, stricter fork-PR approval, read-only workflow token, workflows may not approve pull requests | The reverse of each; every Actions event policy write |
-| Security | Alerts, security updates, secret scanning and push protection on; the larger CodeQL suite where default setup is already on | Anything turned off; the smaller suite; turning CodeQL default setup on |
-| Repo | A merge method off, auto-merge off, delete branch on merge on | The reverse of each; the merge commit message |
+| Security | Alerts, security updates, secret scanning and push protection on; the larger CodeQL suite where default setup is already on; CodeQL default setup on while onboarding | Anything turned off; the smaller suite; turning CodeQL default setup on |
+| Repo | A merge method off, auto-merge off, delete branch on merge on; auto-merge on while onboarding | The reverse of each; the merge commit message |
 | Labels | Create, or set color and description | A write that would rename the live label (its name differs in case) |
 
 A writer that sends a whole group in one call (merge methods, workflow
@@ -82,6 +82,16 @@ repo that runs CodeQL from its own workflow reads as "not configured", and
 GitHub stops accepting that workflow's results once default setup is on, so
 the write can replace a broader analysis with a narrower one. The plan
 cannot see such a workflow.
+
+**Amended 2026-11-20 (owner's rule): onboarding needs no review.** When the
+same plan creates a repo's managed ruleset from scratch, the repo is being
+onboarded, and two writes that otherwise wait are safe there: CodeQL default
+setup on, and auto-merge on. The owner approved exactly those two for
+claude-plan-usage-estimator (run 44744406728, whose reviewed apply changed
+nothing else) and asked that such runs not need him. Outside that plan both
+still wait. The cost: a repo that already runs its own CodeQL workflow and is
+onboarded later would have default setup replace it unreviewed; check for one
+before declaring such a repo.
 
 The ruleset comparison reads the live ruleset as GitHub returned it, not the
 engine's normalized view. A ruleset write replaces the whole body, so a live
