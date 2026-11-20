@@ -688,6 +688,7 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         "Adam-S-Daniel/verify-actions-lock": ["test", "self-verify", "agent-checks"],
         "Adam-S-Daniel/acsi-kit": ["test", "agent-checks", "starter-suites"],
         "Adam-S-Daniel/security-alerts": ["agent-checks", "unit"],
+        "Adam-S-Daniel/claude-plan-usage-estimator": ["test", "agent-checks"],
     }
     PRE_EXISTING = {
         "Adam-S-Daniel/agentskills": ["pytest-windows"],
@@ -1512,7 +1513,7 @@ class AdminBypassFleetConfigTests(unittest.TestCase):
                     {k: v for k, v in none.items() if k != "bypass_actors"},
                 )
             checked += 1
-        self.assertEqual(checked, 23)
+        self.assertEqual(checked, 24)
 
 
 class BypassUnknownTests(unittest.TestCase):
@@ -4073,7 +4074,7 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
         self.assertEqual(set(by_value), {("all",), (), ("labels",)})
         self.assertEqual(by_value[()], self.WERE_FALSE)
         self.assertEqual(by_value[("labels",)], self.LABELS_ONLY)
-        self.assertEqual(len(by_value[("all",)]), 20)
+        self.assertEqual(len(by_value[("all",)]), 21)
 
     def test_diff_output_is_unchanged_apart_from_the_scope_strings(self):
         cfg = rs.load_config(str(self.FLEET))
