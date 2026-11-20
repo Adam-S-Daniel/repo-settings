@@ -4249,6 +4249,67 @@ class CmsLabelOnlyTests(unittest.TestCase):
                 self.assertIn("label-only step", out)
 
 
+class RequireCodeScanningTests(unittest.TestCase):
+    TOOL = {"tool": "CodeQL", "alerts_threshold": "errors",
+            "security_alerts_threshold": "high_or_higher"}
+    CFG = {"enabled": True, "name": "n", "admin_bypass": "always",
+           "require_code_scanning": [TOOL]}
+
+    def _rule(self, body):
+        return next((r for r in body["rules"] if r["type"] == "code_scanning"), None)
+
+    def test_builds_the_rest_rule(self):
+        self.assertEqual(self._rule(rs.build_ruleset_body(self.CFG)),
+                         {"type": "code_scanning", "parameters": {"code_scanning_tools": [self.TOOL]}})
+
+    def test_omitted_is_no_rule(self):
+        cfg = {k: v for k, v in self.CFG.items() if k != "require_code_scanning"}
+        self.assertIsNone(self._rule(rs.build_ruleset_body(cfg)))
+
+    def test_bad_values_are_config_errors(self):
+        for bad in (
+            [], "CodeQL", [{"tool": "CodeQL"}], [dict(self.TOOL, alerts_threshold="high")],
+            [dict(self.TOOL, security_alerts_threshold="errors")], [dict(self.TOOL, extra=1)],
+            [dict(self.TOOL, tool="")], [self.TOOL, self.TOOL],
+        ):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                rs.build_ruleset_body(dict(self.CFG, require_code_scanning=bad))
+
+    def test_normalize_compares_the_tools_in_any_order(self):
+        other = dict(self.TOOL, tool="Other")
+        a = rs.build_ruleset_body(dict(self.CFG, require_code_scanning=[self.TOOL, other]))
+        b = rs.build_ruleset_body(dict(self.CFG, require_code_scanning=[other, self.TOOL]))
+        self.assertEqual(rs.normalize_ruleset(a), rs.normalize_ruleset(b))
+        self.assertNotEqual(rs.normalize_ruleset(a),
+                            rs.normalize_ruleset(rs.build_ruleset_body(self.CFG)))
+
+    def test_generate_round_trips(self):
+        body = rs.build_ruleset_body(self.CFG)
+        again = rs.build_ruleset_body(rs.ruleset_doc(body))
+        self.assertEqual(rs.normalize_ruleset(again), rs.normalize_ruleset(body))
+
+    def _plan(self, private):
+        with patch.object(rs, "get_repo", return_value={"private": private}), \
+             patch.object(rs, "find_ruleset", return_value=None), \
+             patch.object(rs, "list_rulesets", return_value=[]):
+            return rs.plan_repo("o/r", {"ruleset": dict(self.CFG)})
+
+    def test_public_repo_declares_the_rule(self):
+        records = self._plan(private=False)
+        self.assertEqual([r["setting"] for r in records], ["ruleset[n]"])
+        self.assertIsNotNone(self._rule(records[0]["_writer"][1]))
+
+    def test_private_repo_skips_and_drops_the_rule(self):
+        records = self._plan(private=True)
+        by = {r["setting"]: r for r in records}
+        self.assertEqual(by["ruleset.require_code_scanning"]["status"], "skipped")
+        self.assertIn("private", by["ruleset.require_code_scanning"]["note"])
+        self.assertIsNone(self._rule(by["ruleset[n]"]["_writer"][1]))
+
+    def test_surface_key_is_accepted(self):
+        self.assertIn("require_code_scanning", rs.SURFACE_KEYS["ruleset"])
+
+
 class CodeqlDefaultSetupTests(unittest.TestCase):
     """`security.codeql_default_setup` / `codeql_query_suite`: read from
     code-scanning/default-setup, written as one PATCH, skipped on private

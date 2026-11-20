@@ -660,6 +660,47 @@ def admin_bypass_mode(cfg: dict) -> str | None:
     return ADMIN_BYPASS_MODES[value]
 
 
+# `code_scanning` rule thresholds, loosest to strictest. The order is the
+# classifier's definition of "stricter" (write_risk), so keep it that way.
+CODE_SCANNING_ALERTS = ("none", "errors", "errors_and_warnings", "all")
+CODE_SCANNING_SECURITY_ALERTS = ("none", "critical", "high_or_higher", "medium_or_higher", "all")
+CODE_SCANNING_TOOL_KEYS = ("tool", "alerts_threshold", "security_alerts_threshold")
+
+
+def build_code_scanning_tools(value: Any) -> list[dict]:
+    """Validate `ruleset.require_code_scanning` and return the REST
+    `code_scanning_tools` list (each tool with exactly the three keys)."""
+    where = "ruleset.require_code_scanning"
+    if not isinstance(value, list) or not value:
+        raise SystemExit(f"error: {where} must be a non-empty list of "
+                         f"{{tool, alerts_threshold, security_alerts_threshold}} mappings")
+    tools: list[dict] = []
+    seen: set[str] = set()
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise SystemExit(f"error: {where} entries must be mappings (got {entry!r})")
+        bad = [k for k in entry if k not in CODE_SCANNING_TOOL_KEYS]
+        if bad:
+            raise SystemExit(f"error: {where} entry has unknown key(s) "
+                             f"{', '.join(map(repr, bad))} (allowed: {', '.join(CODE_SCANNING_TOOL_KEYS)})")
+        tool = entry.get("tool")
+        if not isinstance(tool, str) or not tool.strip():
+            raise SystemExit(f"error: {where} entry needs a non-empty `tool`")
+        if tool in seen:
+            raise SystemExit(f"error: {where} lists tool {tool!r} twice")
+        seen.add(tool)
+        for key, accepted in (("alerts_threshold", CODE_SCANNING_ALERTS),
+                              ("security_alerts_threshold", CODE_SCANNING_SECURITY_ALERTS)):
+            v = entry.get(key)
+            if not isinstance(v, str) or v not in accepted:
+                raise SystemExit(f"error: {where}[{tool}].{key} must be one of "
+                                 f"{', '.join(accepted)} (got {v!r})")
+        tools.append({"tool": tool,
+                      "alerts_threshold": entry["alerts_threshold"],
+                      "security_alerts_threshold": entry["security_alerts_threshold"]})
+    return tools
+
+
 def build_ruleset_body(cfg: dict) -> dict:
     """Build the POST/PUT body for a desired ruleset from config."""
     name = cfg.get("name", DEFAULT_RULESET_NAME)
@@ -736,6 +777,17 @@ def build_ruleset_body(cfg: dict) -> dict:
                     "required_status_checks": [
                         {"context": c} for c in checks
                     ],
+                },
+            }
+        )
+    if cfg.get("require_code_scanning") is not None:
+        rules.append(
+            {
+                "type": "code_scanning",
+                "parameters": {
+                    "code_scanning_tools": build_code_scanning_tools(
+                        cfg["require_code_scanning"]
+                    )
                 },
             }
         )
@@ -901,6 +953,13 @@ def normalize_ruleset(rs: dict | None) -> dict | None:
             "required_status_checks", []
         )
     )
+    code_scanning = sorted(
+        (
+            {k: t.get(k) for k in CODE_SCANNING_TOOL_KEYS}
+            for t in rules_by_type.get("code_scanning", {}).get("code_scanning_tools", [])
+        ),
+        key=lambda t: str(t["tool"]),
+    )
     include = sorted(
         rs.get("conditions", {}).get("ref_name", {}).get("include", [])
     )
@@ -929,6 +988,7 @@ def normalize_ruleset(rs: dict | None) -> dict | None:
         # unordered compare would report drift on a reshuffle.
         "merge_methods": sorted(pr.get("allowed_merge_methods") or []),
         "checks": checks,
+        "code_scanning": code_scanning,
         "bypass": bypass,
     }
 
@@ -968,6 +1028,8 @@ def ruleset_doc(branch_rs: dict) -> dict:
         "block_force_pushes": "non_fast_forward" in norm["rule_types"],
         "block_deletions": "deletion" in norm["rule_types"],
         "required_status_checks": norm["checks"],
+        **({"require_code_scanning": norm["code_scanning"]}
+           if "code_scanning" in norm["rule_types"] else {}),
         # The admin role's live bypass_mode, or "none". A mode outside
         # ADMIN_BYPASS_MODES (GitHub's `exempt`) is emitted as read, so the
         # generated config fails validation rather than silently changing it.
@@ -1371,6 +1433,7 @@ SURFACE_KEYS = {
         "block_force_pushes",
         "block_deletions",
         "required_status_checks",
+        "require_code_scanning",
         "admin_bypass",
         "bypass_actors",
     ),
@@ -2128,7 +2191,29 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
 
     if ruleset_cfg.get("enabled"):
         name = ruleset_cfg.get("name", DEFAULT_RULESET_NAME)
-        plan_ruleset(name, build_ruleset_body(ruleset_cfg), normalize_ruleset)
+        body_cfg = ruleset_cfg
+        if ruleset_cfg.get("require_code_scanning") is not None:
+            build_code_scanning_tools(ruleset_cfg["require_code_scanning"])  # validate first
+            # The rule blocks every merge while its tool is "not configured for
+            # the repository", and CodeQL default setup is not offered on a
+            # private repo (see the codeql_default_setup skip), so the rule
+            # would deadlock merges there. Drop it from the desired body.
+            try:
+                private = is_private()
+            except GhError as e:
+                records.append(_err("ruleset.require_code_scanning",
+                                    ruleset_cfg["require_code_scanning"], e))
+                private = True
+            else:
+                if private:
+                    records.append(_skip(
+                        "ruleset.require_code_scanning",
+                        ruleset_cfg["require_code_scanning"],
+                        "private repo -- CodeQL is not configured there, and the rule "
+                        "blocks merges while its tool is not configured"))
+            if private:
+                body_cfg = {k: v for k, v in ruleset_cfg.items() if k != "require_code_scanning"}
+        plan_ruleset(name, build_ruleset_body(body_cfg), normalize_ruleset)
     elif "admin_bypass" in ruleset_cfg:
         # Not required while disabled, but a value that is given is checked.
         admin_bypass_mode(ruleset_cfg)
@@ -2746,6 +2831,40 @@ def _status_checks_param_risk(key: str, live: Any, desired: Any) -> str | None:
     return f"`{key}` is not on the non-weakening list"
 
 
+def _code_scanning_param_risk(key: str, live: Any, desired: Any) -> str | None:
+    if key != "code_scanning_tools":
+        return f"`{key}` is not on the non-weakening list"
+    if not isinstance(live, list) or not isinstance(desired, list):
+        return f"{key} is not a list on both sides"
+    ranks = {"alerts_threshold": CODE_SCANNING_ALERTS,
+             "security_alerts_threshold": CODE_SCANNING_SECURITY_ALERTS}
+    wanted: dict[str, dict] = {}
+    for entry in desired:
+        if not isinstance(entry, dict) or not isinstance(entry.get("tool"), str):
+            return f"a desired tool has a shape this classifier does not know: {_json(entry)}"
+        wanted[entry["tool"]] = entry
+    for entry in live:
+        if not isinstance(entry, dict) or not isinstance(entry.get("tool"), str):
+            return f"a live tool has a shape this classifier does not know: {_json(entry)}"
+        tool = entry["tool"]
+        if set(entry) - {"tool", *ranks}:
+            return (f"live code scanning tool {_json(tool)} has a field this classifier "
+                    f"does not know: {_json(entry)}")
+        if tool not in wanted:
+            return f"code scanning tool {_json(tool)} removed"
+        new = wanted[tool]
+        for field, order in ranks.items():
+            old_v, new_v = entry.get(field), new.get(field)
+            if old_v not in order or new_v not in order:
+                return f"code scanning {_json(tool)}.{field} {_json(old_v)} -> {_json(new_v)}: a value this classifier cannot rank"
+            if order.index(new_v) < order.index(old_v):
+                return f"code scanning {_json(tool)}.{field} {_json(old_v)} -> {_json(new_v)} is looser"
+    for entry in desired:
+        if set(entry) - {"tool", *ranks}:
+            return f"a desired tool has a field this classifier does not know: {_json(entry)}"
+    return None
+
+
 def _rule_risk(rule_type: str, live_rule: dict, desired_rule: dict) -> str | None:
     """None when replacing live_rule with desired_rule cannot relax it."""
     if rule_type == "update":
@@ -2758,6 +2877,8 @@ def _rule_risk(rule_type: str, live_rule: dict, desired_rule: dict) -> str | Non
         param_risk = _pull_request_param_risk
     elif rule_type == "required_status_checks":
         param_risk = _status_checks_param_risk
+    elif rule_type == "code_scanning":
+        param_risk = _code_scanning_param_risk
     else:
         return None if live == desired else (
             f"rule `{rule_type}` differs, and this classifier does not know its direction")

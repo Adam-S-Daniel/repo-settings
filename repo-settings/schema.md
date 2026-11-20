@@ -142,6 +142,25 @@ ruleset:
   # (recommended unless you have stable, always-present check names).
   required_status_checks: []
 
+  # "Require code scanning results" (REST rule type `code_scanning`). Omit =
+  # rule not declared. A non-empty list of tools; each takes both thresholds:
+  #   alerts_threshold:          none | errors | errors_and_warnings | all
+  #   security_alerts_threshold: none | critical | high_or_higher |
+  #                              medium_or_higher | all
+  # (each list runs loosest to strictest). A bad value is a config error.
+  # The rule blocks a merge while the tool is "not configured for the
+  # repository" and while its analysis is still running, so it is only safe
+  # where CodeQL default setup is on. On a PRIVATE repo (no default setup
+  # there) the engine drops the rule from the desired ruleset and reports a
+  # `skipped` record instead. Adding the rule or a tool, or making a
+  # threshold stricter, applies unattended; removing the rule or a tool, or
+  # loosening a threshold, waits for review. A live rule that config omits
+  # reads as drift, as for any other undeclared rule.
+  require_code_scanning:
+    - tool: CodeQL
+      alerts_threshold: errors
+      security_alerts_threshold: high_or_higher
+
   # The repository Admin role's bypass. REQUIRED wherever the ruleset is
   # enabled, after `defaults:` and a repo's `overrides:` are merged: the key
   # grants access, so the engine has no default for it and refuses a ruleset
