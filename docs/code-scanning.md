@@ -63,6 +63,9 @@ manages its own settings and still runs `default`.
 
 ## Checked, no change
 
+- **`security-and-quality` suite:** not used. Default setup cannot run it,
+  and code quality comes from managed linters instead
+  ([_agent-guidance ADR 0049](https://github.com/Adam-S-Daniel/_agent-guidance/blob/main/docs/decisions/0049-code-quality-comes-from-managed-linters-not-codeql.md)).
 - **Threat model** `remote_and_local`: public preview, Java/Kotlin and C# only.
 - **Labeled runners, default setup at scale, advanced setup:** self-hosted or
   org features, or more upkeep for no gain; default setup also picks up new
