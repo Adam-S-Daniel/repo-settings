@@ -1671,6 +1671,8 @@ def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
                 "manage": manage,
                 "declared": declared,
                 "effective": effective_settings(declared, manage),
+                "defaults": defaults,
+                "overrides": overrides,
             }
             check_cms_label_only(target)
             targets.append(target)
@@ -2626,8 +2628,12 @@ def _codeql_risk(wanted: Any, statuses: dict[str, str],
                or (suite_rec is not None and suite_rec.get("status") in ("match", "drift")
                    and isinstance(suite_rec.get("current"), str)))
     if not live_on:
-        return _gated("CodeQL default setup -> on would replace the results of a "
-                      "CodeQL workflow the repo may run itself; this plan cannot see one")
+        # Turning it on enables a security feature, so it does not wait
+        # (owner's rule, 2026-11-20). A repo that runs CodeQL from its own
+        # workflow reads as "not configured" and GitHub stops taking that
+        # workflow's results once default setup is on; check for one before
+        # declaring such a repo.
+        return _safe("CodeQL default setup -> on (enables a security feature)")
     suite = wanted.get("codeql_query_suite")
     if suite is not None and suite != "extended" \
             and statuses.get("security.codeql_query_suite") != "match":
@@ -2852,20 +2858,21 @@ def write_risk(rec: dict, records: list[dict]) -> tuple[str, str]:
     if kind in SAFE_GROUP_VALUES:
         return _group_risk(kind, b, statuses)
     if kind == "codeql":
-        verdict = _codeql_risk(b, statuses, records)
-        if (verdict[0] == GATED and _onboarding(records) and isinstance(b, dict)
-                and b.get("codeql_default_setup") is True
-                and not set(b) - {"codeql_default_setup", "codeql_query_suite"}):
-            return _safe("CodeQL default setup -> on while the repo is onboarded "
-                         "(its managed ruleset is created in the same plan)")
-        return verdict
+        return _codeql_risk(b, statuses, records)
     if kind == "auto_merge":
-        if b is False:
-            return _safe("repo.allow_auto_merge -> false")
-        if b is True and _onboarding(records):
-            return _safe("repo.allow_auto_merge -> true while the repo is onboarded "
-                         "(its managed ruleset is created in the same plan)")
-        return _gated("repo.allow_auto_merge -> true adds a way to merge")
+        # Auto-merge merges only once every rule and required check passes,
+        # so neither value loosens a rule or touches security.
+        if b is True or b is False:
+            return _safe(f"repo.allow_auto_merge -> {_json(b)} (merges only what "
+                         "the rules already allow)")
+        return _gated(f"repo.allow_auto_merge -> {_json(b)}: not a boolean")
+    if kind == "merge_commit_message":
+        # The merge commit's default text. It is not a rule and not a
+        # security feature, so no value of it loosens anything.
+        if isinstance(b, dict) and b and set(b) <= set(MERGE_COMMIT_MESSAGE_KEYS) \
+                and all(isinstance(v, str) for v in b.values()):
+            return _safe("repo.merge_commit_message: the default merge text")
+        return _gated("repo.merge_commit_message: a write this classifier cannot read")
     if kind == "delete_branch_on_merge":
         return _safe("repo.delete_branch_on_merge -> true") if b is True else \
             _gated("repo.delete_branch_on_merge -> false")
@@ -2881,9 +2888,13 @@ def write_risk(rec: dict, records: list[dict]) -> tuple[str, str]:
         if b is not False:
             live_name = current.get("name") if isinstance(current, dict) else None
             spec_name = a.get("name") if isinstance(a, dict) else None
-            if not isinstance(spec_name, str) or live_name != spec_name:
-                return _gated(f"{rec.get('setting')}: the write renames the live "
-                              f"label {_json(live_name)}")
+            if not isinstance(spec_name, str):
+                return _gated(f"{rec.get('setting')}: the write's label name is not readable")
+            if isinstance(current, dict) and not isinstance(live_name, str):
+                return _gated(f"{rec.get('setting')}: the live label was read without its name")
+            if live_name is not None and live_name != spec_name:
+                return _safe(f"{rec.get('setting')}: renames {_json(live_name)} to "
+                             f"{_json(spec_name)} (a label is not a rule)")
         return _safe(f"{rec.get('setting')}: create, or set color and description")
     if kind == "ruleset":
         name = a.get("name") if isinstance(a, dict) else None
@@ -2898,11 +2909,63 @@ def write_risk(rec: dict, records: list[dict]) -> tuple[str, str]:
     return _gated(f"writer `{kind}` is not on the non-weakening list")
 
 
-def classify_records(records: list[dict]) -> None:
+def fleet_standard(setting: Any, defaults: Any, overrides: Any) -> bool:
+    """True when a record's setting comes from `defaults:` alone: the defaults
+    declare it and the repo's `overrides:` do not touch it. Anything this
+    cannot map (an actions policy, an extra ruleset, an unknown name) is not
+    a fleet standard."""
+    if not isinstance(setting, str) or not isinstance(defaults, dict) \
+            or not isinstance(overrides, dict):
+        return False
+    if setting.startswith("ruleset[") and setting.endswith("]"):
+        ruleset = defaults.get("ruleset")
+        return (isinstance(ruleset, dict) and ruleset.get("name") == setting[8:-1]
+                and "ruleset" not in overrides)
+    if setting.startswith("label[") and setting.endswith("]"):
+        name = setting[6:-1].lower()
+
+        def names(block: Any) -> set:
+            return {str(x.get("name", "")).lower() for x in block or []
+                    if isinstance(x, dict)} if isinstance(block, list) else set()
+        return name in names(defaults.get("labels")) and name not in names(overrides.get("labels"))
+    group, dot, key = setting.partition(".")
+    if not dot or group not in ("repo", "actions", "security"):
+        return False
+    keys = MERGE_COMMIT_MESSAGE_KEYS if setting == "repo.merge_commit_message" else (key,)
+    d, o = defaults.get(group), overrides.get(group) or {}
+    return (isinstance(d, dict) and isinstance(o, dict)
+            and all(k in d and k not in o for k in keys))
+
+
+def _onboarding(records: list[dict]) -> bool:
+    """True when the same plan creates a managed ruleset that does not exist
+    yet: the repo is being set up, and nothing on it predates the fleet."""
+    for r in records:
+        writer = r.get("_writer")
+        if (r.get("status") == "drift" and isinstance(writer, tuple) and len(writer) == 3
+                and writer[0] == "ruleset" and writer[2] is None
+                and r.get("_live") is None and r.get("current") is None):
+            return True
+    return False
+
+
+def classify_records(records: list[dict], defaults: Any = None,
+                     overrides: Any = None) -> None:
     """Set `risk` and `risk_reason` on every drift record of one repo's plan.
-    Call it before any write: it reads the statuses as planned."""
+    Call it before any write: it reads the statuses as planned.
+
+    With a fleet config's `defaults` and the repo's `overrides`, a plan that
+    sets a repo up (it creates the repo's managed ruleset) also makes every
+    write that puts a setting at the fleet standard safe, even one that
+    would otherwise wait (owner's rule, 2026-11-20). A repo's own overrides
+    never get this, and neither does a repo already set up, so a change to
+    `defaults:` that loosens something still waits on every existing repo."""
     verdicts = [(r, write_risk(r, records)) for r in records if r.get("status") == "drift"]
+    setting_up = defaults is not None and _onboarding(records)
     for rec, (verdict, reason) in verdicts:
+        if (verdict == GATED and setting_up and not rec.get("bypass_unknown")
+                and fleet_standard(rec.get("setting"), defaults, overrides)):
+            verdict, reason = SAFE, f"fleet standard on a repo being set up (was: {reason})"
         rec["risk"], rec["risk_reason"] = verdict, reason
 
 
@@ -3159,7 +3222,7 @@ def cmd_diff(args) -> int:
             print(f"\n{t['repo']}\n  {DIM}{manage_label(t)}{RESET}")
             continue
         records = plan_repo_records(t["repo"], t["effective"])
-        classify_records(records)
+        classify_records(records, t.get("defaults"), t.get("overrides"))
         render_records(t["repo"], records, manage_label(t))
         any_drift |= any(r["status"] == "drift" for r in records)
         any_error |= any(r["status"] == "error" for r in records)
@@ -3202,7 +3265,7 @@ def cmd_apply(args) -> int:
             continue
         records = plan_repo_records(t["repo"], t["effective"])
         # Before the first write: the verdicts read the statuses as planned.
-        classify_records(records)
+        classify_records(records, t.get("defaults"), t.get("overrides"))
         planned = [r for r in records if r["status"] in ("drift", "error")]
         for r in records:
             if r["status"] == "drift":

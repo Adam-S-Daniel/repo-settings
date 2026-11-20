@@ -69,29 +69,44 @@ list.
 |---|---|---|
 | Rulesets | A new ruleset. Added rules and required checks, removed bypass actors, enforcement to `active`, stricter pull-request parameters, fewer merge methods | A removed rule or check, an added bypass actor or a changed bypass mode, any change to which refs are covered, a live setting the write would switch off, a check pinned to an app, any field or parameter the engine does not know |
 | Actions | SHA pinning on, stricter fork-PR approval, read-only workflow token, workflows may not approve pull requests | The reverse of each; every Actions event policy write |
-| Security | Alerts, security updates, secret scanning and push protection on; the larger CodeQL suite where default setup is already on; CodeQL default setup on while onboarding | Anything turned off; the smaller suite; turning CodeQL default setup on |
-| Repo | A merge method off, auto-merge off, delete branch on merge on; auto-merge on while onboarding | The reverse of each; the merge commit message |
-| Labels | Create, or set color and description | A write that would rename the live label (its name differs in case) |
+| Security | Alerts, security updates, secret scanning and push protection on; the larger CodeQL suite where default setup is already on; CodeQL default setup on | Anything turned off; the smaller suite |
+| Repo | A merge method off, delete branch on merge on, auto-merge on or off, the merge commit text | A merge method on, delete branch on merge off |
+| Labels | Create, set color and description, or fix the name's case | A label read without its name |
+
+On a repo being set up, the Gated column does not apply to settings that
+come from `defaults:` alone (see the 2026-11-20 amendment below).
 
 A writer that sends a whole group in one call (merge methods, workflow
 permissions, secret scanning, CodeQL) is safe only when every key it sends is
 either the stricter value or was read as already set.
 
-Turning CodeQL default setup on waits, although it reads as a tightening. A
-repo that runs CodeQL from its own workflow reads as "not configured", and
-GitHub stops accepting that workflow's results once default setup is on, so
-the write can replace a broader analysis with a narrower one. The plan
-cannot see such a workflow.
+**Amended 2026-11-20 (owner's rules).** The owner approved a reviewed apply
+that only turned on CodeQL default setup and auto-merge for a newly onboarded
+repo (run 44744406728) and set the rule: a run needs no approval when its
+changes set a repo up to fleet standards, or when none of them loosens a rule,
+adds a rule that loosens a restriction, enables a feature that decreases
+security, or disables a security feature. So:
 
-**Amended 2026-11-20 (owner's rule): onboarding needs no review.** When the
-same plan creates a repo's managed ruleset from scratch, the repo is being
-onboarded, and two writes that otherwise wait are safe there: CodeQL default
-setup on, and auto-merge on. The owner approved exactly those two for
-claude-plan-usage-estimator (run 44744406728, whose reviewed apply changed
-nothing else) and asked that such runs not need him. Outside that plan both
-still wait. The cost: a repo that already runs its own CodeQL workflow and is
-onboarded later would have default setup replace it unreviewed; check for one
-before declaring such a repo.
+- **Judged on that test alone**, four writes that used to wait are safe:
+  CodeQL default setup on (it enables a security feature), auto-merge on (it
+  merges only what every rule and required check already allow), the merge
+  commit's default text, and a case-only label rename (neither is a rule or a
+  security feature). Everything that loosens still waits, and so does any
+  write the classifier cannot read.
+- **Setting a repo up to the fleet standard.** When the plan creates the
+  repo's managed ruleset from scratch (the repo is being onboarded), a write
+  that would otherwise wait is safe if its setting comes from `defaults:`
+  alone, with no repo override touching it (`fleet_standard` and
+  `classify_records`). The ruleset itself is already safe as a new ruleset.
+  Repo overrides, extra rulesets and Actions policies never qualify.
+- **Why only while setting up.** Any agent can merge a `fleet.yml` change, so
+  the apply gate is the one place a person sees a loosening. If "matches the
+  defaults" were enough on every repo, a loosening edit to `defaults:` would
+  reach the whole fleet unreviewed. Limited to set-up, it reaches only repos
+  that have nothing to protect yet.
+- **Cost.** A repo that runs CodeQL from its own workflow reads as "not
+  configured", and GitHub stops accepting that workflow's results once
+  default setup is on. Check for one before declaring such a repo.
 
 The ruleset comparison reads the live ruleset as GitHub returned it, not the
 engine's normalized view. A ruleset write replaces the whole body, so a live
