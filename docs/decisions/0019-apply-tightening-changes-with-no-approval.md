@@ -94,11 +94,14 @@ security, or disables a security feature. So:
   security feature). Everything that loosens still waits, and so does any
   write the classifier cannot read.
 - **Setting a repo up to the fleet standard.** When the plan creates the
-  repo's managed ruleset from scratch (the repo is being onboarded), a write
-  that would otherwise wait is safe if its setting comes from `defaults:`
-  alone, with no repo override touching it (`fleet_standard` and
-  `classify_records`). The ruleset itself is already safe as a new ruleset.
-  Repo overrides, extra rulesets and Actions policies never qualify.
+  fleet's default ruleset on a repo that has no ruleset at all (the repo is
+  being onboarded), a write that would otherwise wait is safe if its setting
+  comes from `defaults:` alone, with no repo override touching it
+  (`fleet_standard` and `classify_records`). A group writer qualifies only
+  when every key it sends does. The ruleset itself is already safe as a new
+  ruleset. Repo overrides, extra rulesets and Actions policies never
+  qualify, and a new extra ruleset or a renamed default on a repo that
+  already has a ruleset does not count as setting up.
 - **Why only while setting up.** Any agent can merge a `fleet.yml` change, so
   the apply gate is the one place a person sees a loosening. If "matches the
   defaults" were enough on every repo, a loosening edit to `defaults:` would

@@ -689,11 +689,12 @@ class FleetStandardTests(unittest.TestCase):
         "labels": [{"name": "agent-authored", "color": "d4c5f9"}],
     }
 
-    def new_ruleset(self):
-        body = rs.build_ruleset_body(RULESET_CFG)
-        return {"setting": "ruleset[default branch protection]", "status": "drift",
+    def new_ruleset(self, name="default branch protection", first=True):
+        body = rs.build_ruleset_body(dict(RULESET_CFG, name=name))
+        return {"setting": f"ruleset[{name}]", "status": "drift",
                 "current": None, "desired": rs.normalize_ruleset(body),
-                "_writer": ("ruleset", body, None), "_live": None}
+                "_writer": ("ruleset", body, None), "_live": None,
+                "_first_ruleset": first}
 
     def existing_ruleset(self):
         return ruleset_record(live_default(), cfg_with(
@@ -726,6 +727,42 @@ class FleetStandardTests(unittest.TestCase):
             with self.subTest(label):
                 records = self.classify([*extra, self.loosening()], {})
                 self.assertEqual(records[-1]["risk"], GATED)
+
+    def test_a_new_ruleset_on_a_repo_that_has_one_is_not_set_up(self):
+        # Review finding: an extra ruleset, a renamed default, or a managed
+        # ruleset deleted while others remain must not open the gate.
+        for label, ruleset in (
+                ("the default ruleset, but the repo already has another",
+                 self.new_ruleset(first=False)),
+                ("an extra ruleset", self.new_ruleset(name="persistent branches")),
+                ("the first-ruleset flag missing",
+                 {k: v for k, v in self.new_ruleset().items() if k != "_first_ruleset"})):
+            with self.subTest(label):
+                records = self.classify([ruleset, self.loosening()], {})
+                self.assertEqual(records[-1]["risk"], GATED)
+
+    def test_a_group_write_carrying_an_override_still_waits(self):
+        # Review finding: a group writer sends every declared key, so a
+        # sibling from defaults must not carry the repo's own override.
+        defaults = dict(self.DEFAULTS, actions={
+            "sha_pinning_required": True, "default_workflow_permissions": "read",
+            "can_approve_pull_request_reviews": False})
+        group = {"default_workflow_permissions": "write",
+                 "can_approve_pull_request_reviews": False}
+        sibling = rec("actions.can_approve_pull_request_reviews",
+                      ("workflow_permissions", None, group), True, False)
+        records = [self.new_ruleset(), sibling]
+        overrides = {"actions": {"default_workflow_permissions": "write"}}
+        rs.classify_records(records, defaults, overrides)
+        self.assertEqual(sibling["risk"], GATED, sibling["risk_reason"])
+        with self.subTest("the same group with no override is the standard"):
+            group = {"default_workflow_permissions": "read",
+                     "can_approve_pull_request_reviews": False}
+            sibling = rec("actions.can_approve_pull_request_reviews",
+                          ("workflow_permissions", None, group), True, False)
+            records = [self.new_ruleset(), sibling]
+            rs.classify_records(records, defaults, {})
+            self.assertEqual(sibling["risk"], SAFE, sibling["risk_reason"])
 
     def test_without_a_fleet_config_nothing_changes(self):
         records = [self.new_ruleset(), self.loosening()]
@@ -767,6 +804,16 @@ class PlanCarriesTheLiveRulesetTests(unittest.TestCase):
         self.assertIs(records[0]["_live"], live)
         rs.classify_records(records)
         self.assertEqual(records[0]["risk"], SAFE, records[0]["risk_reason"])
+
+    def test_a_missing_ruleset_records_whether_the_repo_has_any(self):
+        cfg = cfg_with(required_status_checks=["test", "agent-checks"])
+        for live_list, first in (([], True), ([{"id": 9, "name": "other"}], False)):
+            with self.subTest(first=first), \
+                 patch.object(rs, "find_ruleset", return_value=None), \
+                 patch.object(rs, "list_rulesets", return_value=live_list), \
+                 patch.object(rs, "get_repo", return_value={"private": False}):
+                records = rs.plan_repo("example/example", {"ruleset": cfg})
+            self.assertIs(records[0]["_first_ruleset"], first)
 
     def test_a_ruleset_read_without_bypass_actors_gates(self):
         cfg = cfg_with(required_status_checks=["test", "agent-checks", "starter-suites"])

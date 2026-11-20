@@ -2061,6 +2061,10 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
                 # The live body as GitHub returned it, for write_risk: the PUT
                 # replaces the whole ruleset, fields `normalize` drops included.
                 "_live": existing,
+                # The repo has no ruleset at all yet: the first sign it is
+                # being set up (classify_records). A renamed or extra ruleset
+                # on a repo that already has one never counts.
+                "_first_ruleset": existing is None and not list_rulesets(repo),
             }
             if unknown:
                 rec["note"] = BYPASS_UNKNOWN_NOTE
@@ -2809,20 +2813,6 @@ def _ruleset_put_risk(name: str, live: Any, desired: Any) -> tuple[str, str]:
     return _safe(f"{label}: no rule, check, ref or bypass actor is removed or relaxed")
 
 
-def _onboarding(records: list[dict]) -> bool:
-    """True when the same plan creates a managed ruleset that does not exist
-    yet: the repo is being onboarded, so nothing on it predates the fleet's
-    settings. The owner's rule (2026-11-20): on a newly onboarded repo,
-    turning on CodeQL default setup and auto-merge needs no review."""
-    for r in records:
-        writer = r.get("_writer")
-        if (r.get("status") == "drift" and isinstance(writer, tuple) and len(writer) == 3
-                and writer[0] == "ruleset" and writer[2] is None
-                and r.get("_live") is None and r.get("current") is None):
-            return True
-    return False
-
-
 def write_risk(rec: dict, records: list[dict]) -> tuple[str, str]:
     """(SAFE | GATED, reason) for one drift record of a repo's plan.
 
@@ -2937,16 +2927,37 @@ def fleet_standard(setting: Any, defaults: Any, overrides: Any) -> bool:
             and all(k in d and k not in o for k in keys))
 
 
-def _onboarding(records: list[dict]) -> bool:
-    """True when the same plan creates a managed ruleset that does not exist
-    yet: the repo is being set up, and nothing on it predates the fleet."""
+def _onboarding(records: list[dict], defaults: Any) -> bool:
+    """True when the plan creates the fleet's default ruleset on a repo that
+    has no ruleset at all yet: the repo is being set up. A new extra ruleset,
+    a renamed default, or a repo that already carries any ruleset is not."""
+    ruleset = defaults.get("ruleset") if isinstance(defaults, dict) else None
+    name = ruleset.get("name") if isinstance(ruleset, dict) else None
+    if not isinstance(name, str):
+        return False
     for r in records:
         writer = r.get("_writer")
-        if (r.get("status") == "drift" and isinstance(writer, tuple) and len(writer) == 3
+        if (r.get("status") == "drift" and r.get("setting") == f"ruleset[{name}]"
+                and isinstance(writer, tuple) and len(writer) == 3
                 and writer[0] == "ruleset" and writer[2] is None
-                and r.get("_live") is None and r.get("current") is None):
+                and r.get("_live") is None and r.get("current") is None
+                and r.get("_first_ruleset") is True):
             return True
     return False
+
+
+def _whole_write_is_standard(rec: dict, defaults: Any, overrides: Any) -> bool:
+    """A group writer sends every declared key of its group in one call, so
+    a record is a fleet standard only when every key it sends is one."""
+    setting = rec.get("setting")
+    if not fleet_standard(setting, defaults, overrides):
+        return False
+    writer = rec.get("_writer")
+    payload = writer[2] if isinstance(writer, tuple) and len(writer) == 3 else None
+    group = setting.partition(".")[0] if isinstance(setting, str) else ""
+    if isinstance(payload, dict) and group in ("repo", "actions", "security"):
+        return all(fleet_standard(f"{group}.{k}", defaults, overrides) for k in payload)
+    return True
 
 
 def classify_records(records: list[dict], defaults: Any = None,
@@ -2961,10 +2972,10 @@ def classify_records(records: list[dict], defaults: Any = None,
     never get this, and neither does a repo already set up, so a change to
     `defaults:` that loosens something still waits on every existing repo."""
     verdicts = [(r, write_risk(r, records)) for r in records if r.get("status") == "drift"]
-    setting_up = defaults is not None and _onboarding(records)
+    setting_up = defaults is not None and _onboarding(records, defaults)
     for rec, (verdict, reason) in verdicts:
         if (verdict == GATED and setting_up and not rec.get("bypass_unknown")
-                and fleet_standard(rec.get("setting"), defaults, overrides)):
+                and _whole_write_is_standard(rec, defaults, overrides)):
             verdict, reason = SAFE, f"fleet standard on a repo being set up (was: {reason})"
         rec["risk"], rec["risk_reason"] = verdict, reason
 
