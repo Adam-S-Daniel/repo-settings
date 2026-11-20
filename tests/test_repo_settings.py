@@ -4318,8 +4318,12 @@ class CodeqlDefaultSetupTests(unittest.TestCase):
     CFG = {"codeql_default_setup": True}
 
     def _plan(self, cfg, private=False, live=None, read_error=None,
-              analyses=None, workflows=None):
+              analyses=None, workflows=None, languages=None):
         def api(path, **kw):
+            if path.endswith("/languages"):
+                if isinstance(languages, Exception):
+                    raise languages
+                return languages or {}
             if path.endswith("/code-scanning/default-setup"):
                 if read_error:
                     raise read_error
@@ -4375,6 +4379,44 @@ class CodeqlDefaultSetupTests(unittest.TestCase):
         records = self._plan(self.CFG, live={"state": "configured", "query_suite": "default"},
                              analyses=AssertionError("looked"))
         self.assertEqual(records[0]["codeql_existing"], [])
+
+    def test_language_gap_is_report_only(self):
+        live = {"state": "configured", "query_suite": "default", "languages": ["actions", "python"]}
+        records = self._plan(self.CFG, live=live,
+                             languages={"Python": 9000, "JavaScript": 1000, "Shell": 5000, "Go": 10})
+        gap = [r for r in records if r["setting"] == "security.codeql_languages"]
+        self.assertEqual(len(gap), 1)
+        self.assertEqual(gap[0]["status"], "advisory")
+        # Go is under 1% of the bytes, so it is not expected.
+        self.assertTrue(gap[0]["note"].startswith(
+            "default setup does not scan javascript-typescript, which"), gap[0]["note"])
+        self.assertNotIn("_writer", gap[0])
+
+    def test_no_language_gap_no_record(self):
+        live = {"state": "configured", "query_suite": "default",
+                "languages": ["actions", "javascript", "python"]}
+        records = self._plan(self.CFG, live=live, languages={"Python": 10, "TypeScript": 10})
+        self.assertEqual([r["setting"] for r in records], ["security.codeql_default_setup"])
+
+    def test_language_gap_helper(self):
+        self.assertEqual(rs.codeql_language_gaps({"Python": 98, "Rust": 2, "C#": 0.5}, ["python"]),
+                         ["rust"])
+        self.assertEqual(rs.codeql_language_gaps({}, []), [])
+        self.assertEqual(rs.codeql_language_gaps({"Kotlin": 5, "Java": 5}, ["java-kotlin"]), [])
+
+    def test_unreadable_languages_is_a_skip(self):
+        live = {"state": "configured", "query_suite": "default", "languages": ["python"]}
+        records = self._plan(self.CFG, live=live, languages=rs.GhError(403, "no"))
+        self.assertEqual([r["status"] for r in records], ["match", "skipped"])
+
+    def test_advisory_is_reported_but_not_a_change(self):
+        adv = {"repo": "o/r", "setting": "security.codeql_languages", "status": "advisory",
+               "current": ["python"], "desired": None, "note": "default setup does not scan rust"}
+        md = rs.changes_markdown([adv])
+        self.assertIn("No changes planned", md)
+        self.assertIn("To check (report only)", md)
+        self.assertIn("rust", md)
+        self.assertEqual(rs.changes_annotations([adv], None), [])
 
     def test_match_when_configured(self):
         records = self._plan(self.CFG, live={"state": "configured", "query_suite": "default"})

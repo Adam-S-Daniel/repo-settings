@@ -510,7 +510,37 @@ def read_codeql_default_setup(repo: str) -> dict | None:
     return {
         "configured": data["state"] == "configured",
         "query_suite": data.get("query_suite"),
+        "languages": [l for l in data.get("languages") or [] if isinstance(l, str)],
     }
+
+
+# GitHub's linguist names -> the CodeQL language default setup scans them as.
+LINGUIST_TO_CODEQL = {
+    "Python": "python", "JavaScript": "javascript-typescript",
+    "TypeScript": "javascript-typescript", "Ruby": "ruby", "Go": "go",
+    "Java": "java-kotlin", "Kotlin": "java-kotlin", "C#": "csharp",
+    "C": "c-cpp", "C++": "c-cpp", "Swift": "swift", "Rust": "rust",
+}
+# A language under this share of the repo's bytes is not expected to be
+# scanned: fixtures and vendored snippets would otherwise read as gaps.
+CODEQL_LANGUAGE_MIN_SHARE = 0.01
+
+
+def codeql_language_gaps(repo_languages: dict, scanned: list[str]) -> list[str]:
+    """CodeQL languages the repo's code needs (at least 1% of its bytes, per
+    GET repos/{repo}/languages) that default setup does not scan. Default
+    setup reports JavaScript/TypeScript as `javascript`, `typescript` and
+    `javascript-typescript`; any one of them counts."""
+    total = sum(v for v in repo_languages.values() if isinstance(v, (int, float)))
+    if total <= 0:
+        return []
+    have = set(scanned)
+    if have & {"javascript", "typescript"}:
+        have.add("javascript-typescript")
+    want = {LINGUIST_TO_CODEQL[name] for name, size in repo_languages.items()
+            if name in LINGUIST_TO_CODEQL and isinstance(size, (int, float))
+            and size / total >= CODEQL_LANGUAGE_MIN_SHARE}
+    return sorted(want - have)
 
 
 def find_existing_codeql(repo: str) -> list[str] | None:
@@ -2141,6 +2171,28 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
                         # What default setup would replace: see _codeql_risk.
                         "codeql_existing": existing,
                     })
+                if live["configured"]:
+                    # Report only: the engine never sends `languages`, so a gap
+                    # is GitHub's to fix (it drops a language whose first
+                    # analysis fails and does not retry).
+                    try:
+                        gaps = codeql_language_gaps(gh_api(f"repos/{repo}/languages") or {},
+                                                    live["languages"])
+                    except GhError as e:
+                        records.append(_skip("security.codeql_languages", None,
+                                             f"cannot read repos/{repo}/languages -- {e.message}"))
+                    else:
+                        if gaps:
+                            records.append({
+                                "setting": "security.codeql_languages",
+                                "status": "advisory",
+                                "current": sorted(live["languages"]),
+                                "desired": None,
+                                "note": (f"default setup does not scan {', '.join(gaps)}, which "
+                                         "the repo's code needs. Read Security > Code scanning > "
+                                         "Tool status for why; turning default setup off and on "
+                                         "again re-detects the languages."),
+                            })
 
     # -- ruleset ------------------------------------------------------------ #
     def plan_ruleset(name: str, body: dict, normalize) -> None:
@@ -3174,6 +3226,7 @@ def _sym(status: str) -> str:
         "drift": f"{YELLOW}DRIFT{RESET}",
         "changed": f"{YELLOW}CHANGED{RESET}",
         "skipped": f"{DIM}skip{RESET}",
+        "advisory": f"{YELLOW}CHECK{RESET}",
         "error": f"{RED}ERROR{RESET}",
         "would-change": f"{YELLOW}would change{RESET}",
         "gated": f"{YELLOW}LEFT FOR REVIEW{RESET}",
@@ -3198,7 +3251,7 @@ def render_records(repo: str, records: list[dict], scope: str | None = None) -> 
                      f"\n      why:  {r.get('note', '')}")
         elif r["status"] == "changed":
             line += f"  -> {r['desired']!r}"
-        elif r["status"] in ("skipped", "error"):
+        elif r["status"] in ("skipped", "error", "advisory"):
             line += f"  ({r.get('note', '')})"
         print(line)
 
@@ -3422,7 +3475,7 @@ def cmd_diff(args) -> int:
              "current": r["current"], "desired": r["desired"],
              "note": r.get("note"), "risk": r.get("risk"),
              "risk_reason": r.get("risk_reason")}
-            for r in records if r["status"] in ("drift", "error")
+            for r in records if r["status"] in ("drift", "error", "advisory")
         )
     if getattr(args, "changes_json", None):
         with open(args.changes_json, "w", encoding="utf-8") as fh:
@@ -3549,10 +3602,15 @@ def changes_markdown(changes: list[dict]) -> str:
     drift = sorted((c for c in changes if c["status"] == "drift"),
                    key=lambda c: (c["setting"], c["repo"].lower()))
     errors = [c for c in changes if c["status"] == "error"]
+    advisories = sorted((c for c in changes if c["status"] == "advisory"),
+                        key=lambda c: (c["setting"], c["repo"].lower()))
+    advisory_lines = (["", "## To check (report only)", ""]
+                      + [f"- {c['repo']}: {c['setting']} ({_md_text(c.get('note') or '')})"
+                         for c in advisories]) if advisories else []
     lines = ["## Planned changes", ""]
-    if not changes:
+    if not drift and not errors:
         lines.append("No changes planned. An apply would change nothing.")
-        return "\n".join(lines) + "\n"
+        return "\n".join(lines + advisory_lines) + "\n"
 
     def cell(text: str) -> str:
         return "`" + text.replace("|", "\\|").replace("`", "'") + "`"
@@ -3575,14 +3633,14 @@ def changes_markdown(changes: list[dict]) -> str:
                   "plan is incomplete:", ""]
         lines += [f"- {c['repo']}: {c['setting']} ({c.get('note') or 'error'})"
                   for c in errors]
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines + advisory_lines) + "\n"
 
 
 def changes_annotations(changes: list[dict], summary_url: str | None) -> list[str]:
     """`::notice` lines, at most MAX_NOTICES. When there are more changes than
     that, the last line says so instead of showing one more."""
     where = f" at {summary_url}" if summary_url else ""
-    lines = [_change_line(c) for c in changes]
+    lines = [_change_line(c) for c in changes if c["status"] != "advisory"]
     if len(lines) > MAX_NOTICES:
         shown = lines[: MAX_NOTICES - 1]
         hidden = len(lines) - len(shown)

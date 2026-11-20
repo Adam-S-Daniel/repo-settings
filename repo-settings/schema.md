@@ -435,7 +435,13 @@ another way (an analysis whose `analysis_key` is not under `dynamic/`; with no
 code scanning read, an active workflow with `codeql` in its path or name),
 because default setup disables that workflow and refuses its uploads. A find,
 or a check it could not make, makes the write wait for review, even on a repo
-being set up. How this compares with GitHub's
+being set up.
+On a repo where default setup is on, the plan also compares its `languages`
+with `GET repos/{repo}/languages`: a CodeQL language with at least 1% of the
+repo's bytes that default setup does not scan is a report-only
+`security.codeql_languages` record (status `advisory`, shown under "To check"
+in the plan summary). It never writes, since `languages` is never sent.
+How this compares with GitHub's
 code scanning docs, and what is worth changing:
 [`docs/code-scanning.md`](../docs/code-scanning.md).
 
