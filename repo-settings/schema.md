@@ -410,7 +410,9 @@ choosing them and a repo that gains a language picks it up. On a **private**
 repo both keys are a `skipped` record (CodeQL there needs GitHub Code
 Security); a 403/404 on the read is a skip too, never drift.
 `codeql_query_suite` is ignored when `codeql_default_setup` is `false`, and
-any value other than `default` or `extended` is a config error.
+any value other than `default` or `extended` is a config error. How this compares with GitHub's
+code scanning docs, and what is worth changing:
+[`docs/code-scanning.md`](../docs/code-scanning.md).
 
 **Endpoints, and the PUT/DELETE-carries-the-value shape.** Both applyable
 leaves are read and written through a pair of GitHub endpoints that take
