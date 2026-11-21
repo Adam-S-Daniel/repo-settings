@@ -205,7 +205,11 @@ the plan, on schedule included. That is a deliberate trade
 ([#113](https://github.com/Adam-S-Daniel/repo-settings/pull/113)): no weekly
 approval for a run that changes nothing, in exchange for no weekly backstop on
 those three. A push or dispatch that applies for other drift still converges
-them, and so does a dispatch with `force_apply`.
+`bypass_actors` and Actions policies, and so does a dispatch with
+`force_apply`. The merge flags it does not: the admin App has no Contents
+permission either (step 1), so the apply skips them too, and only an operator
+`apply` under ambient `gh auth` converges them (`AGENTS.md`, "Merge-setting
+fields go missing on a low-scope token").
 
 A dry-run dispatch is the plan alone and asks for no approval. On pull
 requests, the workflow reports drift only and fails the `drift` check if there
