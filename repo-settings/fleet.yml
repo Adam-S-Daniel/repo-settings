@@ -187,13 +187,16 @@ defaults:
     # CodeQL default setup (owner, 2026-10-26: "turn on codeql for all public
     # repos"). Free on public repos; private repos are skipped because CodeQL
     # there needs GitHub Code Security. GitHub picks the languages itself
-    # (GitHub Actions workflows count, so every repo here has one), and
-    # `codeql_query_suite` is left unmanaged: `default` is GitHub's own
-    # default, and a repo that wants `extended` can declare it in overrides.
+    # (GitHub Actions workflows count, so every repo here has one).
     # Forks and the cms-platform trio are not managed here (see their
     # entries); before this, all 19 public repos had code scanning never run
     # (security-alerts snapshot, 2026-10-26).
     codeql_default_setup: true
+    # The extended suite (`security-extended`): a three-repo trial
+    # (2026-11-20) added one real high-severity finding in first-party code
+    # and no noise outside skills-evals' eval fixtures. See
+    # docs/code-scanning.md.
+    codeql_query_suite: extended
   ruleset:
     enabled: true
     name: "default branch protection"
@@ -578,12 +581,23 @@ repos:
   # and pull requests never touch the repo that feeds the fleet's guidance.
   # Excluded from _agent-guidance's AGENTS.md sync, so agent-checks was added
   # by hand, as for verify-actions-lock above. `test` (ci.yml) runs on every
-  # pull request with no on.paths, no matrix, name or concurrency group.
+  # pull request with no on.paths, no matrix, name or concurrency group;
+  # `starter-suites` (ci.yml, acsi-kit#72) likewise, gating its steps on
+  # whether starter/, export/, ci.yml or actions.lock changed, so it reports
+  # success on every pull request.
   - name: Adam-S-Daniel/acsi-kit
     manage: ["all"]
     overrides:
       ruleset:
-        required_status_checks: [test, agent-checks]
+        required_status_checks: [test, agent-checks, starter-suites]
+        # Trial of "Require code scanning results" (owner, 2026-11-20): a pull
+        # request that adds a high or critical CodeQL security alert, or an
+        # error-level alert, cannot merge. One repo first; see
+        # docs/code-scanning.md for what the trial is meant to show.
+        require_code_scanning:
+          - tool: CodeQL
+            alerts_threshold: errors
+            security_alerts_threshold: high_or_higher
 
   # --- GHA-bench: migrated from classic branch protection to a ruleset (the
   #     fleet standard). Now managed like the other public repos. ---
@@ -636,6 +650,17 @@ repos:
   # already applied here; only this file's grouping was stale.
   - name: Adam-S-Daniel/rss-inator
     manage: ["all"]
+  # claude-plan-usage-estimator: public, created 2026-11-20 for the usage
+  # weight tables, estimate function and measurement kit
+  # (https://github.com/Adam-S-Daniel/claude-plan-usage-estimator).
+  # `test` (ci.yml) runs on every pull request with no on.paths, no matrix,
+  # name or concurrency group; agent-checks comes from the fleet sync. Action
+  # pins stay in the legacy SHA form so the sync keeps delivering agent-checks.
+  - name: Adam-S-Daniel/claude-plan-usage-estimator
+    manage: ["all"]
+    overrides:
+      ruleset:
+        required_status_checks: [test, agent-checks]
 
   # --- private: only SHA pinning applies. fork-PR approval (422), rulesets
   #     (403, needs Pro) and allow_auto_merge are all auto-skipped by the engine

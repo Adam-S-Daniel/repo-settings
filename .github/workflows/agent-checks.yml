@@ -25,7 +25,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Verify action lockfile
-        uses: Adam-S-Daniel/verify-actions-lock@v1.1.0
+        uses: Adam-S-Daniel/verify-actions-lock@v1.2.0
       - name: Run the commit-time checks over this change
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}

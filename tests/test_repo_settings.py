@@ -686,8 +686,9 @@ class RequiredStatusChecksFleetConfigTests(unittest.TestCase):
         "Adam-S-Daniel/wsl-automation": ["shell", "test", "test-linux", "agent-checks"],
         "Adam-S-Daniel/repo-settings": ["agent-checks", "unit"],
         "Adam-S-Daniel/verify-actions-lock": ["test", "self-verify", "agent-checks"],
-        "Adam-S-Daniel/acsi-kit": ["test", "agent-checks"],
+        "Adam-S-Daniel/acsi-kit": ["test", "agent-checks", "starter-suites"],
         "Adam-S-Daniel/security-alerts": ["agent-checks", "unit"],
+        "Adam-S-Daniel/claude-plan-usage-estimator": ["test", "agent-checks"],
     }
     PRE_EXISTING = {
         "Adam-S-Daniel/agentskills": ["pytest-windows"],
@@ -1512,7 +1513,7 @@ class AdminBypassFleetConfigTests(unittest.TestCase):
                     {k: v for k, v in none.items() if k != "bypass_actors"},
                 )
             checked += 1
-        self.assertEqual(checked, 23)
+        self.assertEqual(checked, 24)
 
 
 class BypassUnknownTests(unittest.TestCase):
@@ -2491,8 +2492,10 @@ class ChangesReportTests(unittest.TestCase):
                 self.assertEqual(rs.cmd_diff(args), 1)
             with open(out) as fh:
                 written = json.load(fh)
-        self.assertEqual(written, [{"repo": "o/r", "setting": "a", "status": "drift",
-                                    "current": 1, "desired": 2, "note": None}])
+        self.assertEqual(written, [{
+            "repo": "o/r", "setting": "a", "status": "drift", "current": 1,
+            "desired": 2, "note": None, "risk": "gated",
+            "risk_reason": "not a planned write this classifier can read"}])
 
 
 class WorkflowPermissionsTests(unittest.TestCase):
@@ -4071,7 +4074,7 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
         self.assertEqual(set(by_value), {("all",), (), ("labels",)})
         self.assertEqual(by_value[()], self.WERE_FALSE)
         self.assertEqual(by_value[("labels",)], self.LABELS_ONLY)
-        self.assertEqual(len(by_value[("all",)]), 20)
+        self.assertEqual(len(by_value[("all",)]), 21)
 
     def test_diff_output_is_unchanged_apart_from_the_scope_strings(self):
         cfg = rs.load_config(str(self.FLEET))
@@ -4246,6 +4249,67 @@ class CmsLabelOnlyTests(unittest.TestCase):
                 self.assertIn("label-only step", out)
 
 
+class RequireCodeScanningTests(unittest.TestCase):
+    TOOL = {"tool": "CodeQL", "alerts_threshold": "errors",
+            "security_alerts_threshold": "high_or_higher"}
+    CFG = {"enabled": True, "name": "n", "admin_bypass": "always",
+           "require_code_scanning": [TOOL]}
+
+    def _rule(self, body):
+        return next((r for r in body["rules"] if r["type"] == "code_scanning"), None)
+
+    def test_builds_the_rest_rule(self):
+        self.assertEqual(self._rule(rs.build_ruleset_body(self.CFG)),
+                         {"type": "code_scanning", "parameters": {"code_scanning_tools": [self.TOOL]}})
+
+    def test_omitted_is_no_rule(self):
+        cfg = {k: v for k, v in self.CFG.items() if k != "require_code_scanning"}
+        self.assertIsNone(self._rule(rs.build_ruleset_body(cfg)))
+
+    def test_bad_values_are_config_errors(self):
+        for bad in (
+            [], "CodeQL", [{"tool": "CodeQL"}], [dict(self.TOOL, alerts_threshold="high")],
+            [dict(self.TOOL, security_alerts_threshold="errors")], [dict(self.TOOL, extra=1)],
+            [dict(self.TOOL, tool="")], [self.TOOL, self.TOOL],
+        ):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                rs.build_ruleset_body(dict(self.CFG, require_code_scanning=bad))
+
+    def test_normalize_compares_the_tools_in_any_order(self):
+        other = dict(self.TOOL, tool="Other")
+        a = rs.build_ruleset_body(dict(self.CFG, require_code_scanning=[self.TOOL, other]))
+        b = rs.build_ruleset_body(dict(self.CFG, require_code_scanning=[other, self.TOOL]))
+        self.assertEqual(rs.normalize_ruleset(a), rs.normalize_ruleset(b))
+        self.assertNotEqual(rs.normalize_ruleset(a),
+                            rs.normalize_ruleset(rs.build_ruleset_body(self.CFG)))
+
+    def test_generate_round_trips(self):
+        body = rs.build_ruleset_body(self.CFG)
+        again = rs.build_ruleset_body(rs.ruleset_doc(body))
+        self.assertEqual(rs.normalize_ruleset(again), rs.normalize_ruleset(body))
+
+    def _plan(self, private):
+        with patch.object(rs, "get_repo", return_value={"private": private}), \
+             patch.object(rs, "find_ruleset", return_value=None), \
+             patch.object(rs, "list_rulesets", return_value=[]):
+            return rs.plan_repo("o/r", {"ruleset": dict(self.CFG)})
+
+    def test_public_repo_declares_the_rule(self):
+        records = self._plan(private=False)
+        self.assertEqual([r["setting"] for r in records], ["ruleset[n]"])
+        self.assertIsNotNone(self._rule(records[0]["_writer"][1]))
+
+    def test_private_repo_skips_and_drops_the_rule(self):
+        records = self._plan(private=True)
+        by = {r["setting"]: r for r in records}
+        self.assertEqual(by["ruleset.require_code_scanning"]["status"], "skipped")
+        self.assertIn("private", by["ruleset.require_code_scanning"]["note"])
+        self.assertIsNone(self._rule(by["ruleset[n]"]["_writer"][1]))
+
+    def test_surface_key_is_accepted(self):
+        self.assertIn("require_code_scanning", rs.SURFACE_KEYS["ruleset"])
+
+
 class CodeqlDefaultSetupTests(unittest.TestCase):
     """`security.codeql_default_setup` / `codeql_query_suite`: read from
     code-scanning/default-setup, written as one PATCH, skipped on private
@@ -4253,12 +4317,27 @@ class CodeqlDefaultSetupTests(unittest.TestCase):
 
     CFG = {"codeql_default_setup": True}
 
-    def _plan(self, cfg, private=False, live=None, read_error=None):
+    def _plan(self, cfg, private=False, live=None, read_error=None,
+              analyses=None, workflows=None, languages=None):
         def api(path, **kw):
+            if path.endswith("/languages"):
+                if isinstance(languages, Exception):
+                    raise languages
+                return languages or {}
             if path.endswith("/code-scanning/default-setup"):
                 if read_error:
                     raise read_error
                 return live
+            if "/code-scanning/analyses" in path:
+                if isinstance(analyses, Exception):
+                    raise analyses
+                if analyses is None:
+                    raise rs.GhError(404, "no analysis found")
+                return analyses
+            if "/actions/workflows" in path:
+                if isinstance(workflows, Exception):
+                    raise workflows
+                return {"workflows": workflows or []}
             raise AssertionError(f"unexpected call {path}")
         with patch.object(rs, "get_repo", return_value={"private": private}), \
              patch.object(rs, "gh_api", side_effect=api):
@@ -4270,6 +4349,74 @@ class CodeqlDefaultSetupTests(unittest.TestCase):
         r = records[0]
         self.assertEqual((r["setting"], r["status"], r["current"]), ("security.codeql_default_setup", "drift", False))
         self.assertEqual(r["_writer"], ("codeql", None, self.CFG))
+
+    def test_turning_on_records_no_existing_codeql(self):
+        records = self._plan(self.CFG, live={"state": "not-configured", "query_suite": "default"})
+        self.assertEqual(records[0]["codeql_existing"], [])
+
+    def test_turning_on_finds_an_advanced_setup_analysis(self):
+        analyses = [{"analysis_key": "dynamic/github-code-scanning/codeql:analyze"},
+                    {"analysis_key": ".github/workflows/codeql.yml:analyze"}]
+        records = self._plan(self.CFG, live={"state": "not-configured", "query_suite": "default"},
+                             analyses=analyses)
+        self.assertEqual(records[0]["codeql_existing"], [".github/workflows/codeql.yml:analyze"])
+
+    def test_without_code_scanning_read_it_falls_back_to_workflow_names(self):
+        flows = [{"path": ".github/workflows/codeql-analysis.yml", "name": "CodeQL", "state": "active"},
+                 {"path": ".github/workflows/tests.yml", "name": "tests", "state": "active"},
+                 {"path": "dynamic/github-code-scanning/codeql", "name": "CodeQL", "state": "active"}]
+        records = self._plan(self.CFG, live={"state": "not-configured", "query_suite": "default"},
+                             analyses=rs.GhError(403, "Resource not accessible by integration"),
+                             workflows=flows)
+        self.assertEqual(records[0]["codeql_existing"], [".github/workflows/codeql-analysis.yml"])
+
+    def test_nothing_readable_records_unknown(self):
+        records = self._plan(self.CFG, live={"state": "not-configured", "query_suite": "default"},
+                             analyses=rs.GhError(403, "no"), workflows=rs.GhError(403, "no"))
+        self.assertIsNone(records[0]["codeql_existing"])
+
+    def test_already_on_does_not_look(self):
+        records = self._plan(self.CFG, live={"state": "configured", "query_suite": "default"},
+                             analyses=AssertionError("looked"))
+        self.assertEqual(records[0]["codeql_existing"], [])
+
+    def test_language_gap_is_report_only(self):
+        live = {"state": "configured", "query_suite": "default", "languages": ["actions", "python"]}
+        records = self._plan(self.CFG, live=live,
+                             languages={"Python": 9000, "JavaScript": 1000, "Shell": 5000, "Go": 10})
+        gap = [r for r in records if r["setting"] == "security.codeql_languages"]
+        self.assertEqual(len(gap), 1)
+        self.assertEqual(gap[0]["status"], "advisory")
+        # Go is under 1% of the bytes, so it is not expected.
+        self.assertTrue(gap[0]["note"].startswith(
+            "default setup does not scan javascript-typescript, which"), gap[0]["note"])
+        self.assertNotIn("_writer", gap[0])
+
+    def test_no_language_gap_no_record(self):
+        live = {"state": "configured", "query_suite": "default",
+                "languages": ["actions", "javascript", "python"]}
+        records = self._plan(self.CFG, live=live, languages={"Python": 10, "TypeScript": 10})
+        self.assertEqual([r["setting"] for r in records], ["security.codeql_default_setup"])
+
+    def test_language_gap_helper(self):
+        self.assertEqual(rs.codeql_language_gaps({"Python": 98, "Rust": 2, "C#": 0.5}, ["python"]),
+                         ["rust"])
+        self.assertEqual(rs.codeql_language_gaps({}, []), [])
+        self.assertEqual(rs.codeql_language_gaps({"Kotlin": 5, "Java": 5}, ["java-kotlin"]), [])
+
+    def test_unreadable_languages_is_a_skip(self):
+        live = {"state": "configured", "query_suite": "default", "languages": ["python"]}
+        records = self._plan(self.CFG, live=live, languages=rs.GhError(403, "no"))
+        self.assertEqual([r["status"] for r in records], ["match", "skipped"])
+
+    def test_advisory_is_reported_but_not_a_change(self):
+        adv = {"repo": "o/r", "setting": "security.codeql_languages", "status": "advisory",
+               "current": ["python"], "desired": None, "note": "default setup does not scan rust"}
+        md = rs.changes_markdown([adv])
+        self.assertIn("No changes planned", md)
+        self.assertIn("To check (report only)", md)
+        self.assertIn("rust", md)
+        self.assertEqual(rs.changes_annotations([adv], None), [])
 
     def test_match_when_configured(self):
         records = self._plan(self.CFG, live={"state": "configured", "query_suite": "default"})

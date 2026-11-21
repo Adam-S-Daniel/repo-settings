@@ -142,6 +142,25 @@ ruleset:
   # (recommended unless you have stable, always-present check names).
   required_status_checks: []
 
+  # "Require code scanning results" (REST rule type `code_scanning`). Omit =
+  # rule not declared. A non-empty list of tools; each takes both thresholds:
+  #   alerts_threshold:          none | errors | errors_and_warnings | all
+  #   security_alerts_threshold: none | critical | high_or_higher |
+  #                              medium_or_higher | all
+  # (each list runs loosest to strictest). A bad value is a config error.
+  # The rule blocks a merge while the tool is "not configured for the
+  # repository" and while its analysis is still running, so it is only safe
+  # where CodeQL default setup is on. On a PRIVATE repo (no default setup
+  # there) the engine drops the rule from the desired ruleset and reports a
+  # `skipped` record instead. Adding the rule or a tool, or making a
+  # threshold stricter, applies unattended; removing the rule or a tool, or
+  # loosening a threshold, waits for review. A live rule that config omits
+  # reads as drift, as for any other undeclared rule.
+  require_code_scanning:
+    - tool: CodeQL
+      alerts_threshold: errors
+      security_alerts_threshold: high_or_higher
+
   # The repository Admin role's bypass. REQUIRED wherever the ruleset is
   # enabled, after `defaults:` and a repo's `overrides:` are merged: the key
   # grants access, so the engine has no default for it and refuses a ruleset
@@ -411,6 +430,20 @@ repo both keys are a `skipped` record (CodeQL there needs GitHub Code
 Security); a 403/404 on the read is a skip too, never drift.
 `codeql_query_suite` is ignored when `codeql_default_setup` is `false`, and
 any value other than `default` or `extended` is a config error.
+Before turning default setup on, the plan looks for CodeQL already running
+another way (an analysis whose `analysis_key` is not under `dynamic/`; with no
+code scanning read, an active workflow with `codeql` in its path or name),
+because default setup disables that workflow and refuses its uploads. A find,
+or a check it could not make, makes the write wait for review, even on a repo
+being set up.
+On a repo where default setup is on, the plan also compares its `languages`
+with `GET repos/{repo}/languages`: a CodeQL language with at least 1% of the
+repo's bytes that default setup does not scan is a report-only
+`security.codeql_languages` record (status `advisory`, shown under "To check"
+in the plan summary). It never writes, since `languages` is never sent.
+How this compares with GitHub's
+code scanning docs, and what is worth changing:
+[`docs/code-scanning.md`](../docs/code-scanning.md).
 
 **Endpoints, and the PUT/DELETE-carries-the-value shape.** Both applyable
 leaves are read and written through a pair of GitHub endpoints that take

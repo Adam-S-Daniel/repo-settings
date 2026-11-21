@@ -510,7 +510,75 @@ def read_codeql_default_setup(repo: str) -> dict | None:
     return {
         "configured": data["state"] == "configured",
         "query_suite": data.get("query_suite"),
+        "languages": [l for l in data.get("languages") or [] if isinstance(l, str)],
     }
+
+
+# GitHub's linguist names -> the CodeQL language default setup scans them as.
+LINGUIST_TO_CODEQL = {
+    "Python": "python", "JavaScript": "javascript-typescript",
+    "TypeScript": "javascript-typescript", "Ruby": "ruby", "Go": "go",
+    "Java": "java-kotlin", "Kotlin": "java-kotlin", "C#": "csharp",
+    "C": "c-cpp", "C++": "c-cpp", "Swift": "swift", "Rust": "rust",
+}
+# A language under this share of the repo's bytes is not expected to be
+# scanned: fixtures and vendored snippets would otherwise read as gaps.
+CODEQL_LANGUAGE_MIN_SHARE = 0.01
+
+
+def codeql_language_gaps(repo_languages: dict, scanned: list[str]) -> list[str]:
+    """CodeQL languages the repo's code needs (at least 1% of its bytes, per
+    GET repos/{repo}/languages) that default setup does not scan. Default
+    setup reports JavaScript/TypeScript as `javascript`, `typescript` and
+    `javascript-typescript`; any one of them counts."""
+    total = sum(v for v in repo_languages.values() if isinstance(v, (int, float)))
+    if total <= 0:
+        return []
+    have = set(scanned)
+    if have & {"javascript", "typescript"}:
+        have.add("javascript-typescript")
+    want = {LINGUIST_TO_CODEQL[name] for name, size in repo_languages.items()
+            if name in LINGUIST_TO_CODEQL and isinstance(size, (int, float))
+            and size / total >= CODEQL_LANGUAGE_MIN_SHARE}
+    return sorted(want - have)
+
+
+def find_existing_codeql(repo: str) -> list[str] | None:
+    """What already runs CodeQL on the repo outside default setup, or None
+    when nothing could be read. Turning default setup on disables such a
+    workflow and refuses its uploads, so a non-empty answer gates the write.
+
+    The analyses list is the authority: default setup's analyses carry an
+    `analysis_key` under `dynamic/`, anything else is an advanced-setup
+    workflow or an upload from other CI. A token without code scanning read
+    falls back to the Actions workflow list (actions read), where only a
+    workflow with `codeql` in its path or name can be told apart."""
+    try:
+        data = gh_api(f"repos/{repo}/code-scanning/analyses?tool_name=CodeQL&per_page=100")
+    except GhError as e:
+        if e.status == 404 and "no analysis found" in str(e.message).lower():
+            return []
+        if e.status not in (403, 404):
+            raise
+    else:
+        if not isinstance(data, list):
+            return None
+        return sorted({a["analysis_key"] for a in data
+                       if isinstance(a, dict) and isinstance(a.get("analysis_key"), str)
+                       and not a["analysis_key"].startswith("dynamic/")})
+    try:
+        data = gh_api(f"repos/{repo}/actions/workflows?per_page=100")
+    except GhError as e:
+        if e.status in (403, 404):
+            return None
+        raise
+    flows = data.get("workflows") if isinstance(data, dict) else None
+    if not isinstance(flows, list):
+        return None
+    return sorted({w["path"] for w in flows
+                   if isinstance(w, dict) and isinstance(w.get("path"), str)
+                   and not w["path"].startswith("dynamic/") and w.get("state") == "active"
+                   and "codeql" in (w["path"] + " " + str(w.get("name", ""))).lower()})
 
 
 def write_codeql_default_setup(repo: str, desired: dict) -> None:
@@ -622,6 +690,47 @@ def admin_bypass_mode(cfg: dict) -> str | None:
     return ADMIN_BYPASS_MODES[value]
 
 
+# `code_scanning` rule thresholds, loosest to strictest. The order is the
+# classifier's definition of "stricter" (write_risk), so keep it that way.
+CODE_SCANNING_ALERTS = ("none", "errors", "errors_and_warnings", "all")
+CODE_SCANNING_SECURITY_ALERTS = ("none", "critical", "high_or_higher", "medium_or_higher", "all")
+CODE_SCANNING_TOOL_KEYS = ("tool", "alerts_threshold", "security_alerts_threshold")
+
+
+def build_code_scanning_tools(value: Any) -> list[dict]:
+    """Validate `ruleset.require_code_scanning` and return the REST
+    `code_scanning_tools` list (each tool with exactly the three keys)."""
+    where = "ruleset.require_code_scanning"
+    if not isinstance(value, list) or not value:
+        raise SystemExit(f"error: {where} must be a non-empty list of "
+                         f"{{tool, alerts_threshold, security_alerts_threshold}} mappings")
+    tools: list[dict] = []
+    seen: set[str] = set()
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise SystemExit(f"error: {where} entries must be mappings (got {entry!r})")
+        bad = [k for k in entry if k not in CODE_SCANNING_TOOL_KEYS]
+        if bad:
+            raise SystemExit(f"error: {where} entry has unknown key(s) "
+                             f"{', '.join(map(repr, bad))} (allowed: {', '.join(CODE_SCANNING_TOOL_KEYS)})")
+        tool = entry.get("tool")
+        if not isinstance(tool, str) or not tool.strip():
+            raise SystemExit(f"error: {where} entry needs a non-empty `tool`")
+        if tool in seen:
+            raise SystemExit(f"error: {where} lists tool {tool!r} twice")
+        seen.add(tool)
+        for key, accepted in (("alerts_threshold", CODE_SCANNING_ALERTS),
+                              ("security_alerts_threshold", CODE_SCANNING_SECURITY_ALERTS)):
+            v = entry.get(key)
+            if not isinstance(v, str) or v not in accepted:
+                raise SystemExit(f"error: {where}[{tool}].{key} must be one of "
+                                 f"{', '.join(accepted)} (got {v!r})")
+        tools.append({"tool": tool,
+                      "alerts_threshold": entry["alerts_threshold"],
+                      "security_alerts_threshold": entry["security_alerts_threshold"]})
+    return tools
+
+
 def build_ruleset_body(cfg: dict) -> dict:
     """Build the POST/PUT body for a desired ruleset from config."""
     name = cfg.get("name", DEFAULT_RULESET_NAME)
@@ -698,6 +807,17 @@ def build_ruleset_body(cfg: dict) -> dict:
                     "required_status_checks": [
                         {"context": c} for c in checks
                     ],
+                },
+            }
+        )
+    if cfg.get("require_code_scanning") is not None:
+        rules.append(
+            {
+                "type": "code_scanning",
+                "parameters": {
+                    "code_scanning_tools": build_code_scanning_tools(
+                        cfg["require_code_scanning"]
+                    )
                 },
             }
         )
@@ -863,6 +983,13 @@ def normalize_ruleset(rs: dict | None) -> dict | None:
             "required_status_checks", []
         )
     )
+    code_scanning = sorted(
+        (
+            {k: t.get(k) for k in CODE_SCANNING_TOOL_KEYS}
+            for t in rules_by_type.get("code_scanning", {}).get("code_scanning_tools", [])
+        ),
+        key=lambda t: str(t["tool"]),
+    )
     include = sorted(
         rs.get("conditions", {}).get("ref_name", {}).get("include", [])
     )
@@ -891,6 +1018,7 @@ def normalize_ruleset(rs: dict | None) -> dict | None:
         # unordered compare would report drift on a reshuffle.
         "merge_methods": sorted(pr.get("allowed_merge_methods") or []),
         "checks": checks,
+        "code_scanning": code_scanning,
         "bypass": bypass,
     }
 
@@ -930,6 +1058,8 @@ def ruleset_doc(branch_rs: dict) -> dict:
         "block_force_pushes": "non_fast_forward" in norm["rule_types"],
         "block_deletions": "deletion" in norm["rule_types"],
         "required_status_checks": norm["checks"],
+        **({"require_code_scanning": norm["code_scanning"]}
+           if "code_scanning" in norm["rule_types"] else {}),
         # The admin role's live bypass_mode, or "none". A mode outside
         # ADMIN_BYPASS_MODES (GitHub's `exempt`) is emitted as read, so the
         # generated config fails validation rather than silently changing it.
@@ -1333,6 +1463,7 @@ SURFACE_KEYS = {
         "block_force_pushes",
         "block_deletions",
         "required_status_checks",
+        "require_code_scanning",
         "admin_bypass",
         "bypass_actors",
     ),
@@ -1671,6 +1802,8 @@ def resolve_targets(cfg: dict, repo_arg: str | None) -> list[dict]:
                 "manage": manage,
                 "declared": declared,
                 "effective": effective_settings(declared, manage),
+                "defaults": defaults,
+                "overrides": overrides,
             }
             check_cms_label_only(target)
             targets.append(target)
@@ -2016,6 +2149,14 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
             else:
                 current = {"codeql_default_setup": live["configured"],
                            "codeql_query_suite": live["query_suite"] if live["configured"] else None}
+                turns_on = (not live["configured"]
+                            and cq_wanted.get("codeql_default_setup", True) is True)
+                existing: list[str] | None = []
+                if turns_on:
+                    try:
+                        existing = find_existing_codeql(repo)
+                    except GhError:
+                        existing = None
                 for key, desired_v in cq_wanted.items():
                     if key == "codeql_query_suite" and cq_wanted.get("codeql_default_setup") is False:
                         continue  # a suite means nothing with default setup off
@@ -2027,7 +2168,31 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
                         # Every record carries the WHOLE declared group: see
                         # write_codeql_default_setup for why it is one PATCH.
                         "_writer": ("codeql", None, cq_wanted),
+                        # What default setup would replace: see _codeql_risk.
+                        "codeql_existing": existing,
                     })
+                if live["configured"]:
+                    # Report only: the engine never sends `languages`, so a gap
+                    # is GitHub's to fix (it drops a language whose first
+                    # analysis fails and does not retry).
+                    try:
+                        gaps = codeql_language_gaps(gh_api(f"repos/{repo}/languages") or {},
+                                                    live["languages"])
+                    except GhError as e:
+                        records.append(_skip("security.codeql_languages", None,
+                                             f"cannot read repos/{repo}/languages -- {e.message}"))
+                    else:
+                        if gaps:
+                            records.append({
+                                "setting": "security.codeql_languages",
+                                "status": "advisory",
+                                "current": sorted(live["languages"]),
+                                "desired": None,
+                                "note": (f"default setup does not scan {', '.join(gaps)}, which "
+                                         "the repo's code needs. Read Security > Code scanning > "
+                                         "Tool status for why; turning default setup off and on "
+                                         "again re-detects the languages."),
+                            })
 
     # -- ruleset ------------------------------------------------------------ #
     def plan_ruleset(name: str, body: dict, normalize) -> None:
@@ -2056,6 +2221,13 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
                 "current": current,
                 "desired": desired,
                 "_writer": ("ruleset", body, existing_id),
+                # The live body as GitHub returned it, for write_risk: the PUT
+                # replaces the whole ruleset, fields `normalize` drops included.
+                "_live": existing,
+                # The repo has no ruleset at all yet: the first sign it is
+                # being set up (classify_records). A renamed or extra ruleset
+                # on a repo that already has one never counts.
+                "_first_ruleset": existing is None and not list_rulesets(repo),
             }
             if unknown:
                 rec["note"] = BYPASS_UNKNOWN_NOTE
@@ -2071,7 +2243,29 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
 
     if ruleset_cfg.get("enabled"):
         name = ruleset_cfg.get("name", DEFAULT_RULESET_NAME)
-        plan_ruleset(name, build_ruleset_body(ruleset_cfg), normalize_ruleset)
+        body_cfg = ruleset_cfg
+        if ruleset_cfg.get("require_code_scanning") is not None:
+            build_code_scanning_tools(ruleset_cfg["require_code_scanning"])  # validate first
+            # The rule blocks every merge while its tool is "not configured for
+            # the repository", and CodeQL default setup is not offered on a
+            # private repo (see the codeql_default_setup skip), so the rule
+            # would deadlock merges there. Drop it from the desired body.
+            try:
+                private = is_private()
+            except GhError as e:
+                records.append(_err("ruleset.require_code_scanning",
+                                    ruleset_cfg["require_code_scanning"], e))
+                private = True
+            else:
+                if private:
+                    records.append(_skip(
+                        "ruleset.require_code_scanning",
+                        ruleset_cfg["require_code_scanning"],
+                        "private repo -- CodeQL is not configured there, and the rule "
+                        "blocks merges while its tool is not configured"))
+            if private:
+                body_cfg = {k: v for k, v in ruleset_cfg.items() if k != "require_code_scanning"}
+        plan_ruleset(name, build_ruleset_body(body_cfg), normalize_ruleset)
     elif "admin_bypass" in ruleset_cfg:
         # Not required while disabled, but a value that is given is checked.
         admin_bypass_mode(ruleset_cfg)
@@ -2503,6 +2697,522 @@ def apply_record(repo: str, rec: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Write risk: which planned writes may be applied with no reviewer
+# --------------------------------------------------------------------------- #
+# The apply used to wait for the owner's approval every time. Almost every plan
+# he approved only added protection (docs/decisions/0019), and a gate that is
+# clicked for every plan stops being read. So `apply --refuse-weakening`
+# applies a write only when this section can show it cannot leave a repo with
+# FEWER constraints than it has now, and leaves the rest for the reviewed apply.
+#
+# Two properties hold it up, the same two as cms-platform's
+# scripts/repo-settings-write-risk.js, which this follows:
+#
+#   1. It is an allowlist. A writer, setting, rule type, parameter or value
+#      that is not named below is GATED, including one GitHub adds later. A
+#      false GATED costs one approval; a false SAFE is an unreviewed admin
+#      write that weakened a repo.
+#   2. It is enforced where the write happens. The workflow routes on the
+#      verdict, but the unreviewed job also passes --refuse-weakening, so a
+#      wrong `if:` in the workflow can produce a red job and never a
+#      weakening write.
+#
+# It says nothing about whether a setting is good, only about direction.
+# Removing a required check can reduce protection; adding one cannot.
+SAFE, GATED = "safe", "gated"
+
+# Fork-PR approval, least to most restrictive.
+FORK_APPROVAL_RANK = (
+    "first_time_contributors_new_to_github",
+    "first_time_contributors",
+    "all_external_contributors",
+)
+
+# For the writers that send a whole declared group in one call: the value of
+# each key that cannot reduce protection. A key set to anything else is safe
+# only when the same plan read it as already matching, so the call leaves it
+# as it is.
+SAFE_GROUP_VALUES: dict[str, dict[str, Any]] = {
+    "workflow_permissions": {
+        "default_workflow_permissions": "read",
+        "can_approve_pull_request_reviews": False,
+    },
+    "merge_methods": {key: False for key in MERGE_METHOD_KEYS},
+    "secret_scanning": {key: True for key in SECRET_SCANNING_KEYS},
+}
+GROUP_SETTING_PREFIX = {
+    "workflow_permissions": "actions.",
+    "merge_methods": "repo.",
+    "secret_scanning": "security.",
+}
+
+# Top-level keys of a live ruleset that a PUT neither sends nor changes.
+RULESET_READ_ONLY_KEYS = frozenset({
+    "id", "node_id", "source", "source_type", "created_at", "updated_at",
+    "_links", "current_user_can_bypass",
+})
+# Rule types with no parameters to compare.
+PARAMETERLESS_RULES = frozenset({"creation", "deletion", "non_fast_forward"})
+# `pull_request` parameters where True is the stricter value.
+PR_STRICTER_WHEN_TRUE = frozenset({
+    "dismiss_stale_reviews_on_push",
+    "require_code_owner_review",
+    "require_last_push_approval",
+    "required_review_thread_resolution",
+    "require_extra_approval_for_unattributed_changes",
+})
+# Parameters GitHub returns that the engine's body never sends, with the only
+# live values a PUT without them is known not to relax.
+OMITTED_PARAM_OK: dict[str, dict[str, tuple]] = {
+    "pull_request": {
+        "required_reviewers": ([],),
+        # Organization-owned repos return this. Disabled with no actors is
+        # its least strict value, so a PUT without it cannot relax it.
+        "dismissal_restriction": ({"enabled": False, "allowed_actors": []},),
+    },
+    # Off is the stricter value, so whichever of the two is live, a PUT that
+    # omits it cannot relax it.
+    "required_status_checks": {"do_not_enforce_on_create": (False, True)},
+}
+
+
+def _gated(reason: str) -> tuple[str, str]:
+    return GATED, reason
+
+
+def _safe(reason: str) -> tuple[str, str]:
+    return SAFE, reason
+
+
+def _group_risk(kind: str, wanted: Any, statuses: dict[str, str]) -> tuple[str, str]:
+    safe_values = SAFE_GROUP_VALUES[kind]
+    if not isinstance(wanted, dict) or not wanted:
+        return _gated(f"{kind}: the write carries no readable group of keys")
+    for key, value in wanted.items():
+        if key not in safe_values:
+            return _gated(f"{key} is not on the non-weakening list")
+        if type(value) is type(safe_values[key]) and value == safe_values[key]:
+            continue
+        if statuses.get(GROUP_SETTING_PREFIX[kind] + key) == "match":
+            continue  # already this value: the call does not change it
+        return _gated(f"{key} -> {_json(value)} can relax the repo")
+    return _safe(f"{kind}: every key written is unchanged or stricter")
+
+
+def _codeql_risk(wanted: Any, statuses: dict[str, str],
+                 records: list[dict]) -> tuple[str, str]:
+    if not isinstance(wanted, dict):
+        return _gated("codeql: the write carries no readable group of keys")
+    if set(wanted) - {"codeql_default_setup", "codeql_query_suite"}:
+        return _gated("codeql: the write carries a key this classifier does not know")
+    if wanted.get("codeql_default_setup", True) is not True:
+        return _gated("CodeQL default setup -> off")
+    # Turning default setup ON is not on the list. A repo that runs CodeQL
+    # from its own workflow reads as "not configured" here, and GitHub stops
+    # accepting that workflow's results once default setup is on, so the
+    # write can swap a broader analysis for a narrower one unseen.
+    suite_rec = next(
+        (r for r in records if r.get("setting") == "security.codeql_query_suite"), None)
+    live_on = (statuses.get("security.codeql_default_setup") == "match"
+               or (suite_rec is not None and suite_rec.get("status") in ("match", "drift")
+                   and isinstance(suite_rec.get("current"), str)))
+    if not live_on:
+        # Turning it on enables a security feature, so it does not wait
+        # (owner's rule, 2026-11-20) -- unless the repo already runs CodeQL
+        # another way. Such a repo reads as "not configured", and GitHub
+        # disables that workflow and refuses its uploads once default setup
+        # is on, which can swap a broader analysis for a narrower one unseen.
+        existing = next((r["codeql_existing"] for r in records
+                         if r.get("setting", "").startswith("security.codeql_")
+                         and "codeql_existing" in r), None)
+        if existing is None:
+            return _gated("CodeQL default setup -> on, but the plan could not check "
+                          "for a CodeQL workflow it would replace")
+        if existing:
+            return _gated("CodeQL default setup -> on would disable the repo's own CodeQL "
+                          f"analysis ({', '.join(existing)})")
+        return _safe("CodeQL default setup -> on (enables a security feature; "
+                     "no CodeQL workflow to replace)")
+    suite = wanted.get("codeql_query_suite")
+    if suite is not None and suite != "extended" \
+            and statuses.get("security.codeql_query_suite") != "match":
+        return _gated(f"CodeQL query suite -> {_json(suite)} runs fewer queries")
+    return _safe("CodeQL default setup stays on; the query suite is unchanged or larger")
+
+
+def _rule_params(rule: dict) -> dict:
+    params = rule.get("parameters")
+    return dict(params) if isinstance(params, dict) else {}
+
+
+def _pull_request_param_risk(key: str, live: Any, desired: Any) -> str | None:
+    """None when desired cannot relax live for this parameter, else why not."""
+    if key == "required_approving_review_count":
+        ok = (type(live) is int and type(desired) is int and desired >= live)
+        return None if ok else f"{key} {_json(live)} -> {_json(desired)}"
+    if key in PR_STRICTER_WHEN_TRUE:
+        return None if desired is True else f"{key} -> {_json(desired)}"
+    if key == "allowed_merge_methods":
+        ok = (isinstance(live, list) and isinstance(desired, list) and desired
+              and all(isinstance(m, str) for m in live + desired)
+              and set(desired) <= set(live))
+        return None if ok else f"{key} {_json(live)} -> {_json(desired)} allows another method"
+    return f"`{key}` is not on the non-weakening list"
+
+
+def _status_checks_param_risk(key: str, live: Any, desired: Any) -> str | None:
+    if key == "strict_required_status_checks_policy":
+        return None if desired is True else f"{key} -> {_json(desired)}"
+    if key == "required_status_checks":
+        if not isinstance(live, list) or not isinstance(desired, list):
+            return f"{key} is not a list on both sides"
+        desired_contexts = set()
+        for entry in desired:
+            if not isinstance(entry, dict) or set(entry) != {"context"}:
+                return f"a desired check is not a bare context: {_json(entry)}"
+            desired_contexts.add(entry["context"])
+        for entry in live:
+            if not isinstance(entry, dict) or not set(entry) <= {"context", "integration_id"}:
+                return f"a live check has a shape this classifier does not know: {_json(entry)}"
+            if entry.get("integration_id") is not None:
+                return (f"live check {_json(entry.get('context'))} is pinned to an app, "
+                        "and the write would drop the pin")
+            if entry.get("context") not in desired_contexts:
+                return f"required check {_json(entry.get('context'))} removed"
+        return None
+    return f"`{key}` is not on the non-weakening list"
+
+
+def _code_scanning_param_risk(key: str, live: Any, desired: Any) -> str | None:
+    if key != "code_scanning_tools":
+        return f"`{key}` is not on the non-weakening list"
+    if not isinstance(live, list) or not isinstance(desired, list):
+        return f"{key} is not a list on both sides"
+    ranks = {"alerts_threshold": CODE_SCANNING_ALERTS,
+             "security_alerts_threshold": CODE_SCANNING_SECURITY_ALERTS}
+    wanted: dict[str, dict] = {}
+    for entry in desired:
+        if not isinstance(entry, dict) or not isinstance(entry.get("tool"), str):
+            return f"a desired tool has a shape this classifier does not know: {_json(entry)}"
+        wanted[entry["tool"]] = entry
+    for entry in live:
+        if not isinstance(entry, dict) or not isinstance(entry.get("tool"), str):
+            return f"a live tool has a shape this classifier does not know: {_json(entry)}"
+        tool = entry["tool"]
+        if set(entry) - {"tool", *ranks}:
+            return (f"live code scanning tool {_json(tool)} has a field this classifier "
+                    f"does not know: {_json(entry)}")
+        if tool not in wanted:
+            return f"code scanning tool {_json(tool)} removed"
+        new = wanted[tool]
+        for field, order in ranks.items():
+            old_v, new_v = entry.get(field), new.get(field)
+            if old_v not in order or new_v not in order:
+                return f"code scanning {_json(tool)}.{field} {_json(old_v)} -> {_json(new_v)}: a value this classifier cannot rank"
+            if order.index(new_v) < order.index(old_v):
+                return f"code scanning {_json(tool)}.{field} {_json(old_v)} -> {_json(new_v)} is looser"
+    for entry in desired:
+        if set(entry) - {"tool", *ranks}:
+            return f"a desired tool has a field this classifier does not know: {_json(entry)}"
+    return None
+
+
+def _rule_risk(rule_type: str, live_rule: dict, desired_rule: dict) -> str | None:
+    """None when replacing live_rule with desired_rule cannot relax it."""
+    if rule_type == "update":
+        same = _extra_rule_params(live_rule) == _extra_rule_params(desired_rule)
+        return None if same else "rule `update` parameters differ"
+    live, desired = _rule_params(live_rule), _rule_params(desired_rule)
+    if rule_type in PARAMETERLESS_RULES:
+        return None if not live and not desired else f"rule `{rule_type}` carries parameters"
+    if rule_type == "pull_request":
+        param_risk = _pull_request_param_risk
+    elif rule_type == "required_status_checks":
+        param_risk = _status_checks_param_risk
+    elif rule_type == "code_scanning":
+        param_risk = _code_scanning_param_risk
+    else:
+        return None if live == desired else (
+            f"rule `{rule_type}` differs, and this classifier does not know its direction")
+    omitted_ok = OMITTED_PARAM_OK.get(rule_type, {})
+    for key in sorted(set(live) | set(desired)):
+        if key not in desired:
+            if key in omitted_ok and any(
+                    type(live[key]) is type(v) and live[key] == v for v in omitted_ok[key]):
+                continue
+            return (f"live `{rule_type}.{key}` is {_json(live[key])} and the write "
+                    "does not send it")
+        if key not in live:
+            return f"`{rule_type}.{key}` is not in the live rule, so its direction is unknown"
+        if type(live[key]) is type(desired[key]) and live[key] == desired[key]:
+            continue
+        if (key == "allowed_merge_methods" and isinstance(live[key], list)
+                and isinstance(desired[key], list)
+                and sorted(map(str, live[key])) == sorted(map(str, desired[key]))):
+            continue  # the same methods in another order
+        why = param_risk(key, live[key], desired[key])
+        if why is not None:
+            return why
+    return None
+
+
+def _ruleset_put_risk(name: str, live: Any, desired: Any) -> tuple[str, str]:
+    """Risk of replacing the live ruleset body with `desired` (a PUT)."""
+    label = f"ruleset[{name}]"
+    if not isinstance(live, dict) or not isinstance(desired, dict):
+        return _gated(f"{label}: no live body to compare the write against")
+    unknown = set(live) - RULESET_READ_ONLY_KEYS - set(desired)
+    if unknown:
+        return _gated(f"{label}: the live ruleset has field(s) the write does not "
+                      f"send: {', '.join(sorted(unknown))}")
+    extra = set(desired) - {"name", "target", "enforcement", "conditions", "rules",
+                            "bypass_actors"}
+    if extra:
+        return _gated(f"{label}: the write sends field(s) this classifier does not "
+                      f"know: {', '.join(sorted(extra))}")
+    for key in ("name", "target"):
+        if live.get(key) != desired.get(key):
+            return _gated(f"{label}: `{key}` differs")
+    if live.get("enforcement") != desired.get("enforcement") and desired.get("enforcement") != "active":
+        return _gated(f"{label}: enforcement -> {_json(desired.get('enforcement'))}")
+
+    # Which refs the ruleset covers. Any change here can uncover a branch.
+    def refs(body: dict) -> tuple | None:
+        cond = body.get("conditions")
+        if not isinstance(cond, dict) or set(cond) != {"ref_name"}:
+            return None
+        ref = cond["ref_name"]
+        if not isinstance(ref, dict) or set(ref) != {"include", "exclude"}:
+            return None
+        if not all(isinstance(ref[k], list) and all(isinstance(x, str) for x in ref[k])
+                   for k in ("include", "exclude")):
+            return None
+        return sorted(ref["include"]), sorted(ref["exclude"])
+
+    live_refs, desired_refs = refs(live), refs(desired)
+    if live_refs is None or desired_refs is None or live_refs != desired_refs:
+        return _gated(f"{label}: `conditions` differ or have a shape this classifier "
+                      "does not know")
+
+    # Bypass actors. GitHub hides the list from a token that cannot edit the
+    # ruleset; an unseen list cannot be compared, so it gates.
+    def actors(body: dict) -> set | None:
+        listed = body.get("bypass_actors")
+        if not isinstance(listed, list):
+            return None
+        out = set()
+        for actor in listed:
+            if not isinstance(actor, dict) or set(actor) != {"actor_id", "actor_type", "bypass_mode"}:
+                return None
+            out.add((actor["actor_type"], actor["actor_id"], actor["bypass_mode"]))
+        return out
+
+    live_actors, desired_actors = actors(live), actors(desired)
+    if live_actors is None:
+        return _gated(f"{label}: live bypass actors are not visible or not readable, "
+                      "so the write cannot be compared")
+    if desired_actors is None:
+        return _gated(f"{label}: the write's bypass actors are not readable")
+    added = desired_actors - live_actors
+    if added:
+        shown = ", ".join(f"{t} {i} ({m})" for t, i, m in sorted(added, key=repr))
+        return _gated(f"{label}: bypass actor(s) added: {shown}")
+
+    # Rules, by type.
+    def by_type(body: dict) -> dict | None:
+        listed = body.get("rules")
+        if not isinstance(listed, list):
+            return None
+        out: dict[str, dict] = {}
+        for rule in listed:
+            if (not isinstance(rule, dict) or not isinstance(rule.get("type"), str)
+                    or rule["type"] in out or set(rule) - {"type", "parameters"}):
+                return None
+            out[rule["type"]] = rule
+        return out
+
+    live_rules, desired_rules = by_type(live), by_type(desired)
+    if live_rules is None or desired_rules is None:
+        return _gated(f"{label}: `rules` have a shape this classifier does not know")
+    removed = sorted(set(live_rules) - set(desired_rules))
+    if removed:
+        return _gated(f"{label}: rule(s) removed: {', '.join(removed)}")
+    for rule_type in sorted(set(live_rules) & set(desired_rules)):
+        why = _rule_risk(rule_type, live_rules[rule_type], desired_rules[rule_type])
+        if why is not None:
+            return _gated(f"{label}: {why}")
+    return _safe(f"{label}: no rule, check, ref or bypass actor is removed or relaxed")
+
+
+def write_risk(rec: dict, records: list[dict]) -> tuple[str, str]:
+    """(SAFE | GATED, reason) for one drift record of a repo's plan.
+
+    `records` is the whole plan for the same repo, as planned and before any
+    write: a group writer sends every declared key, so whether one of them is
+    safe can depend on what the plan read for its siblings."""
+    writer = rec.get("_writer")
+    if rec.get("status") != "drift" or not isinstance(writer, tuple) or len(writer) != 3:
+        return _gated("not a planned write this classifier can read")
+    if rec.get("bypass_unknown"):
+        return _gated("this token cannot see the ruleset's bypass actors; the "
+                      "apply decides with a token that can")
+    kind, a, b = writer
+    statuses = {r["setting"]: r["status"] for r in records if "setting" in r}
+    current, desired = rec.get("current"), rec.get("desired")
+
+    if kind == "sha":
+        # write_sha_pinning sends back `enabled` and `allowed_actions`; with
+        # either missing from the read it would send a default instead.
+        if b is not True:
+            return _gated("actions.sha_pinning_required -> false")
+        if not isinstance(a, dict) or "enabled" not in a or "allowed_actions" not in a:
+            return _gated("actions permissions were read without `enabled` or "
+                          "`allowed_actions`, which the write must send back")
+        return _safe("actions.sha_pinning_required -> true")
+    if kind == "fork":
+        if current not in FORK_APPROVAL_RANK or b not in FORK_APPROVAL_RANK:
+            return _gated(f"fork-PR approval {_json(current)} -> {_json(b)}: a value "
+                          "this classifier cannot rank")
+        if FORK_APPROVAL_RANK.index(b) < FORK_APPROVAL_RANK.index(current):
+            return _gated(f"fork-PR approval -> {b} asks for fewer approvals")
+        return _safe(f"fork-PR approval -> {b} (stricter)")
+    if kind in SAFE_GROUP_VALUES:
+        return _group_risk(kind, b, statuses)
+    if kind == "codeql":
+        return _codeql_risk(b, statuses, records)
+    if kind == "auto_merge":
+        # Auto-merge merges only once every rule and required check passes,
+        # so neither value loosens a rule or touches security.
+        if b is True or b is False:
+            return _safe(f"repo.allow_auto_merge -> {_json(b)} (merges only what "
+                         "the rules already allow)")
+        return _gated(f"repo.allow_auto_merge -> {_json(b)}: not a boolean")
+    if kind == "merge_commit_message":
+        # The merge commit's default text. It is not a rule and not a
+        # security feature, so no value of it loosens anything.
+        if isinstance(b, dict) and b and set(b) <= set(MERGE_COMMIT_MESSAGE_KEYS) \
+                and all(isinstance(v, str) for v in b.values()):
+            return _safe("repo.merge_commit_message: the default merge text")
+        return _gated("repo.merge_commit_message: a write this classifier cannot read")
+    if kind == "delete_branch_on_merge":
+        return _safe("repo.delete_branch_on_merge -> true") if b is True else \
+            _gated("repo.delete_branch_on_merge -> false")
+    if kind in ("vuln_alerts", "auto_sec_fixes"):
+        return _safe(f"{rec.get('setting')} -> on") if b is True else \
+            _gated(f"{rec.get('setting')} -> off")
+    if kind == "label":
+        # A label write creates the label or sets its color and description.
+        # It never deletes one or removes it from an issue or pull request.
+        # On an existing label it also sends the declared name, which renames
+        # one that differs only in case; a workflow that matches the old
+        # spelling exactly would stop matching, so that write waits.
+        if b is not False:
+            live_name = current.get("name") if isinstance(current, dict) else None
+            spec_name = a.get("name") if isinstance(a, dict) else None
+            if not isinstance(spec_name, str):
+                return _gated(f"{rec.get('setting')}: the write's label name is not readable")
+            if isinstance(current, dict) and not isinstance(live_name, str):
+                return _gated(f"{rec.get('setting')}: the live label was read without its name")
+            if live_name is not None and live_name != spec_name:
+                return _safe(f"{rec.get('setting')}: renames {_json(live_name)} to "
+                             f"{_json(spec_name)} (a label is not a rule)")
+        return _safe(f"{rec.get('setting')}: create, or set color and description")
+    if kind == "ruleset":
+        name = a.get("name") if isinstance(a, dict) else None
+        if b is None and rec.get("_live") is None and current is None:
+            # GitHub enforces the union of a repo's rulesets, and a bypass
+            # actor bypasses only the ruleset that names it, so a ruleset
+            # that does not exist yet cannot relax anything by existing.
+            return _safe(f"ruleset[{name}]: new ruleset (rulesets add up)")
+        return _ruleset_put_risk(str(name), rec.get("_live"), a)
+    # actions_policy (it allows events GitHub would block), merge_commit_message
+    # (no protective direction) and anything added later.
+    return _gated(f"writer `{kind}` is not on the non-weakening list")
+
+
+def fleet_standard(setting: Any, defaults: Any, overrides: Any) -> bool:
+    """True when a record's setting comes from `defaults:` alone: the defaults
+    declare it and the repo's `overrides:` do not touch it. Anything this
+    cannot map (an actions policy, an extra ruleset, an unknown name) is not
+    a fleet standard."""
+    if not isinstance(setting, str) or not isinstance(defaults, dict) \
+            or not isinstance(overrides, dict):
+        return False
+    if setting.startswith("ruleset[") and setting.endswith("]"):
+        ruleset = defaults.get("ruleset")
+        return (isinstance(ruleset, dict) and ruleset.get("name") == setting[8:-1]
+                and "ruleset" not in overrides)
+    if setting.startswith("label[") and setting.endswith("]"):
+        name = setting[6:-1].lower()
+
+        def names(block: Any) -> set:
+            return {str(x.get("name", "")).lower() for x in block or []
+                    if isinstance(x, dict)} if isinstance(block, list) else set()
+        return name in names(defaults.get("labels")) and name not in names(overrides.get("labels"))
+    group, dot, key = setting.partition(".")
+    if not dot or group not in ("repo", "actions", "security"):
+        return False
+    keys = MERGE_COMMIT_MESSAGE_KEYS if setting == "repo.merge_commit_message" else (key,)
+    d, o = defaults.get(group), overrides.get(group) or {}
+    return (isinstance(d, dict) and isinstance(o, dict)
+            and all(k in d and k not in o for k in keys))
+
+
+def _onboarding(records: list[dict], defaults: Any) -> bool:
+    """True when the plan creates the fleet's default ruleset on a repo that
+    has no ruleset at all yet: the repo is being set up. A new extra ruleset,
+    a renamed default, or a repo that already carries any ruleset is not."""
+    ruleset = defaults.get("ruleset") if isinstance(defaults, dict) else None
+    name = ruleset.get("name") if isinstance(ruleset, dict) else None
+    if not isinstance(name, str):
+        return False
+    for r in records:
+        writer = r.get("_writer")
+        if (r.get("status") == "drift" and r.get("setting") == f"ruleset[{name}]"
+                and isinstance(writer, tuple) and len(writer) == 3
+                and writer[0] == "ruleset" and writer[2] is None
+                and r.get("_live") is None and r.get("current") is None
+                and r.get("_first_ruleset") is True):
+            return True
+    return False
+
+
+def _whole_write_is_standard(rec: dict, defaults: Any, overrides: Any) -> bool:
+    """A group writer sends every declared key of its group in one call, so
+    a record is a fleet standard only when every key it sends is one."""
+    setting = rec.get("setting")
+    if not fleet_standard(setting, defaults, overrides):
+        return False
+    writer = rec.get("_writer")
+    payload = writer[2] if isinstance(writer, tuple) and len(writer) == 3 else None
+    group = setting.partition(".")[0] if isinstance(setting, str) else ""
+    if isinstance(payload, dict) and group in ("repo", "actions", "security"):
+        return all(fleet_standard(f"{group}.{k}", defaults, overrides) for k in payload)
+    return True
+
+
+def classify_records(records: list[dict], defaults: Any = None,
+                     overrides: Any = None) -> None:
+    """Set `risk` and `risk_reason` on every drift record of one repo's plan.
+    Call it before any write: it reads the statuses as planned.
+
+    With a fleet config's `defaults` and the repo's `overrides`, a plan that
+    sets a repo up (it creates the repo's managed ruleset) also makes every
+    write that puts a setting at the fleet standard safe, even one that
+    would otherwise wait (owner's rule, 2026-11-20). A repo's own overrides
+    never get this, and neither does a repo already set up, so a change to
+    `defaults:` that loosens something still waits on every existing repo."""
+    verdicts = [(r, write_risk(r, records)) for r in records if r.get("status") == "drift"]
+    setting_up = defaults is not None and _onboarding(records, defaults)
+    for rec, (verdict, reason) in verdicts:
+        if (verdict == GATED and setting_up and not rec.get("bypass_unknown")
+                and rec.get("codeql_existing", []) == []
+                and _whole_write_is_standard(rec, defaults, overrides)):
+            verdict, reason = SAFE, f"fleet standard on a repo being set up (was: {reason})"
+        rec["risk"], rec["risk_reason"] = verdict, reason
+
+
+# --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
 GREEN, YELLOW, RED, DIM, RESET = (
@@ -2516,8 +3226,10 @@ def _sym(status: str) -> str:
         "drift": f"{YELLOW}DRIFT{RESET}",
         "changed": f"{YELLOW}CHANGED{RESET}",
         "skipped": f"{DIM}skip{RESET}",
+        "advisory": f"{YELLOW}CHECK{RESET}",
         "error": f"{RED}ERROR{RESET}",
         "would-change": f"{YELLOW}would change{RESET}",
+        "gated": f"{YELLOW}LEFT FOR REVIEW{RESET}",
     }.get(status, status)
 
 
@@ -2534,9 +3246,12 @@ def render_records(repo: str, records: list[dict], scope: str | None = None) -> 
             line += f"\n      from: {r['current']!r}\n      to:   {r['desired']!r}"
             if r.get("note"):
                 line += f"\n      note: {r['note']}"
+        elif r["status"] == "gated":
+            line += (f"\n      from: {r['current']!r}\n      to:   {r['desired']!r}"
+                     f"\n      why:  {r.get('note', '')}")
         elif r["status"] == "changed":
             line += f"  -> {r['desired']!r}"
-        elif r["status"] in ("skipped", "error"):
+        elif r["status"] in ("skipped", "error", "advisory"):
             line += f"  ({r.get('note', '')})"
         print(line)
 
@@ -2751,14 +3466,16 @@ def cmd_diff(args) -> int:
             print(f"\n{t['repo']}\n  {DIM}{manage_label(t)}{RESET}")
             continue
         records = plan_repo_records(t["repo"], t["effective"])
+        classify_records(records, t.get("defaults"), t.get("overrides"))
         render_records(t["repo"], records, manage_label(t))
         any_drift |= any(r["status"] == "drift" for r in records)
         any_error |= any(r["status"] == "error" for r in records)
         changes.extend(
             {"repo": t["repo"], "setting": r["setting"], "status": r["status"],
              "current": r["current"], "desired": r["desired"],
-             "note": r.get("note")}
-            for r in records if r["status"] in ("drift", "error")
+             "note": r.get("note"), "risk": r.get("risk"),
+             "risk_reason": r.get("risk_reason")}
+            for r in records if r["status"] in ("drift", "error", "advisory")
         )
     if getattr(args, "changes_json", None):
         with open(args.changes_json, "w", encoding="utf-8") as fh:
@@ -2774,7 +3491,11 @@ def cmd_apply(args) -> int:
     # The workflow applies the cms-platform repos in their own step, under a
     # token that can write issues and nothing else (docs/decisions/0016).
     mode = getattr(args, "cms_label_only", None)
-    any_error = False
+    # With --refuse-weakening only the writes write_risk calls SAFE are made;
+    # the rest are left, reported as `gated`, for an apply without the flag.
+    refuse = bool(getattr(args, "refuse_weakening", False))
+    any_error = any_gated = False
+    results: list[dict] = []
     for t in targets:
         if mode and is_cms_label_only(t["repo"]) != (mode == "only"):
             if mode == "skip":
@@ -2787,6 +3508,9 @@ def cmd_apply(args) -> int:
             print(f"\n{t['repo']}\n  {DIM}{manage_label(t)}{RESET}")
             continue
         records = plan_repo_records(t["repo"], t["effective"])
+        # Before the first write: the verdicts read the statuses as planned.
+        classify_records(records, t.get("defaults"), t.get("overrides"))
+        planned = [r for r in records if r["status"] in ("drift", "error")]
         for r in records:
             if r["status"] == "drift":
                 if r.get("bypass_unknown"):
@@ -2794,6 +3518,12 @@ def cmd_apply(args) -> int:
                     # that apply would refuse.
                     r["status"] = "error"
                     r["note"] = BYPASS_UNKNOWN_REFUSAL
+                elif refuse and r.get("risk") != SAFE:
+                    # Checked here, at the write, and not only where the
+                    # workflow routes: this is what keeps the unreviewed
+                    # lane from making a write nobody classified as safe.
+                    r["status"] = "gated"
+                    r["note"] = r.get("risk_reason") or "not classified"
                 elif args.dry_run:
                     r["status"] = "would-change"
                 else:
@@ -2805,7 +3535,21 @@ def cmd_apply(args) -> int:
                         r["note"] = e.message
         render_records(t["repo"], records, manage_label(t))
         any_error |= any(r["status"] == "error" for r in records)
-    return 2 if any_error else 0
+        any_gated |= any(r["status"] == "gated" for r in records)
+        results.extend(
+            {"repo": t["repo"], "setting": r["setting"], "status": r["status"],
+             "current": r["current"], "desired": r["desired"],
+             "note": r.get("note"), "risk": r.get("risk"),
+             "risk_reason": r.get("risk_reason")}
+            for r in planned
+        )
+    if getattr(args, "result_json", None):
+        with open(args.result_json, "w", encoding="utf-8") as fh:
+            json.dump(results, fh, indent=2, default=repr)
+    if any_error:
+        return 2
+    # 3, not 0: "every safe write was made" must not read as "nothing is left".
+    return 3 if any_gated else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -2838,6 +3582,19 @@ def _annotation_escape(text: str) -> str:
     return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
+def _md_text(value: Any) -> str:
+    """Prose for a Markdown table cell: one line, pipes escaped."""
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _review_cell(c: dict) -> str:
+    """Which apply makes this change: the one that runs with no reviewer, or
+    the one that waits for the owner."""
+    if c.get("risk") == SAFE:
+        return "not needed"
+    return "needed: " + _md_text(c.get("risk_reason") or "not classified")
+
+
 def changes_markdown(changes: list[dict]) -> str:
     """The job summary: one row per planned change, errors included. Rows sort
     by setting, then repo, so one setting's changes across the fleet read as a
@@ -2845,10 +3602,15 @@ def changes_markdown(changes: list[dict]) -> str:
     drift = sorted((c for c in changes if c["status"] == "drift"),
                    key=lambda c: (c["setting"], c["repo"].lower()))
     errors = [c for c in changes if c["status"] == "error"]
+    advisories = sorted((c for c in changes if c["status"] == "advisory"),
+                        key=lambda c: (c["setting"], c["repo"].lower()))
+    advisory_lines = (["", "## To check (report only)", ""]
+                      + [f"- {c['repo']}: {c['setting']} ({_md_text(c.get('note') or '')})"
+                         for c in advisories]) if advisories else []
     lines = ["## Planned changes", ""]
-    if not changes:
+    if not drift and not errors:
         lines.append("No changes planned. An apply would change nothing.")
-        return "\n".join(lines) + "\n"
+        return "\n".join(lines + advisory_lines) + "\n"
 
     def cell(text: str) -> str:
         return "`" + text.replace("|", "\\|").replace("`", "'") + "`"
@@ -2858,12 +3620,12 @@ def changes_markdown(changes: list[dict]) -> str:
             f"{len(drift)} setting(s) would change. Settings this token cannot "
             "read are skipped, not listed; the plan log names them.",
             "",
-            "| Repo | Setting | From | To |",
-            "|---|---|---|---|",
+            "| Repo | Setting | From | To | Review |",
+            "|---|---|---|---|---|",
         ]
         lines += [
             f"| {c['repo']} | {c['setting']} | {cell(_short(c['current']))} "
-            f"| {cell(_short(c['desired']))} |"
+            f"| {cell(_short(c['desired']))} | {_review_cell(c)} |"
             for c in drift
         ]
     if errors:
@@ -2871,14 +3633,14 @@ def changes_markdown(changes: list[dict]) -> str:
                   "plan is incomplete:", ""]
         lines += [f"- {c['repo']}: {c['setting']} ({c.get('note') or 'error'})"
                   for c in errors]
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines + advisory_lines) + "\n"
 
 
 def changes_annotations(changes: list[dict], summary_url: str | None) -> list[str]:
     """`::notice` lines, at most MAX_NOTICES. When there are more changes than
     that, the last line says so instead of showing one more."""
     where = f" at {summary_url}" if summary_url else ""
-    lines = [_change_line(c) for c in changes]
+    lines = [_change_line(c) for c in changes if c["status"] != "advisory"]
     if len(lines) > MAX_NOTICES:
         shown = lines[: MAX_NOTICES - 1]
         hidden = len(lines) - len(shown)
@@ -2902,6 +3664,89 @@ def cmd_changes_report(args) -> int:
     else:
         for line in changes_annotations(changes, args.summary_url):
             print(line)
+    return 0
+
+
+def apply_markdown(results: list[dict]) -> str:
+    """The job summary of an `apply --refuse-weakening`: what it changed, and
+    what it left for the reviewed apply and why."""
+    def rows(status: str) -> list[dict]:
+        return sorted((r for r in results if r["status"] == status),
+                      key=lambda r: (r["setting"], r["repo"].lower()))
+
+    def cell(text: str) -> str:
+        return "`" + text.replace("|", "\\|").replace("`", "'") + "`"
+
+    changed, gated, errors = rows("changed"), rows("gated"), rows("error")
+    lines = ["## Applied without review", ""]
+    if changed:
+        lines += ["| Repo | Setting | From | To |", "|---|---|---|---|"]
+        lines += [
+            f"| {r['repo']} | {r['setting']} | {cell(_short(r['current']))} "
+            f"| {cell(_short(r['desired']))} |"
+            for r in changed
+        ]
+    else:
+        lines.append("Nothing.")
+    lines += ["", "## Left for the reviewed apply", ""]
+    if gated:
+        lines += [
+            f"{len(gated)} change(s) could reduce protection, or could not be "
+            "shown not to. Approving the reviewed apply makes them.",
+            "",
+            "| Repo | Setting | From | To | Why |",
+            "|---|---|---|---|---|",
+        ]
+        lines += [
+            f"| {r['repo']} | {r['setting']} | {cell(_short(r['current']))} "
+            f"| {cell(_short(r['desired']))} "
+            f"| {_md_text(r.get('note') or '')} |"
+            for r in gated
+        ]
+    elif results_need_review(results):
+        lines.append(
+            "No change was held back, but a setting could not be read or "
+            "classified (below), so the reviewed apply is still asked for.")
+    else:
+        lines.append("Nothing. No approval is needed for this plan.")
+    if errors:
+        lines += ["", f"**{len(errors)} setting(s) failed:**", ""]
+        lines += [f"- {r['repo']}: {r['setting']} ({r.get('note') or 'error'})"
+                  for r in errors]
+    return "\n".join(lines) + "\n"
+
+
+def results_need_review(results: list[dict]) -> bool:
+    """True when an `apply --refuse-weakening` left something for the reviewed
+    apply: a change it would not make, or a setting it could not read or
+    classify. A failed read can hide a change that would have waited, so only
+    a write already classified safe may fail without asking for the review."""
+    return any(
+        r["status"] == "gated" or (r["status"] == "error" and r.get("risk") != SAFE)
+        for r in results
+    )
+
+
+def cmd_apply_report(args) -> int:
+    """Merge the `apply --result-json` files given and print the job summary
+    (--format markdown), or `true`/`false` for whether a change was left for
+    the reviewed apply (--format needs-review)."""
+    results: list[dict] = []
+    for path in args.inputs:
+        with open(path, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        # Refused, not guessed at: "nothing was left for review" must never be
+        # read out of a file that is not a result list.
+        if not isinstance(loaded, list) or not all(
+                isinstance(r, dict) and isinstance(r.get("status"), str)
+                and isinstance(r.get("setting"), str) and isinstance(r.get("repo"), str)
+                for r in loaded):
+            raise SystemExit(f"error: {path} is not a list of apply results")
+        results.extend(loaded)
+    if args.format == "markdown":
+        sys.stdout.write(apply_markdown(results))
+    else:
+        print("true" if results_need_review(results) else "false")
     return 0
 
 
@@ -2961,7 +3806,27 @@ def main() -> int:
         help="skip the cms-platform label-only repos, or apply only them "
         "(default: every target)",
     )
+    a.add_argument(
+        "--refuse-weakening",
+        action="store_true",
+        help="make only the writes that cannot reduce protection; leave the "
+        "rest (reported as left for review) and exit 3 if any were left",
+    )
+    a.add_argument(
+        "--result-json",
+        help="also write what happened to each planned change to this file, "
+        "for apply-report",
+    )
     a.set_defaults(func=cmd_apply)
+
+    ar = sub.add_parser(
+        "apply-report",
+        help="render apply --result-json files as a job summary, or say "
+        "whether anything was left for review",
+    )
+    ar.add_argument("inputs", nargs="+", help="files written by apply --result-json")
+    ar.add_argument("--format", choices=("markdown", "needs-review"), required=True)
+    ar.set_defaults(func=cmd_apply_report)
 
     cl = sub.add_parser(
         "cms-label-repos",
