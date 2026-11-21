@@ -124,7 +124,9 @@ jobs:
   # never sets `needs_apply`, on schedule either: the owner chose (PR #113) to
   # stop approving weekly applies that change nothing over keeping a blind
   # weekly backstop for those. A settings push that finds other drift, or a
-  # `force_apply` dispatch, still converges them.
+  # `force_apply` dispatch, still converges `bypass_actors` and Actions
+  # policies. Not the merge flags: the admin App has no Contents either, so the
+  # apply skips them too and only an operator `apply` converges them.
   #
   # Not gated on the read App's variable, on purpose: a plan that skipped
   # would read as "nothing to apply" on push. A missing App fails the mint and
