@@ -46,7 +46,7 @@ owners.
 - The three cms-platform-managed repos (`manage: ["labels"]`, ADR 0016) and
   `manage: []` repos do not receive the secret. Extending the label-only
   token to Secrets would need its own decision.
-- Until the Apps hold Secrets permission, every repo's `secret[...]` record is
+- Until the Apps hold Secrets permission, every repo's `fanout[...]` record is
   an `error` (HTTP 403), not drift and not a silent skip.
 - The source's age is the setter script's own timestamp, so rotating the
   denylist by any other route leaves the copies looking current.

@@ -78,7 +78,7 @@ class SecretSpecTests(unittest.TestCase):
 class SecretPlanTests(unittest.TestCase):
     def test_missing_secret_is_drift_with_a_writer(self):
         (rec,) = _plan(None)
-        self.assertEqual((rec["setting"], rec["status"]), (f"secret[{NAME}]", "drift"))
+        self.assertEqual((rec["setting"], rec["status"]), (f"fanout[{NAME}]", "drift"))
         self.assertEqual(rec["current"], {"present": False, "updated_at": None})
         self.assertEqual(rec["_writer"], ("secret", NAME, SOURCE_TS))
 
@@ -179,7 +179,7 @@ class SecretWriteTests(unittest.TestCase):
 class SecretRiskTests(unittest.TestCase):
     def test_an_allowlisted_secret_write_is_safe_and_anything_else_waits(self):
         def rec(name):
-            return {"setting": f"secret[{name}]", "status": "drift", "current": {},
+            return {"setting": f"fanout[{name}]", "status": "drift", "current": {},
                     "desired": {}, "_writer": ("secret", name, None)}
         self.assertEqual(rs.write_risk(rec(NAME), [rec(NAME)])[0], rs.SAFE)
         self.assertEqual(rs.write_risk(rec("OTHER"), [rec("OTHER")])[0], rs.GATED)
@@ -224,7 +224,7 @@ class NoValueReachesOutputTests(unittest.TestCase):
         # The write failed (gh exited 1), which is an error, not a silent pass.
         self.assertEqual(rc_apply, 2)
         everything = out.getvalue() + err.getvalue() + files
-        self.assertIn("secret[PRIVACY_DENYLIST]", everything)
+        self.assertIn("fanout[PRIVACY_DENYLIST]", everything)
         for needle in ("example-host-alpha", "example-person-beta"):
             self.assertNotIn(needle, everything)
         self.assertIn("[redacted]", everything)

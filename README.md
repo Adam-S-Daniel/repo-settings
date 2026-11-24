@@ -188,7 +188,7 @@ organization secrets
 1. **Grant the permission (owner action).** Add **Secrets: Read & write** to
    the admin App and **Secrets: Read** to the read-only App, and accept the
    new permission on both installations. Until then each repo's
-   `secret[PRIVACY_DENYLIST]` record is an `error` naming the HTTP failure.
+   `fanout[PRIVACY_DENYLIST]` record is an `error` naming the HTTP failure.
 2. **Store the source** from the owner's machine, with `gh` signed in as an
    admin of this repo and the denylist outside every git work tree:
 

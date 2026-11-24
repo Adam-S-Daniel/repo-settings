@@ -2750,7 +2750,7 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
     # them gets an `error` record, never a silent skip.
     for spec in build_secret_specs(settings):
         name = spec["name"]
-        setting = f"secret[{name}]"
+        setting = f"fanout[{name}]"
         try:
             source = source_secret_updated_at(name)
         except ValueError:
@@ -3285,8 +3285,8 @@ def write_risk(rec: dict, records: list[dict]) -> tuple[str, str]:
         # holds no constraint, so no rule is removed or relaxed. A name off
         # the allowlist waits.
         if a in SECRET_SOURCES:
-            return _safe(f"secret[{a}]: create or refresh the fanned-out copy")
-        return _gated(f"secret[{a}]: not a secret this engine fans out")
+            return _safe(f"fanout[{a}]: create or refresh the fanned-out copy")
+        return _gated(f"fanout[{a}]: not a secret this engine fans out")
     if kind == "ruleset":
         name = a.get("name") if isinstance(a, dict) else None
         if b is None and rec.get("_live") is None and current is None:
