@@ -30,29 +30,29 @@ SETTINGS = {"secrets": [{"name": NAME}]}
 
 
 def _plan(live, *, source=SOURCE_TS, repo=None, gh_error=None):
-    env = {rs.secret_updated_env(NAME): source} if source else {}
+    env = {rs.stamp_env(NAME): source} if source else {}
     repo_doc = {"private": False, "archived": False}
     repo_doc.update(repo or {})
     with patch.dict(os.environ, env, clear=False), \
-            patch.object(rs, "read_repo_secret", side_effect=gh_error,
+            patch.object(rs, "read_fanout_copy", side_effect=gh_error,
                          return_value=live), \
             patch.object(rs, "get_repo", return_value=repo_doc):
         if not source:
-            os.environ.pop(rs.secret_updated_env(NAME), None)
+            os.environ.pop(rs.stamp_env(NAME), None)
         return rs.plan_repo(REPO, SETTINGS)
 
 
 class SecretSpecTests(unittest.TestCase):
     def test_only_allowlisted_names(self):
         with self.assertRaises(SystemExit) as cm:
-            rs.build_secret_specs({"secrets": [{"name": "REPO_SETTINGS_APP_PRIVATE_KEY"}]})
+            rs.build_fanout_specs({"secrets": [{"name": "REPO_SETTINGS_APP_PRIVATE_KEY"}]})
         self.assertIn("must be one of PRIVACY_DENYLIST", str(cm.exception.code))
 
     def test_duplicates_and_shapes_are_refused(self):
         for bad in ({"secrets": [{"name": NAME}, {"name": NAME}]},
                     {"secrets": "x"}, {"secrets": ["x"]}):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
-                rs.build_secret_specs(bad)
+                rs.build_fanout_specs(bad)
 
     def test_unknown_key_in_an_entry_is_refused(self):
         cfg = {"repo": REPO, "secrets": [{"name": NAME, "value": "x"}]}
@@ -117,7 +117,7 @@ class SecretPlanTests(unittest.TestCase):
         self.assertEqual(rec["status"], "error")
 
     def test_a_404_is_probed_against_the_repo(self):
-        with patch.object(rs, "read_repo_secret", return_value=None), \
+        with patch.object(rs, "read_fanout_copy", return_value=None), \
                 patch.object(rs, "get_repo",
                              side_effect=rs.GhError(404, "Not Found")) as get_repo:
             (rec,) = rs.plan_repo(REPO, SETTINGS)
@@ -130,15 +130,15 @@ class SecretPlanTests(unittest.TestCase):
 
     def test_read_uses_the_metadata_endpoint(self):
         with patch.object(rs, "gh_api", return_value={"name": NAME}) as api:
-            rs.read_repo_secret(REPO, NAME)
+            rs.read_fanout_copy(REPO, NAME)
         api.assert_called_once_with("repos/o/r/actions/secrets/PRIVACY_DENYLIST")
 
     def test_read_maps_404_to_none_and_reraises_the_rest(self):
         with patch.object(rs, "gh_api", side_effect=rs.GhError(404, "x")):
-            self.assertIsNone(rs.read_repo_secret(REPO, NAME))
+            self.assertIsNone(rs.read_fanout_copy(REPO, NAME))
         with patch.object(rs, "gh_api", side_effect=rs.GhError(500, "x")), \
                 self.assertRaises(rs.GhError):
-            rs.read_repo_secret(REPO, NAME)
+            rs.read_fanout_copy(REPO, NAME)
 
 
 class SecretWriteTests(unittest.TestCase):
@@ -148,7 +148,7 @@ class SecretWriteTests(unittest.TestCase):
 
     def test_value_goes_on_stdin_never_argv(self):
         with patch.dict(os.environ, {NAME: VALUE}), self._run() as run:
-            rs.write_repo_secret(REPO, NAME)
+            rs.write_fanout_copy(REPO, NAME)
         (argv,), kwargs = run.call_args
         self.assertEqual(argv, ["gh", "secret", "set", NAME, "--repo", REPO, "--app", "actions"])
         self.assertEqual(kwargs["input"], VALUE)
@@ -158,20 +158,20 @@ class SecretWriteTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False), self._run() as run:
             os.environ.pop(NAME, None)
             with self.assertRaises(rs.GhError):
-                rs.write_repo_secret(REPO, NAME)
+                rs.write_fanout_copy(REPO, NAME)
         run.assert_not_called()
 
     def test_failure_message_is_redacted(self):
         leak = f"HTTP 422: bad value {VALUE!r} and example-person-beta"
         with patch.dict(os.environ, {NAME: VALUE}), self._run(1, leak):
             with self.assertRaises(rs.GhError) as cm:
-                rs.write_repo_secret(REPO, NAME)
+                rs.write_fanout_copy(REPO, NAME)
         self.assertNotIn("example-host-alpha", cm.exception.message)
         self.assertNotIn("example-person-beta", cm.exception.message)
         self.assertEqual(cm.exception.status, 422)
 
     def test_apply_record_dispatches_the_secret_writer(self):
-        with patch.object(rs, "write_repo_secret") as write:
+        with patch.object(rs, "write_fanout_copy") as write:
             rs.apply_record(REPO, {"_writer": ("secret", NAME, SOURCE_TS)})
         write.assert_called_once_with(REPO, NAME)
 
@@ -202,11 +202,11 @@ class NoValueReachesOutputTests(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with tempfile.TemporaryDirectory() as tmp:
             changes, result = Path(tmp, "c.json"), Path(tmp, "r.json")
-            env = {NAME: VALUE, rs.secret_updated_env(NAME): SOURCE_TS}
+            env = {NAME: VALUE, rs.stamp_env(NAME): SOURCE_TS}
             done = subprocess.CompletedProcess([], 1, stdout="",
                                                stderr=f"HTTP 500 {VALUE}")
             with patch.dict(os.environ, env), \
-                    patch.object(rs, "read_repo_secret", return_value=None), \
+                    patch.object(rs, "read_fanout_copy", return_value=None), \
                     patch.object(rs, "get_repo",
                                  return_value={"private": False, "archived": False}), \
                     patch.object(rs.subprocess, "run", return_value=done), \

@@ -1210,13 +1210,13 @@ def write_label(repo: str, spec: dict, exists: bool) -> None:
 SECRET_SOURCES = ("PRIVACY_DENYLIST",)
 
 
-def secret_updated_env(name: str) -> str:
+def stamp_env(name: str) -> str:
     """The environment variable holding when the source secret was last
     stored (ISO 8601, UTC). A timestamp, never a value."""
     return f"{name}_UPDATED_AT"
 
 
-def build_secret_specs(settings: dict) -> list[dict]:
+def build_fanout_specs(settings: dict) -> list[dict]:
     """Validate and normalize every `secrets` entry of one repo's settings."""
     entries = settings.get("secrets") or []
     if not isinstance(entries, list):
@@ -1239,7 +1239,7 @@ def build_secret_specs(settings: dict) -> list[dict]:
     return specs
 
 
-def parse_secret_timestamp(text: str) -> datetime:
+def parse_stamp(text: str) -> datetime:
     """An ISO 8601 timestamp with a UTC offset (`Z` accepted), as aware UTC."""
     value = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
     if value.tzinfo is None:
@@ -1247,14 +1247,14 @@ def parse_secret_timestamp(text: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def source_secret_updated_at(name: str) -> datetime | None:
+def source_stamp(name: str) -> datetime | None:
     """When the source secret was stored, from the job's environment, or None
     when the job was not given it. Raises ValueError on a malformed value."""
-    raw = os.environ.get(secret_updated_env(name), "").strip()
-    return parse_secret_timestamp(raw) if raw else None
+    raw = os.environ.get(stamp_env(name), "").strip()
+    return parse_stamp(raw) if raw else None
 
 
-def read_repo_secret(repo: str, name: str) -> dict | None:
+def read_fanout_copy(repo: str, name: str) -> dict | None:
     """The live secret's metadata (name, created_at, updated_at), never its
     value, or None on a 404. A bare 404 is ambiguous (secret missing, or repo
     invisible to this credential): the caller probes the repo."""
@@ -1274,7 +1274,7 @@ def _redact(text: str, value: str) -> str:
     return text
 
 
-def write_repo_secret(repo: str, name: str) -> None:
+def write_fanout_copy(repo: str, name: str) -> None:
     """Store the source value as the repo's Actions secret. `gh secret set`
     seals it with the repo's public key; the value goes in on stdin, never in
     argv, and nothing gh prints is passed on unredacted."""
@@ -1747,7 +1747,7 @@ def _validate_builders(where: str, settings: dict) -> None:
     including on a surface the repo's `manage` leaves out."""
     try:
         build_label_specs(settings)
-        build_secret_specs(settings)
+        build_fanout_specs(settings)
         build_extra_ruleset_bodies(settings)
         build_actions_policy_bodies(settings)
         ruleset_cfg = settings.get("ruleset") or {}
@@ -2748,20 +2748,20 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
     # secret is left alone. No value or pattern is read, hashed or printed.
     # Reading needs Secrets: read, writing Secrets: write; a credential without
     # them gets an `error` record, never a silent skip.
-    for spec in build_secret_specs(settings):
+    for spec in build_fanout_specs(settings):
         name = spec["name"]
         setting = f"fanout[{name}]"
         try:
-            source = source_secret_updated_at(name)
+            source = source_stamp(name)
         except ValueError:
             records.append(_err(setting, None, GhError(
-                None, f"{secret_updated_env(name)} is not an ISO 8601 timestamp "
+                None, f"{stamp_env(name)} is not an ISO 8601 timestamp "
                       f"with a UTC offset")))
             continue
         desired = {"present": True,
                    "updated_at_not_before": source.isoformat() if source else None}
         try:
-            live = read_repo_secret(repo, name)
+            live = read_fanout_copy(repo, name)
             if live is None:
                 # Same probe as labels: a bare 404 may mean an invisible repo.
                 get_repo(repo)
@@ -2773,7 +2773,7 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
         stale = False
         if live is not None and source is not None:
             try:
-                stale = parse_secret_timestamp(str(live.get("updated_at"))) < source
+                stale = parse_stamp(str(live.get("updated_at"))) < source
             except ValueError:
                 stale = True  # no readable age: refresh rather than trust it
         if live is not None and not stale:
@@ -2837,7 +2837,7 @@ def apply_record(repo: str, rec: dict) -> None:
     elif kind == "label":
         write_label(repo, a, b)
     elif kind == "secret":
-        write_repo_secret(repo, a)
+        write_fanout_copy(repo, a)
     elif kind == "actions_policy":
         write_actions_policy(repo, a, b)
     elif kind == "auto_merge":
