@@ -117,8 +117,8 @@ def main(argv: list[str] | None = None, stdin=None) -> int:
     except SetError as e:
         sys.stderr.write(f"error: {e}\n")
         return 1
-    print(f"stored {SECRET_NAME} in {', '.join(environments)} of {args.repo}")
-    print(f"{UPDATED_VARIABLE} = {stamp}")
+    print(f"stored the denylist in {', '.join(environments)} of {args.repo}")
+    print(f"timestamp variable updated: {stamp}")
     return 0
 
 
