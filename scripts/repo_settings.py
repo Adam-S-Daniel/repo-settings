@@ -61,6 +61,14 @@ Managed settings:
                                                POST when absent or PATCH on
                                                drift; idempotent BY NAME, never
                                                deletes a label)
+  * secrets (defaults + per-repo)          -> repos/{repo}/actions/secrets/{name}  (GET
+                                               for name and updated_at only,
+                                               never a value; `gh secret set`
+                                               to store the value the job
+                                               holds, sealed by gh; drift =
+                                               missing or older than the
+                                               source -- see the secrets
+                                               section)
   * actions_policies (per-repo only)       -> repos/{repo}/actions/policies  (idempotent
                                                BY NAME; never edits or deletes an
                                                undeclared policy)
@@ -87,7 +95,7 @@ PAT with "Administration: read and write", a classic PAT with `repo` scope, or a
 GitHub App token). The default Actions `GITHUB_TOKEN` cannot change repo settings.
 
 Config schema: see ../repo-settings/schema.md. A SURFACE is one top-level key
-of a repo's resolved settings, which plan_repo plans independently: the seven
+of a repo's resolved settings, which plan_repo plans independently: the eight
 names in SURFACES. Two shapes are accepted:
 
   * Single-repo -- top-level surface blocks (`actions:`, `ruleset:`, ...), plus
@@ -126,10 +134,12 @@ import argparse
 import copy
 import fnmatch
 import json
+import os
 import re
 import subprocess
 import sys
 import urllib.parse
+from datetime import datetime, timezone
 from typing import Any
 
 try:
@@ -1190,6 +1200,100 @@ def write_label(repo: str, spec: dict, exists: bool) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Secrets (fleet-wide defaults plus per-repo)
+# --------------------------------------------------------------------------- #
+# A secret the engine fans out. The VALUE never lives in fleet.yml: it is read
+# at apply time from the environment variable of the same name, which the apply
+# jobs get from their environment's secret (README, "Secrets fan-out"). Only
+# names listed here can be declared, so a config change cannot make the engine
+# copy some other variable (the admin App key, say) into a repo.
+SECRET_SOURCES = ("PRIVACY_DENYLIST",)
+
+
+def secret_updated_env(name: str) -> str:
+    """The environment variable holding when the source secret was last
+    stored (ISO 8601, UTC). A timestamp, never a value."""
+    return f"{name}_UPDATED_AT"
+
+
+def build_secret_specs(settings: dict) -> list[dict]:
+    """Validate and normalize every `secrets` entry of one repo's settings."""
+    entries = settings.get("secrets") or []
+    if not isinstance(entries, list):
+        raise SystemExit("error: secrets must be a list")
+    specs: list[dict] = []
+    seen: set[str] = set()
+    for cfg in entries:
+        if not isinstance(cfg, dict):
+            raise SystemExit(f"error: secrets entries must be mappings (got {cfg!r})")
+        name = cfg.get("name")
+        if name not in SECRET_SOURCES:
+            raise SystemExit(
+                f"error: secrets entry `name` must be one of "
+                f"{', '.join(SECRET_SOURCES)} (got {name!r})"
+            )
+        if name in seen:
+            raise SystemExit(f"error: secrets name {name!r} is duplicated")
+        seen.add(name)
+        specs.append({"name": name})
+    return specs
+
+
+def parse_secret_timestamp(text: str) -> datetime:
+    """An ISO 8601 timestamp with a UTC offset (`Z` accepted), as aware UTC."""
+    value = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        raise ValueError("no UTC offset")
+    return value.astimezone(timezone.utc)
+
+
+def source_secret_updated_at(name: str) -> datetime | None:
+    """When the source secret was stored, from the job's environment, or None
+    when the job was not given it. Raises ValueError on a malformed value."""
+    raw = os.environ.get(secret_updated_env(name), "").strip()
+    return parse_secret_timestamp(raw) if raw else None
+
+
+def read_repo_secret(repo: str, name: str) -> dict | None:
+    """The live secret's metadata (name, created_at, updated_at), never its
+    value, or None on a 404. A bare 404 is ambiguous (secret missing, or repo
+    invisible to this credential): the caller probes the repo."""
+    try:
+        return gh_api(f"repos/{repo}/actions/secrets/{urllib.parse.quote(name, safe='')}")
+    except GhError as e:
+        if e.status == 404:
+            return None
+        raise
+
+
+def _redact(text: str, value: str) -> str:
+    """Remove a secret value, and each of its lines, from text bound for a log."""
+    for part in sorted({value, *value.splitlines()}, key=len, reverse=True):
+        if part.strip():
+            text = text.replace(part, "[redacted]")
+    return text
+
+
+def write_repo_secret(repo: str, name: str) -> None:
+    """Store the source value as the repo's Actions secret. `gh secret set`
+    seals it with the repo's public key; the value goes in on stdin, never in
+    argv, and nothing gh prints is passed on unredacted."""
+    value = os.environ.get(name, "")
+    if not value.strip():
+        raise GhError(None, f"{name} is not in this job's environment, so there is "
+                            f"no value to store")
+    proc = subprocess.run(
+        ["gh", "secret", "set", name, "--repo", repo, "--app", "actions"],
+        input=value, capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        message = _redact((proc.stderr or proc.stdout).strip(), value)
+        status = next((int(t) for t in ("401", "403", "404", "409", "422", "500")
+                       if t in message), None)
+        raise GhError(status, message or "gh secret set failed")
+
+
+# --------------------------------------------------------------------------- #
 # Actions policies (per-repo only)
 # --------------------------------------------------------------------------- #
 def _str_list(value: Any, allow_empty: bool) -> bool:
@@ -1426,6 +1530,7 @@ SURFACES = (
     "labels",
     "repo",
     "ruleset",
+    "secrets",
     "security",
 )
 # `manage: ["all"]` -- every surface, INCLUDING any added to SURFACES later
@@ -1467,6 +1572,7 @@ SURFACE_KEYS = {
         "admin_bypass",
         "bypass_actors",
     ),
+    "secrets": ("name",),
     "security": (
         "vulnerability_alerts",
         "automated_security_fixes",
@@ -1605,7 +1711,7 @@ def validate_surfaces(where: str, block: dict) -> None:
 def validate_manage(where: str, value: Any) -> list[str]:
     """Return a `manage` value if it is one of the documented ones, else raise
     ConfigError. One meaning, one value: `["all"]`, `[]`, or surface names
-    from SURFACES, each once, in SURFACES' order, short of naming all seven."""
+    from SURFACES, each once, in SURFACES' order, short of naming all eight."""
 
     def bad(problem: str) -> ConfigError:
         return ConfigError(f"error: {where}: `manage` {problem}; {MANAGE_ACCEPTED}")
@@ -1641,6 +1747,7 @@ def _validate_builders(where: str, settings: dict) -> None:
     including on a surface the repo's `manage` leaves out."""
     try:
         build_label_specs(settings)
+        build_secret_specs(settings)
         build_extra_ruleset_bodies(settings)
         build_actions_policy_bodies(settings)
         ruleset_cfg = settings.get("ruleset") or {}
@@ -2633,6 +2740,59 @@ def plan_repo(repo: str, settings: dict) -> list[dict]:
             }
         )
 
+    # -- secrets -------------------------------------------------------------- #
+    # Fanned out from one source (README, "Secrets fan-out"). The API gives a
+    # secret's name and timestamps, never its value, so the plan judges only
+    # presence and age: missing, or last updated before the source was stored
+    # (`<NAME>_UPDATED_AT`), is drift. With no source timestamp a present
+    # secret is left alone. No value or pattern is read, hashed or printed.
+    # Reading needs Secrets: read, writing Secrets: write; a credential without
+    # them gets an `error` record, never a silent skip.
+    for spec in build_secret_specs(settings):
+        name = spec["name"]
+        setting = f"secret[{name}]"
+        try:
+            source = source_secret_updated_at(name)
+        except ValueError:
+            records.append(_err(setting, None, GhError(
+                None, f"{secret_updated_env(name)} is not an ISO 8601 timestamp "
+                      f"with a UTC offset")))
+            continue
+        desired = {"present": True,
+                   "updated_at_not_before": source.isoformat() if source else None}
+        try:
+            live = read_repo_secret(repo, name)
+            if live is None:
+                # Same probe as labels: a bare 404 may mean an invisible repo.
+                get_repo(repo)
+        except GhError as e:
+            records.append(_err(setting, desired, e))
+            continue
+        current = {"present": live is not None,
+                   "updated_at": live.get("updated_at") if live else None}
+        stale = False
+        if live is not None and source is not None:
+            try:
+                stale = parse_secret_timestamp(str(live.get("updated_at"))) < source
+            except ValueError:
+                stale = True  # no readable age: refresh rather than trust it
+        if live is not None and not stale:
+            records.append({"setting": setting, "status": "match", "current": current,
+                            "desired": desired})
+            continue
+        try:
+            archived = bool(get_repo(repo).get("archived"))
+        except GhError as e:
+            records.append(_err(setting, desired, e))
+            continue
+        if archived:
+            records.append(_skip(setting, desired, "archived repo: secrets are read-only"))
+            continue
+        records.append({"setting": setting, "status": "drift", "current": current,
+                        "desired": desired,
+                        "note": "missing" if live is None else "older than the source",
+                        "_writer": ("secret", name, desired["updated_at_not_before"])})
+
     return records
 
 
@@ -2676,6 +2836,8 @@ def apply_record(repo: str, rec: dict) -> None:
         write_ruleset(repo, a, b, rec.get("bypass_unknown", False))
     elif kind == "label":
         write_label(repo, a, b)
+    elif kind == "secret":
+        write_repo_secret(repo, a)
     elif kind == "actions_policy":
         write_actions_policy(repo, a, b)
     elif kind == "auto_merge":
@@ -3117,6 +3279,14 @@ def write_risk(rec: dict, records: list[dict]) -> tuple[str, str]:
                 return _safe(f"{rec.get('setting')}: renames {_json(live_name)} to "
                              f"{_json(spec_name)} (a label is not a rule)")
         return _safe(f"{rec.get('setting')}: create, or set color and description")
+    if kind == "secret":
+        # Stores the owner's own source value under a name this engine
+        # allowlists (SECRET_SOURCES) in a repo the config declares. A secret
+        # holds no constraint, so no rule is removed or relaxed. A name off
+        # the allowlist waits.
+        if a in SECRET_SOURCES:
+            return _safe(f"secret[{a}]: create or refresh the fanned-out copy")
+        return _gated(f"secret[{a}]: not a secret this engine fans out")
     if kind == "ruleset":
         name = a.get("name") if isinstance(a, dict) else None
         if b is None and rec.get("_live") is None and current is None:

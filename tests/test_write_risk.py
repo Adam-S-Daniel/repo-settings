@@ -619,7 +619,7 @@ class SimpleWriterRiskTests(unittest.TestCase):
         has_a_safe_direction = {
             "sha", "fork", "workflow_permissions", "ruleset", "label", "auto_merge",
             "merge_methods", "delete_branch_on_merge", "vuln_alerts", "auto_sec_fixes",
-            "secret_scanning", "codeql",
+            "secret_scanning", "codeql", "secret",
         }
         has_a_safe_direction.add("merge_commit_message")
         always_gated = {"actions_policy"}
