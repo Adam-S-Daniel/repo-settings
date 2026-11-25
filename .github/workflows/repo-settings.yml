@@ -109,6 +109,13 @@ on:
 permissions:
   contents: read
 
+# When the source PRIVACY_DENYLIST was last stored (a timestamp, not a value;
+# scripts/set_privacy_denylist.py sets it). Every job that plans or applies the
+# `secrets` surface reads it to tell a stale copy from a current one. The VALUE
+# is passed only to the two apply steps below.
+env:
+  PRIVACY_DENYLIST_UPDATED_AT: ${{ vars.PRIVACY_DENYLIST_UPDATED_AT }}
+
 jobs:
   # The ungated plan (issue #116; issue #13, properties 1 and 2). It never
   # touches the admin key and declares no environment, so it needs no
@@ -162,6 +169,7 @@ jobs:
           permission-actions: read
           permission-issues: read
           permission-metadata: read
+          permission-secrets: read
 
       - name: Mint read-only GitHub App token for jodidaniel
         id: token_jodidaniel
@@ -174,6 +182,7 @@ jobs:
           permission-actions: read
           permission-issues: read
           permission-metadata: read
+          permission-secrets: read
 
       # `diff` exits 0 for no drift, 1 for drift, 2 when it could not ask or
       # the config is wrong. GitHub runs this under `bash -e`, so `|| rc=$?`
@@ -515,6 +524,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           OWNER: ${{ matrix.owner }}
+          PRIVACY_DENYLIST: ${{ secrets.PRIVACY_DENYLIST }}
         run: |
           set -uo pipefail
           # Under RUNNER_TEMP, never the checkout: the last step must only
@@ -776,6 +786,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           OWNER: ${{ matrix.owner }}
+          PRIVACY_DENYLIST: ${{ secrets.PRIVACY_DENYLIST }}
         run: python scripts/repo_settings.py apply --config repo-settings/fleet.yml --owner "$OWNER" --cms-label-only skip
 
       # Least privilege for the cms-platform-managed repos (docs/decisions/0016).
@@ -868,6 +879,7 @@ jobs:
           permission-actions: read
           permission-issues: read
           permission-metadata: read
+          permission-secrets: read
 
       - name: Drift report
         env:

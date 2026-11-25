@@ -14,7 +14,7 @@ is a collection of keys and values, an **array** is an ordered list, an
 written at all.
 
 A **surface** is one top-level key of a repo's resolved settings, which the
-engine plans independently. There are exactly seven, listed in canonical
+engine plans independently. There are exactly eight, listed in canonical
 (alphabetical) order, the order of `SURFACES` in `scripts/repo_settings.py`:
 
 | Surface | Value | Section |
@@ -25,6 +25,7 @@ engine plans independently. There are exactly seven, listed in canonical
 | `labels` | array of maps | "`labels:`" |
 | `repo` | map | "`repo:`" |
 | `ruleset` | map | the single-repo example below |
+| `secrets` | array of maps | "`secrets:`" |
 | `security` | map | "`security:`" |
 
 Surfaces are top-level only: there is no way to manage part of `actions`.
@@ -32,7 +33,7 @@ Surfaces are top-level only: there is no way to manage part of `actions`.
 **Unknown keys are refused.** The engine accepts only the keys documented
 here, at every level: the fleet file's top level (`defaults`, `repos`), a
 `repos` element (`name`, `manage`, `overrides`), `defaults` and `overrides`
-(the seven surfaces), and the keys inside each surface (for an array surface,
+(the eight surfaces), and the keys inside each surface (for an array surface,
 inside each element). A misspelling such as `overides:` or `rulesetz:` fails
 with an error that names the accepted keys, rather than being silently
 ignored. So does a map that names the same key twice: PyYAML would keep the
@@ -270,6 +271,30 @@ labels:
   label writes. A credential without it gets an `error` record naming the
   HTTP failure for each write, never a silent skip.
 - `generate` does not emit `labels`.
+
+### `secrets:` -- fanned-out Actions secrets
+
+An array of `{name}` elements (fleet-wide under `defaults:`, or a repo's
+`overrides:`; the repo's list replaces the default). `name` must be one the
+engine allowlists (`FANOUT_SOURCES`): today `PRIVACY_DENYLIST`. The value is
+never in the config; it comes from the apply job's environment variable of the
+same name (README, "Secrets fan-out", ADR 0020).
+
+- **Drift is presence and age.** The plan reads
+  `GET repos/{repo}/actions/secrets/{name}` (name and `updated_at`, never a
+  value): missing, or `updated_at` before `<NAME>_UPDATED_AT` (the time the
+  source was stored), is `DRIFT`. With no source timestamp, a present secret
+  is `ok`. A malformed timestamp is an `error`. A bare 404 is probed against
+  the repo, as for labels. An archived repo is `skip`.
+- **Apply** runs `gh secret set <name> --repo <repo> --app actions` with the
+  value on stdin, which seals it with the repo's public key. The write is
+  classified safe (it holds no constraint). Failure text is redacted.
+- **No value or pattern** is read, hashed, printed or written to the changes
+  files.
+- **Removal does not delete.** Dropping the entry leaves live secrets alone.
+- **Needs Secrets read** (plan) and **write** (apply). Without it the record
+  is an `error`.
+- `generate` does not emit `secrets`.
 
 ### `actions_policies:` -- repository Actions event policies (per-repo only)
 
@@ -583,7 +608,7 @@ loads `no`, `yes`, `on` and `off` as booleans); an unknown surface name,
 including `"none"`, `""` and case variants such as `"Labels"`; `"all"`
 alongside other elements; a surface listed twice; surfaces out of canonical
 (alphabetical) order, since `["security", "labels"]` and `["labels",
-"security"]` would be two values with one meaning; and all seven surfaces
+"security"]` would be two values with one meaning; and all eight surfaces
 listed out, which is `["all"]`.
 
 The engine validates the whole file first, including `[]` elements and the

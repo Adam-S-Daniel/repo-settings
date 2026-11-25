@@ -9,6 +9,14 @@ defaults:
     - name: agent-authored
       color: D4C5F9
       description: Opened by an AI agent on the owner's behalf
+  # why: the fleet's privacy denylist has to reach every repo's CI, and
+  # Adam-S-Daniel is a personal account with no organization secrets, so this
+  # engine is the organization layer (issue #231). The value comes from the
+  # apply job's environment, never from this file; a repo's copy is refreshed
+  # when it is missing or older than the source. Removing this entry does not
+  # delete the live secrets.
+  secrets:
+    - name: PRIVACY_DENYLIST
   # Prerequisite for the Dependabot unattended-merge path being rolled out
   # fleet-wide: GitHub's native auto-merge cannot be armed at all unless the
   # repo's "Allow auto-merge" setting is on. A plain repo setting (not

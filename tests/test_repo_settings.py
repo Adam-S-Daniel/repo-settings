@@ -3552,12 +3552,12 @@ def _write_yaml(test, text):
 
 
 class SurfaceConstantTests(unittest.TestCase):
-    def test_there_are_exactly_seven_surfaces_in_alphabetical_order(self):
+    def test_there_are_exactly_eight_surfaces_in_alphabetical_order(self):
         # Alphabetical is the canonical order a `manage` array must use.
         self.assertEqual(
             rs.SURFACES,
             ("actions", "actions_policies", "extra_rulesets", "labels", "repo",
-             "ruleset", "security"),
+             "ruleset", "secrets", "security"),
         )
         self.assertEqual(list(rs.SURFACES), sorted(rs.SURFACES))
 
@@ -3988,7 +3988,8 @@ class SingleRepoSecurityRegressionTests(unittest.TestCase):
 
     def test_every_surface_block_is_kept(self):
         cfg = {"repo": {"allow_auto_merge": True}, "actions": {}, "security": {},
-               "ruleset": {}, "extra_rulesets": [], "actions_policies": [], "labels": []}
+               "ruleset": {}, "extra_rulesets": [], "actions_policies": [], "labels": [],
+               "secrets": []}
         (t,) = rs.resolve_targets(cfg, "o/r")
         self.assertEqual(set(t["effective"]), set(rs.SURFACES))
 

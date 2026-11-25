@@ -109,3 +109,4 @@ Optional sections for high-impact decisions:
 | [0017](0017-eval-scope-prs-auto-merge-under-adr-0012.md) | Eval-scope PRs in skills-evals auto-merge under ADR 0012 | Accepted |
 | [0018](0018-fleet-worker-fixture-prs-auto-merge-under-adr-0012.md) | Fleet worker fixture PRs in skills-evals auto-merge under ADR 0012 | Accepted |
 | [0019](0019-apply-tightening-changes-with-no-approval.md) | Apply changes that cannot reduce protection with no approval; review the rest | Accepted |
+| [0020](0020-fan-the-privacy-denylist-out-as-a-secrets-surface.md) | Fan the privacy denylist out as a `secrets` surface | Accepted |

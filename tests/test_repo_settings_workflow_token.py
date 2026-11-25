@@ -73,6 +73,7 @@ REQUIRED_READ = {
     "permission-actions",
     "permission-issues",
     "permission-metadata",
+    "permission-secrets",
 }
 READ_APP_GATE = "vars.REPO_SETTINGS_READ_APP_CLIENT_ID != ''"
 READ_APP_CLIENT_ID = "${{ vars.REPO_SETTINGS_READ_APP_CLIENT_ID }}"
