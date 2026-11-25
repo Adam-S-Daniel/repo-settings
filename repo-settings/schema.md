@@ -276,7 +276,7 @@ labels:
 
 An array of `{name}` elements (fleet-wide under `defaults:`, or a repo's
 `overrides:`; the repo's list replaces the default). `name` must be one the
-engine allowlists (`SECRET_SOURCES`): today `PRIVACY_DENYLIST`. The value is
+engine allowlists (`FANOUT_SOURCES`): today `PRIVACY_DENYLIST`. The value is
 never in the config; it comes from the apply job's environment variable of the
 same name (README, "Secrets fan-out", ADR 0020).
 

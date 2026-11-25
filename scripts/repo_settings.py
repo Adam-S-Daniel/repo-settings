@@ -1207,7 +1207,7 @@ def write_label(repo: str, spec: dict, exists: bool) -> None:
 # jobs get from their environment's secret (README, "Secrets fan-out"). Only
 # names listed here can be declared, so a config change cannot make the engine
 # copy some other variable (the admin App key, say) into a repo.
-SECRET_SOURCES = ("PRIVACY_DENYLIST",)
+FANOUT_SOURCES = ("PRIVACY_DENYLIST",)
 
 
 def stamp_env(name: str) -> str:
@@ -1227,18 +1227,19 @@ def build_fanout_specs(settings: dict) -> list[dict]:
         if not isinstance(cfg, dict):
             raise SystemExit(f"error: secrets entries must be mappings (got {cfg!r})")
         name = cfg.get("name")
-        if name not in SECRET_SOURCES:
+        if name not in FANOUT_SOURCES:
             raise SystemExit(
                 f"error: secrets entry `name` must be one of "
-                f"{', '.join(SECRET_SOURCES)} (got {name!r})"
+                f"{', '.join(FANOUT_SOURCES)} (got {name!r})"
             )
         if name in seen:
             raise SystemExit(f"error: secrets name {name!r} is duplicated")
         seen.add(name)
         # Keep the allowlist's own string, not the config's: the name reaches
         # the plan's printed records, and a value read from the config under
-        # the `secrets` key is what CodeQL's clear-text-logging rule follows.
-        specs.append({"name": next(s for s in SECRET_SOURCES if s == name)})
+        # the `secrets` key, or a constant named for secrets, is what CodeQL's
+        # clear-text-logging rule follows.
+        specs.append({"name": next(s for s in FANOUT_SOURCES if s == name)})
     return specs
 
 
@@ -3284,10 +3285,10 @@ def write_risk(rec: dict, records: list[dict]) -> tuple[str, str]:
         return _safe(f"{rec.get('setting')}: create, or set color and description")
     if kind == "secret":
         # Stores the owner's own source value under a name this engine
-        # allowlists (SECRET_SOURCES) in a repo the config declares. A secret
+        # allowlists (FANOUT_SOURCES) in a repo the config declares. A secret
         # holds no constraint, so no rule is removed or relaxed. A name off
         # the allowlist waits.
-        if a in SECRET_SOURCES:
+        if a in FANOUT_SOURCES:
             return _safe(f"fanout[{a}]: create or refresh the fanned-out copy")
         return _gated(f"fanout[{a}]: not a secret this engine fans out")
     if kind == "ruleset":

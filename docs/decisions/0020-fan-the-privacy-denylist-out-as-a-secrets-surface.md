@@ -18,7 +18,7 @@ owners.
 
 - **`secrets` is an eighth surface**, an array of `{name}` like `labels`, and
   `["all"]` includes it. `fleet.yml` declares `PRIVACY_DENYLIST` under
-  `defaults`. Names must be on `SECRET_SOURCES` in the engine, so a config
+  `defaults`. Names must be on `FANOUT_SOURCES` in the engine, so a config
   change cannot make the engine copy another variable (the admin App key)
   into a repo.
 - **One source, never in the file.** `scripts/set_privacy_denylist.py` stores
