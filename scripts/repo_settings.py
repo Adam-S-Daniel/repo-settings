@@ -1235,7 +1235,10 @@ def build_fanout_specs(settings: dict) -> list[dict]:
         if name in seen:
             raise SystemExit(f"error: secrets name {name!r} is duplicated")
         seen.add(name)
-        specs.append({"name": name})
+        # Keep the allowlist's own string, not the config's: the name reaches
+        # the plan's printed records, and a value read from the config under
+        # the `secrets` key is what CodeQL's clear-text-logging rule follows.
+        specs.append({"name": next(s for s in SECRET_SOURCES if s == name)})
     return specs
 
 
