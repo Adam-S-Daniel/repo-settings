@@ -202,8 +202,9 @@ organization secrets
    every change to the file.
 3. The next run reports a repo as drifted when its secret is missing or
    older than that timestamp, and `apply-auto` rewrites it. Only the two
-   apply steps receive the value. The cms-platform-managed repos
-   (`manage: ["labels"]`) are not covered.
+   apply steps receive the value. The cms-platform-managed repos take it
+   too, as `manage: ["labels", "secrets"]` (ADR 0020, addendum); they accept no
+   other surface.
 
 After that, every push to `main` (config/script changes), weekly schedule and
 manual dispatch first runs the `plan` job, with no approval: `diff` per owner
