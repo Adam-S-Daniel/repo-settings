@@ -313,7 +313,7 @@ actions_policies:
     allowed_events: [pull_request_target]   # required, non-empty, no duplicates
 ```
 
-- **What it is.** On 2026-11-02 GitHub restricts `pull_request_target` on public
+- **What it is.** On 2026-12-02 GitHub restricts `pull_request_target` on public
   repos by default unless an Actions policy applies
   ([docs](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target)).
   A policy's rule `restrict_action_events` carries `allowed_events`.
