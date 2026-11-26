@@ -404,13 +404,18 @@ repos:
   # no matrix, `concurrency:` or `paths:`. Verified on adam-agentskills#139:
   # the context landed as `merge-gate` on the PR head sha
   # (https://github.com/Adam-S-Daniel/adam-agentskills/actions/runs/42750280532/job/129616044077).
-  # Do not drop it in favor of the three jobs it needs: they stay listed so a
+  # Do not drop it in favor of the jobs it needs: they stay listed so a
   # reader sees them, but only `merge-gate` cannot be reported from elsewhere.
+  #
+  # `privacy` dropped (2026-11-26, _agent-guidance#635 item 7): adam-agentskills
+  # retired its own ci.yml `privacy` job, because the required `agent-checks`
+  # job's fleet denylist scan (_agent-guidance#652) covers the same ground.
+  # `merge-gate` now needs `pytest` and `pytest-windows` only.
   - name: Adam-S-Daniel/adam-agentskills
     manage: ["all"]
     overrides:
       ruleset:
-        required_status_checks: [privacy, pytest, pytest-windows, plugin-runtime-approval, agent-checks, merge-gate]
+        required_status_checks: [pytest, pytest-windows, plugin-runtime-approval, agent-checks, merge-gate]
       actions_policies:
         - name: "plugin-runtime-review: allow pull_request_target"
           enforcement: active
