@@ -43,7 +43,7 @@ Per repo, according to `fleet.yml`:
   Actions policies that restrict which events may trigger a workflow. The one
   use is adam-agentskills' `plugin-runtime-review.yml`, which triggers only on
   `pull_request_target` and publishes a required check; GitHub blocks that event
-  on public repos by default from 2026-11-02 unless a policy allows it
+  on public repos by default from 2026-12-02 unless a policy allows it
   ([ADR 0009](docs/decisions/0009-allow-pull-request-target-with-a-workflow-scoped-policy-owned-by-name.md)).
   Policies are matched by name and the engine owns only the names `fleet.yml`
   declares. They need the repository Administration permission, which the
