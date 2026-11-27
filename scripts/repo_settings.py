@@ -1620,7 +1620,15 @@ CMS_OWNED_LABELS = (
     "decap-cms/*",
     "not-decap-created",
 )
-CMS_LABEL_ONLY_MANAGE = ("labels",)
+# The `manage` values a cms-platform-managed repo accepts, in SURFACES order:
+# `secrets` only ever writes names on FANOUT_SOURCES and holds no constraint,
+# so it does not reopen ADR 0016's reasons (ADR 0020, addendum).
+CMS_ALLOWED_MANAGE = (
+    [],
+    ["labels"],
+    ["secrets"],
+    ["labels", "secrets"],
+)
 
 
 def _json(value: Any) -> str:
@@ -1810,11 +1818,12 @@ def check_cms_label_only(target: dict) -> None:
         return
     where = f"repos[{target['repo']}]"
     manage = target["manage"]
-    if manage not in ([], list(CMS_LABEL_ONLY_MANAGE)):
+    if manage not in CMS_ALLOWED_MANAGE:
+        accepted = ", ".join(_json(m) for m in CMS_ALLOWED_MANAGE)
         raise ConfigError(
             f"error: {where}: `manage` is {_json(manage)}; a cms-platform-managed "
-            f"repo accepts only [] or {_json(list(CMS_LABEL_ONLY_MANAGE))}, because "
-            f"cms-platform owns every other surface"
+            f"repo accepts only {accepted}, because cms-platform owns every "
+            f"other surface"
         )
     if not manages(target, "labels"):
         return  # labels never reach the repo, so none are checked

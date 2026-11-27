@@ -4055,7 +4055,7 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
                 settings["labels"] = rs.merge_labels(
                     defaults["labels"], (entry.get("overrides") or {}).get("labels"))
             if entry["name"] in self.LABELS_ONLY:
-                settings = {"labels": settings["labels"]}
+                settings = {k: settings[k] for k in ("labels", "secrets") if k in settings}
             targets.append({"repo": entry["name"], "settings": settings,
                             "manage": entry["manage"] != []})
         return targets
@@ -4072,9 +4072,9 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
         by_value = {}
         for entry in cfg["repos"]:
             by_value.setdefault(tuple(entry["manage"]), set()).add(entry["name"])
-        self.assertEqual(set(by_value), {("all",), (), ("labels",)})
+        self.assertEqual(set(by_value), {("all",), (), ("labels", "secrets")})
         self.assertEqual(by_value[()], self.WERE_FALSE)
-        self.assertEqual(by_value[("labels",)], self.LABELS_ONLY)
+        self.assertEqual(by_value[("labels", "secrets")], self.LABELS_ONLY)
         self.assertEqual(len(by_value[("all",)]), 21)
 
     def test_diff_output_is_unchanged_apart_from_the_scope_strings(self):
@@ -4093,7 +4093,7 @@ class MigrationLeavesDiffUnchangedTests(unittest.TestCase):
             .replace("excluded (manage: false)", "excluded (manage: [])")
         )
         actual = new.getvalue()
-        for scope in ("all", "labels"):
+        for scope in ("all", "labels, secrets"):
             actual = actual.replace(f"\n  {rs.DIM}managed: {scope}{rs.RESET}", "")
         self.assertEqual(actual, expected)
         self.assertEqual(new_calls, legacy_calls)
@@ -4137,8 +4137,9 @@ class CmsLabelOnlyTests(unittest.TestCase):
         cms = [t for t in targets if rs.is_cms_label_only(t["repo"])]
         self.assertEqual({t["repo"] for t in cms}, set(rs.CMS_LABEL_ONLY_REPOS))
         for t in cms:
-            self.assertEqual(t["manage"], ["labels"])
-            self.assertEqual(list(t["effective"]), ["labels"])
+            self.assertEqual(t["manage"], ["labels", "secrets"])
+            self.assertEqual(sorted(t["effective"]), ["labels", "secrets"])
+            self.assertEqual(t["effective"]["secrets"], [{"name": "PRIVACY_DENYLIST"}])
             self.assertEqual([l["name"] for l in t["effective"]["labels"]],
                              ["agent-authored"])
 
@@ -4174,11 +4175,18 @@ class CmsLabelOnlyTests(unittest.TestCase):
         self.assertIn("'cms/ready'", msg)
 
     def test_other_manage_values_are_refused(self):
-        for manage in (["all"], ["labels", "security"]):
+        for manage in (["all"], ["labels", "security"], ["secrets", "security"]):
             with self.subTest(manage=manage):
                 with self.assertRaises(rs.ConfigError) as cm:
                     self._resolve(defaults_labels=[self.AGENT], manage=manage)
-                self.assertIn('[] or ["labels"]', str(cm.exception))
+                self.assertIn('[], ["labels"], ["secrets"], ["labels", "secrets"]',
+                              str(cm.exception))
+
+    def test_secrets_manage_values_are_accepted(self):
+        for manage in (["secrets"], ["labels", "secrets"]):
+            with self.subTest(manage=manage):
+                t = self._resolve(defaults_labels=[self.AGENT], manage=manage)
+                self.assertEqual(t[0]["manage"], manage)
 
     def test_manage_empty_checks_no_labels(self):
         t = self._resolve(defaults_labels=[{"name": "ci", "color": "ffffff"}], manage=[])

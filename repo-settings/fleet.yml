@@ -790,14 +790,14 @@ repos:
   # --- cms-platform + consumers: cms-platform owns every other surface through
   #     its OWN settings-as-code (repo-settings.yml manifest + rulesets), so a
   #     competing source of truth is excluded (GitHub enforces the union of
-  #     rulesets). Labels only here, and the engine refuses any label name that
+  #     rulesets). Labels and the fanned-out secrets only here, and the engine refuses any label name that
   #     is not on CMS_LABEL_ALLOWLIST or that cms-platform owns
   #     (scripts/repo_settings.py, docs/decisions/0016).
   # why: so the fleet-wide `agent-authored` label (_agent-guidance ADR 0023)
   #     exists there and agents can apply it (issue #88). ---
   - name: Adam-S-Daniel/cms-platform
-    manage: ["labels"]
+    manage: ["labels", "secrets"]
   - name: Adam-S-Daniel/adamdaniel.ai
-    manage: ["labels"]
+    manage: ["labels", "secrets"]
   - name: jodidaniel/jodidaniel.com
-    manage: ["labels"]
+    manage: ["labels", "secrets"]

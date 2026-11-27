@@ -50,3 +50,21 @@ owners.
   an `error` (HTTP 403), not drift and not a silent skip.
 - The source's age is the setter script's own timestamp, so rotating the
   denylist by any other route leaves the copies looking current.
+
+## Addendum 2026-11-26: the cms-platform-managed repos take `secrets`
+
+The Consequences above said extending the label-only repos to Secrets needed
+its own decision. It is made here
+([#241](https://github.com/Adam-S-Daniel/repo-settings/issues/241)). cms-platform
+v0.1.193 passes `PRIVACY_DENYLIST` into both public sites' agent-checks, and
+without the fan-out the scan skips with a warning on every site PR.
+
+- A repo in `CMS_LABEL_ONLY_REPOS` may now take `manage: []`, `["labels"]`,
+  `["secrets"]` or `["labels", "secrets"]`; every other value is still refused.
+- The `secrets` surface writes only names on `FANOUT_SOURCES` and holds no
+  constraint, so it does not reopen ADR 0016's reasons for keeping the engine
+  off those repos' admin surfaces. cms-platform's own manifest manages no
+  secrets, so the two do not overlap.
+- `fleet.yml` sets all three repos to `["labels", "secrets"]`. The admin App
+  must be installed on them with Secrets: Read & write for the apply to write.
+
