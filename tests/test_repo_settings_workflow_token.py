@@ -407,14 +407,23 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertEqual(by_mode["only"]["env"]["GH_TOKEN"],
                          "${{ steps.token_labels.outputs.token }}")
 
-    def test_labels_token_is_narrowed_to_issues_write_on_the_cms_repos(self):
+    def test_labels_token_is_narrowed_to_issues_and_secrets_write_on_the_cms_repos(self):
         step = next(s for s in self.apply["steps"] if s.get("id") == "token_labels")
         self.assertTrue(step["uses"].startswith(MINT_ACTION))
         with_ = step["with"]
-        self.assertEqual(set(with_), {"client-id", "private-key", "owner",
-                                      "repositories", "permission-issues"})
+        self.assertEqual(set(with_), {"client-id", "private-key", "owner", "repositories",
+                                      "permission-issues", "permission-secrets"})
         self.assertEqual(with_["permission-issues"], "write")
+        # The secrets fan-out reaches these repos (#241): without it every
+        # write there is "Resource not accessible by integration".
+        self.assertEqual(with_["permission-secrets"], "write")
         self.assertEqual(with_["repositories"], "${{ steps.cms_label_repos.outputs.repos }}")
+
+    def test_the_cms_apply_step_gets_the_fanned_out_value(self):
+        # The engine writes PRIVACY_DENYLIST from its environment; the
+        # cms-only step runs separately, so it needs the value too (#241).
+        only = self._apply_steps()["only"]
+        self.assertEqual(only["env"]["PRIVACY_DENYLIST"], "${{ secrets.PRIVACY_DENYLIST }}")
 
     def test_admin_token_mint_is_not_narrowed_or_changed(self):
         step = next(s for s in self.apply["steps"] if s.get("id") == "token")
